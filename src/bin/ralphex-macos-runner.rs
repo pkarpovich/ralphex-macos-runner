@@ -92,6 +92,11 @@ async fn main() -> ExitCode {
         },
     };
 
+    if let Err(error) = ipc::unoccupied(&socket) {
+        tracing::error!("{error}");
+        return ExitCode::FAILURE;
+    }
+
     let options = AgentOptions {
         drain_timeout: config.drain_timeout,
         ..AgentOptions::default()

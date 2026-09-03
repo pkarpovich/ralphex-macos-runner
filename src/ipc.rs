@@ -13,6 +13,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -39,6 +40,15 @@ pub const DIRECTORY_MODE: u32 = 0o700;
 
 /// The bytes `sun_path` holds on Darwin, which a socket path stays under.
 pub const SOCKET_PATH_MAX: usize = 104;
+
+/// The time a fresh connection has to name what it wants.
+pub const FIRST_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The pause after an accept that failed, before the next one is tried.
+pub const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
+
+/// The shortest interval between two complaints about a failing accept.
+pub const ACCEPT_COMPLAINT: Duration = Duration::from_secs(60);
 
 /// The name the socket carries while it is bound in its staging directory.
 ///
@@ -243,9 +253,10 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`IpcError::Io`] when the socket's directory cannot be created, the
-/// staged path needs more than [`SOCKET_PATH_MAX`] bytes, the socket cannot be
-/// bound, its permissions cannot be set or it cannot be moved to `path`.
+/// Returns [`IpcError::Io`] when another daemon is already listening at `path`,
+/// the socket's directory cannot be created, the staged path needs more than
+/// [`SOCKET_PATH_MAX`] bytes, the socket cannot be bound, its permissions
+/// cannot be set or it cannot be moved to `path`.
 pub async fn serve(
     path: PathBuf,
     agent: Arc<Agent>,
@@ -263,19 +274,56 @@ pub async fn serve(
     };
     tracing::info!("the client socket is {}", path.display());
     let mut shutdown = shutdown;
+    let mut complained: Option<tokio::time::Instant> = None;
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
             _raised = raised(&mut shutdown) => break,
         };
-        let Ok((stream, _address)) = accepted else {
-            continue;
+        let (stream, _address) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                let now = tokio::time::Instant::now();
+                if due(complained, now) {
+                    tracing::warn!("the client socket could not be accepted: {error}");
+                    complained = Some(now);
+                }
+                tokio::time::sleep(ACCEPT_PAUSE).await;
+                continue;
+            }
         };
         tokio::spawn(handle(stream, Arc::clone(&agent), shutdown.clone()));
     }
     drop(listener);
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+/// Returns an error when a daemon is already listening at `path`.
+///
+/// A socket file left behind by a daemon that is gone refuses the connection
+/// and is replaced; one a live daemon still answers on is not this process's to
+/// take, and two daemons claiming jobs from the same checkout would write over
+/// each other.
+///
+/// # Errors
+///
+/// Returns [`IpcError::Io`] naming `path` when a connection to it is accepted.
+pub fn unoccupied(path: &Path) -> Result<(), IpcError> {
+    let Ok(_stream) = std::os::unix::net::UnixStream::connect(path) else {
+        return Ok(());
+    };
+    Err(IpcError::Io(format!(
+        "another daemon is listening at {}",
+        path.display()
+    )))
+}
+
+fn due(complained: Option<tokio::time::Instant>, now: tokio::time::Instant) -> bool {
+    let Some(last) = complained else {
+        return true;
+    };
+    now.duration_since(last) >= ACCEPT_COMPLAINT
 }
 
 fn bind(path: &Path) -> Result<UnixListener, IpcError> {
@@ -285,6 +333,7 @@ fn bind(path: &Path) -> Result<UnixListener, IpcError> {
             path.display()
         )));
     };
+    unoccupied(path)?;
     if let Err(error) = std::fs::DirBuilder::new()
         .recursive(true)
         .mode(DIRECTORY_MODE)
@@ -327,9 +376,17 @@ fn abandon(staging: &Path, error: &str) -> Result<UnixListener, IpcError> {
     Err(IpcError::Io(error.to_string()))
 }
 
+async fn first_command(stream: &mut UnixStream, deadline: Duration) -> Result<Command, IpcError> {
+    let received = tokio::time::timeout(deadline, receive::<Command, _>(stream)).await;
+    let Ok(received) = received else {
+        return Err(IpcError::Io(format!("no command within {deadline:?}")));
+    };
+    received
+}
+
 async fn handle(stream: UnixStream, agent: Arc<Agent>, shutdown: watch::Receiver<Shutdown>) {
     let mut stream = stream;
-    let command = match receive::<Command, _>(&mut stream).await {
+    let command = match first_command(&mut stream, FIRST_COMMAND_TIMEOUT).await {
         Ok(command) => command,
         Err(error) => {
             tracing::warn!("a client sent no usable command: {error}");
@@ -491,6 +548,69 @@ mod tests {
         assert!(message.contains("bound"), "{message}");
         assert!(!path.exists());
         assert!(!path.parent().unwrap().join(".daemon.sock").exists());
+    }
+
+    #[tokio::test]
+    async fn a_socket_a_daemon_still_answers_on_is_not_taken_over() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("daemon.sock");
+
+        assert!(unoccupied(&path).is_ok(), "an absent socket is free");
+
+        let listener = bind(&path).unwrap();
+        let refused = unoccupied(&path).unwrap_err();
+        let IpcError::Io(message) = refused.clone() else {
+            panic!("a live socket is an io failure");
+        };
+        assert!(message.contains("another daemon is listening"), "{message}");
+        assert_eq!(bind(&path).unwrap_err(), refused);
+
+        drop(listener);
+        assert!(
+            unoccupied(&path).is_ok(),
+            "a socket file nothing answers on is stale"
+        );
+    }
+
+    #[test]
+    fn a_failing_accept_is_complained_about_once_a_minute() {
+        let now = tokio::time::Instant::now();
+        assert!(due(None, now));
+        assert!(!due(Some(now), now));
+        assert!(!due(
+            Some(now),
+            now + ACCEPT_COMPLAINT - Duration::from_secs(1)
+        ));
+        assert!(due(Some(now), now + ACCEPT_COMPLAINT));
+    }
+
+    #[tokio::test]
+    async fn a_client_that_sends_nothing_is_dropped_at_the_deadline() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let deadline = Duration::from_millis(50);
+
+        let refused = first_command(&mut server, deadline).await.unwrap_err();
+        drop(server);
+
+        let IpcError::Io(message) = refused else {
+            panic!("a client that sends nothing times out");
+        };
+        assert!(message.contains("50ms"), "{message}");
+        let mut byte = [0u8; 1];
+        let read = client.read(&mut byte).await.unwrap();
+        assert_eq!(read, 0, "the connection outlived the deadline");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_names_what_it_wants_is_served() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        send(&mut client, &Command::Attach).await.unwrap();
+
+        let command = first_command(&mut server, Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        assert_eq!(command, Command::Attach);
     }
 
     #[tokio::test]
