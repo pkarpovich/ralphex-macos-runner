@@ -18,6 +18,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -233,6 +234,7 @@ pub struct Agent {
     slot: watch::Sender<RunSlot>,
     permits: Arc<Semaphore>,
     current: Mutex<Option<Arc<CurrentRun>>>,
+    exiting: AtomicBool,
 }
 
 impl Agent {
@@ -247,6 +249,7 @@ impl Agent {
             slot,
             permits: Arc::new(Semaphore::new(1)),
             current: Mutex::new(None),
+            exiting: AtomicBool::new(false),
         }
     }
 
@@ -311,9 +314,13 @@ impl Agent {
                     }
                 }
                 Err(error) => {
+                    let mismatch = version_mismatch(&error);
+                    if mismatch.is_some() {
+                        self.stop_accepting();
+                    }
                     self.hold(RunSlot::Free);
                     drop(permit);
-                    let Some(message) = version_mismatch(&error) else {
+                    let Some(message) = mismatch else {
                         tracing::warn!("the claim failed: {error}");
                         tokio::time::sleep(self.options.claim_retry_delay).await;
                         continue;
@@ -332,11 +339,15 @@ impl Agent {
             let outcome = self
                 .run_job(job, LocalOptions::default(), shutdown.clone())
                 .await;
-            self.hold(RunSlot::Free);
-            drop(permit);
             match outcome {
-                RunOutcome::Continue => {}
+                RunOutcome::Continue => {
+                    self.hold(RunSlot::Free);
+                    drop(permit);
+                }
                 RunOutcome::VersionMismatch { message } => {
+                    self.stop_accepting();
+                    self.hold(RunSlot::Free);
+                    drop(permit);
                     return AgentExit::VersionMismatch { message };
                 }
             }
@@ -353,7 +364,10 @@ impl Agent {
     /// claimed during a shutdown; a shutdown that arrives while the farm is
     /// minting the run is answered the same way, and the run it minted is
     /// completed as `runner_shutdown` without ralphex ever being spawned. The
-    /// run outlives the client that asked for it.
+    /// run outlives the client that asked for it. A request that reaches the slot
+    /// the instant a protocol mismatch ended the claim loop is refused the same
+    /// way: the daemon is on its way out, and the run it would open is one the
+    /// farm has already said it cannot speak for.
     ///
     /// # Panics
     ///
@@ -367,6 +381,12 @@ impl Agent {
             Ok(permit) => permit,
             Err(run_id) => return LocalStart::Busy { run_id },
         };
+        if self.exiting.load(Ordering::SeqCst) {
+            drop(permit);
+            return LocalStart::Refused {
+                message: "the daemon is exiting".to_string(),
+            };
+        }
         if *shutdown.borrow() {
             drop(permit);
             return LocalStart::Refused {
@@ -619,6 +639,10 @@ impl Agent {
 
     fn hold(&self, state: RunSlot) {
         self.slot.send_replace(state);
+    }
+
+    fn stop_accepting(&self) {
+        self.exiting.store(true, Ordering::SeqCst);
     }
 
     async fn drained(&self) -> AgentExit {

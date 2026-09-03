@@ -695,6 +695,115 @@ async fn a_local_run_asked_for_during_a_shutdown_is_refused_without_opening_one(
 }
 
 #[tokio::test]
+async fn a_local_run_queued_behind_a_mismatched_claim_is_refused_without_opening_one() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    farm.always_claim(Reply::Hold);
+    let agent = Arc::new(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(&checkout.tools),
+    ));
+    let (raise, shutdown) = watch::channel(false);
+    let claiming = Arc::clone(&agent);
+    let claims = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move { claiming.run(shutdown).await }
+    });
+    let polling = wait_for(|| match agent.slot() {
+        RunSlot::Polling => Some(()),
+        RunSlot::Free => None,
+        RunSlot::Opening => None,
+        RunSlot::Running(_) => None,
+    })
+    .await;
+    assert!(polling.is_some(), "the claim loop never polled");
+
+    let asking = Arc::clone(&agent);
+    let request = RunRequest {
+        ctx: checkout.path().display().to_string(),
+        plan: checkout.plan.display().to_string(),
+        branch: Branch("x".to_string()),
+        create_pr: CreatePr::No,
+        worktree: Worktree::No,
+        env: Vec::new(),
+    };
+    let started = tokio::spawn(async move { asking.start_local(request, shutdown).await });
+    farm.release_claim(Reply::Status(409, MISMATCH.to_string()));
+
+    let exit = claims.await.unwrap();
+    let LocalStart::Refused { message } = started.await.unwrap() else {
+        panic!("the queued request was not refused");
+    };
+
+    assert_eq!(
+        exit,
+        AgentExit::VersionMismatch {
+            message: "the runner speaks 1, the farm speaks 2".to_string()
+        }
+    );
+    assert!(message.contains("the daemon is exiting"), "{message}");
+    assert!(farm.requests_ending("/runs").is_empty());
+    assert!(!checkout.record.exists(), "ralphex was started anyway");
+    drop(raise);
+}
+
+#[tokio::test]
+async fn a_local_run_asked_for_after_a_mismatched_heartbeat_is_refused() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_SLEEP", "120")]);
+    let farm = FakeFarm::start().await;
+    farm.push_claim(Reply::Job(Box::new(job(
+        checkout.path(),
+        &checkout.plan,
+        CreatePr::No,
+    ))));
+    farm.always_claim(Reply::Hold);
+    let agent = Arc::new(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(&checkout.tools),
+    ));
+    let (raise, shutdown) = watch::channel(false);
+    let claiming = Arc::clone(&agent);
+    let claims = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move { claiming.run(shutdown).await }
+    });
+    spawned(&checkout.record).await;
+    farm.always_heartbeat(Reply::Status(409, MISMATCH.to_string()));
+    let exit = claims.await.unwrap();
+
+    let started = agent
+        .start_local(
+            RunRequest {
+                ctx: checkout.path().display().to_string(),
+                plan: checkout.plan.display().to_string(),
+                branch: Branch("x".to_string()),
+                create_pr: CreatePr::No,
+                worktree: Worktree::No,
+                env: Vec::new(),
+            },
+            shutdown,
+        )
+        .await;
+
+    assert_eq!(
+        exit,
+        AgentExit::VersionMismatch {
+            message: "the runner speaks 1, the farm speaks 2".to_string()
+        }
+    );
+    let LocalStart::Refused { message } = started else {
+        panic!("the request was not refused");
+    };
+    assert!(message.contains("the daemon is exiting"), "{message}");
+    assert!(farm.requests_ending("/runs").is_empty());
+    drop(raise);
+}
+
+#[tokio::test]
 async fn a_shutdown_that_lands_while_the_farm_mints_a_local_run_completes_it_unstarted() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_SLEEP", "120")]);

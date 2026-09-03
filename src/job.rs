@@ -275,7 +275,9 @@ fn unanswered(path: &Path, budget: Duration) -> JobError {
 /// Starts ralphex for `spec` and tees its output into `log`.
 ///
 /// The child leads its own process group, reads nothing from stdin and has both
-/// of its pipes drained by tasks of their own.
+/// of its pipes drained by tasks of their own. A [`RunningJob`] dropped without
+/// being stopped kills the leader, so no path out of the agent can leave ralphex
+/// running in a checkout the next job is about to take.
 ///
 /// # Errors
 ///
@@ -318,6 +320,7 @@ pub fn spawn(spec: &JobSpec, log: Arc<LogStream>) -> Result<RunningJob, JobError
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     command.process_group(0);
+    command.kill_on_drop(true);
 
     let mut child = match command.spawn() {
         Ok(child) => child,
