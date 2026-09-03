@@ -4,14 +4,16 @@
 //! chunks under a strictly increasing sequence number, and keeps two bounded
 //! views of the same output: the tail a completion carries and the history an
 //! attaching client replays before it follows the live lines. The flush cadence
-//! arrives through the [`Ticker`] trait, so a test drives every flush itself.
+//! arrives through the [`Ticker`] trait, so a test drives every flush itself,
+//! and a buffer that reaches [`MAX_LOG_CHUNK`] wakes the flusher without waiting
+//! for the next tick.
 
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{Notify, broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::protocol::client::{FarmClient, FarmError};
@@ -128,6 +130,7 @@ pub struct LogStream {
     lines: broadcast::Sender<String>,
     gone: watch::Sender<Latch>,
     phase: watch::Sender<Phase>,
+    filled: Arc<Notify>,
     flusher: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -149,6 +152,7 @@ impl LogStream {
         let (lines, _) = broadcast::channel(SUBSCRIBER_CAPACITY);
         let (gone, _) = watch::channel(Latch::Open);
         let (phase, closing) = watch::channel(Phase::Running);
+        let filled = Arc::new(Notify::new());
         let flusher = tokio::spawn(flush_loop(
             client,
             run_id,
@@ -156,19 +160,25 @@ impl LogStream {
             ticker,
             gone.clone(),
             closing,
+            Arc::clone(&filled),
         ));
         LogStream {
             buffers,
             lines,
             gone,
             phase,
+            filled,
             flusher: Mutex::new(Some(flusher)),
         }
     }
 
     /// Appends `bytes` to the buffer the flusher sends to the farm.
     ///
-    /// Past [`LOG_BUFFER_BYTES`] the oldest bytes are dropped.
+    /// A buffer that reaches [`MAX_LOG_CHUNK`] wakes the flusher rather than
+    /// waiting for its next tick, because a burst larger than
+    /// [`LOG_BUFFER_BYTES`] inside one tick would otherwise lose its oldest
+    /// bytes to the cap while the history and the tail still carried them. Past
+    /// [`LOG_BUFFER_BYTES`] the oldest bytes are dropped.
     ///
     /// # Panics
     ///
@@ -179,6 +189,11 @@ impl LogStream {
         let over = buffers.outgoing.len().saturating_sub(LOG_BUFFER_BYTES);
         if over > 0 {
             buffers.outgoing.drain(..over);
+        }
+        let filled = buffers.outgoing.len() >= MAX_LOG_CHUNK;
+        drop(buffers);
+        if filled {
+            self.filled.notify_one();
         }
     }
 
@@ -269,11 +284,13 @@ async fn flush_loop(
     ticker: Arc<dyn Ticker>,
     gone: watch::Sender<Latch>,
     mut closing: watch::Receiver<Phase>,
+    filled: Arc<Notify>,
 ) {
     let mut seq = Seq::FIRST;
     loop {
         let phase = tokio::select! {
             () = ticker.tick() => Phase::Running,
+            () = filled.notified() => Phase::Running,
             _ = closing.changed() => Phase::Closing,
         };
         match phase {

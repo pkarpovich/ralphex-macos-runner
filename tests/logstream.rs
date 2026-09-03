@@ -242,6 +242,41 @@ async fn a_buffer_past_its_bound_drops_its_oldest_bytes() {
 }
 
 #[tokio::test]
+async fn a_burst_larger_than_the_buffer_reaches_the_farm_whole_without_a_tick() {
+    let farm = FakeFarm::start().await;
+    let (stream, _handle) = stream(&farm);
+
+    let pieces = 5 * 1024 * 1024 / MAX_LOG_CHUNK;
+    let mut written = Vec::new();
+    for piece in 0..pieces {
+        let byte = b'a' + u8::try_from(piece % 26).unwrap();
+        let bytes = vec![byte; MAX_LOG_CHUNK];
+        stream.write(&bytes);
+        written.extend(bytes);
+        tokio::task::yield_now().await;
+    }
+    stream.close().await;
+
+    let mut delivered = Vec::new();
+    for request in farm.requests_ending("/log") {
+        delivered.extend(request.body);
+    }
+    assert_eq!(
+        delivered.len(),
+        written.len(),
+        "the buffer dropped bytes the ticker never came to flush"
+    );
+    assert_eq!(
+        delivered, written,
+        "the chunks reached the farm out of order"
+    );
+    assert_eq!(
+        sequences(&farm),
+        (1..=u64::try_from(pieces).unwrap()).collect::<Vec<u64>>()
+    );
+}
+
+#[tokio::test]
 async fn a_chunk_the_farm_loses_is_retried_under_the_same_sequence() {
     let farm = FakeFarm::start().await;
     farm.push_log(Reply::Status(500, "boom".to_string()));
