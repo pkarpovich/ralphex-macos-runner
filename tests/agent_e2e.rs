@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
-use ralphex_macos_runner::agent::{Agent, AgentExit, AgentOptions, LocalStart, RunSlot};
+use ralphex_macos_runner::agent::{Agent, AgentExit, AgentOptions, LocalStart, RunSlot, Shutdown};
 use ralphex_macos_runner::config::Config;
 use ralphex_macos_runner::ipc::RunRequest;
 use ralphex_macos_runner::job::Worktree;
@@ -128,13 +128,13 @@ fn agent(farm: &FakeFarm, config: Config, options: AgentOptions) -> Agent {
 
 struct Running {
     agent: Arc<Agent>,
-    raise: watch::Sender<bool>,
+    raise: watch::Sender<Shutdown>,
     handle: JoinHandle<AgentExit>,
 }
 
 fn start(agent: Agent) -> Running {
     let agent = Arc::new(agent);
-    let (raise, shutdown) = watch::channel(false);
+    let (raise, shutdown) = watch::channel(Shutdown::Running);
     let claiming = Arc::clone(&agent);
     let handle = tokio::spawn(async move { claiming.run(shutdown).await });
     Running {
@@ -597,7 +597,7 @@ async fn a_second_job_is_not_claimed_while_one_runs() {
         RunSlot::Running(RunId("FARM-12-1753180800000".to_string()))
     );
 
-    running.raise.send_replace(true);
+    running.raise.send_replace(Shutdown::Draining);
     let CompleteRequest {
         status: _,
         pr_url: _,
@@ -624,7 +624,7 @@ async fn a_run_that_outlasts_its_drain_completes_as_a_shutdown() {
     ));
 
     let record = spawned(&checkout.record).await;
-    running.raise.send_replace(true);
+    running.raise.send_replace(Shutdown::Draining);
 
     let CompleteRequest {
         status,
@@ -642,13 +642,40 @@ async fn a_run_that_outlasts_its_drain_completes_as_a_shutdown() {
 }
 
 #[tokio::test]
+async fn a_second_signal_stops_the_run_without_waiting_the_drain_out() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_SLEEP", "120")]);
+    let farm = farm_with(job(checkout.path(), &checkout.plan, CreatePr::No)).await;
+    let mut options = options(&checkout.tools);
+    options.drain_timeout = Duration::from_secs(3600);
+    let running = start(agent(&farm, config(&farm, &ralphex), options));
+
+    let record = spawned(&checkout.record).await;
+    running.raise.send_replace(Shutdown::Draining);
+    running.raise.send_replace(Shutdown::Hurry);
+
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Error);
+    assert_eq!(fail_reason, "runner_shutdown");
+    assert!(dead(record.pid).await, "the run outlived the second signal");
+    assert_eq!(running.handle.await.unwrap(), AgentExit::Shutdown);
+}
+
+#[tokio::test]
 async fn a_shutdown_before_the_first_claim_stops_the_agent_at_once() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[]);
     let farm = FakeFarm::start().await;
     farm.always_claim(Reply::Hold);
     let agent = agent(&farm, config(&farm, &ralphex), options(&checkout.tools));
-    let (raise, shutdown) = watch::channel(true);
+    let (raise, shutdown) = watch::channel(Shutdown::Draining);
 
     let exit = agent.run(shutdown).await;
 
@@ -680,7 +707,7 @@ async fn an_empty_claim_paces_the_loop_and_the_pause_ends_on_a_shutdown() {
         "an empty claim was not paced"
     );
 
-    running.raise.send_replace(true);
+    running.raise.send_replace(Shutdown::Draining);
     let exit = tokio::time::timeout(Duration::from_secs(5), running.handle).await;
 
     let Ok(exit) = exit else {
@@ -707,7 +734,7 @@ async fn a_job_claimed_during_a_shutdown_is_completed_without_being_started() {
     })
     .await;
     assert!(polling.is_some(), "the claim never reached the farm");
-    running.raise.send_replace(true);
+    running.raise.send_replace(Shutdown::Draining);
     farm.release_claim(Reply::Job(Box::new(job(
         checkout.path(),
         &checkout.plan,
@@ -743,7 +770,7 @@ async fn a_local_run_asked_for_during_a_shutdown_is_refused_without_opening_one(
         config(&farm, &ralphex),
         options(&checkout.tools),
     ));
-    let (raise, shutdown) = watch::channel(true);
+    let (raise, shutdown) = watch::channel(Shutdown::Draining);
 
     let started = agent
         .start_local(
@@ -779,7 +806,7 @@ async fn a_local_run_queued_behind_a_mismatched_claim_is_refused_without_opening
         config(&farm, &ralphex),
         options(&checkout.tools),
     ));
-    let (raise, shutdown) = watch::channel(false);
+    let (raise, shutdown) = watch::channel(Shutdown::Running);
     let claiming = Arc::clone(&agent);
     let claims = tokio::spawn({
         let shutdown = shutdown.clone();
@@ -839,7 +866,7 @@ async fn a_local_run_asked_for_after_a_mismatched_heartbeat_is_refused() {
         config(&farm, &ralphex),
         options(&checkout.tools),
     ));
-    let (raise, shutdown) = watch::channel(false);
+    let (raise, shutdown) = watch::channel(Shutdown::Running);
     let claiming = Arc::clone(&agent);
     let claims = tokio::spawn({
         let shutdown = shutdown.clone();
@@ -888,7 +915,7 @@ async fn a_shutdown_that_lands_while_the_farm_mints_a_local_run_completes_it_uns
         config(&farm, &ralphex),
         options(&checkout.tools),
     ));
-    let (raise, shutdown) = watch::channel(false);
+    let (raise, shutdown) = watch::channel(Shutdown::Running);
     let opening = Arc::clone(&agent);
     let request = RunRequest {
         ctx: checkout.path().display().to_string(),
@@ -906,7 +933,7 @@ async fn a_shutdown_that_lands_while_the_farm_mints_a_local_run_completes_it_uns
     })
     .await;
     assert!(opened.is_some(), "the opening never reached the farm");
-    raise.send_replace(true);
+    raise.send_replace(Shutdown::Draining);
     farm.release_runs(Reply::Job(Box::new(job(
         checkout.path(),
         &checkout.plan,

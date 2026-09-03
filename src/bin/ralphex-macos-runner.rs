@@ -10,7 +10,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use ralphex_macos_runner::agent::{Agent, AgentExit, AgentOptions};
+use ralphex_macos_runner::agent::{Agent, AgentExit, AgentOptions, Shutdown, hasten};
 use ralphex_macos_runner::config::Config;
 use ralphex_macos_runner::ipc;
 use ralphex_macos_runner::paths;
@@ -96,7 +96,7 @@ async fn main() -> ExitCode {
     );
     let agent = Arc::new(Agent::new(config, client, options));
 
-    let (raise, shutdown) = watch::channel(false);
+    let (raise, shutdown) = watch::channel(Shutdown::Running);
     tokio::spawn(raise_on_signal(raise));
     let listening = tokio::spawn(ipc::serve(
         socket.clone(),
@@ -116,17 +116,26 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn raise_on_signal(raise: watch::Sender<bool>) {
+async fn raise_on_signal(raise: watch::Sender<Shutdown>) {
     let terminate = signal(SignalKind::terminate());
     let interrupt = signal(SignalKind::interrupt());
     let (Ok(mut terminate), Ok(mut interrupt)) = (terminate, interrupt) else {
         tracing::error!("the shutdown signals could not be installed");
         return;
     };
-    tokio::select! {
-        _signaled = terminate.recv() => {}
-        _signaled = interrupt.recv() => {}
+    loop {
+        tokio::select! {
+            _signaled = terminate.recv() => {}
+            _signaled = interrupt.recv() => {}
+        }
+        match hasten(&raise) {
+            Shutdown::Running => {}
+            Shutdown::Draining => {
+                tracing::info!("a shutdown was asked for; the claim loop stops");
+            }
+            Shutdown::Hurry => {
+                tracing::warn!("second signal received, stopping the run now");
+            }
+        }
     }
-    tracing::info!("a shutdown was asked for; the claim loop stops");
-    raise.send_replace(true);
 }

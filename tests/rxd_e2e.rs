@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
-use ralphex_macos_runner::agent::{Agent, AgentOptions};
+use ralphex_macos_runner::agent::{Agent, AgentOptions, Shutdown};
 use ralphex_macos_runner::config::Config;
 use ralphex_macos_runner::ipc::{
     self, Command, DIRECTORY_MODE, IpcError, MAX_MESSAGE_BYTES, Response, RunRequest,
@@ -128,7 +128,7 @@ fn options(record: &Path) -> AgentOptions {
 struct Daemon {
     agent: Arc<Agent>,
     socket: PathBuf,
-    raise: watch::Sender<bool>,
+    raise: watch::Sender<Shutdown>,
 }
 
 async fn daemon(
@@ -145,7 +145,7 @@ async fn daemon(
         client,
         options(&checkout.tools),
     ));
-    let (raise, shutdown) = watch::channel(false);
+    let (raise, shutdown) = watch::channel(Shutdown::Running);
     let socket = checkout.dir.path().join("daemon.sock");
     tokio::spawn(ipc::serve(
         socket.clone(),
@@ -324,7 +324,7 @@ async fn a_stale_socket_is_replaced_and_the_new_one_is_removed_on_shutdown() {
     assert!(client.is_ok(), "the stale file was not replaced");
     drop(client);
 
-    daemon.raise.send_replace(true);
+    daemon.raise.send_replace(Shutdown::Draining);
     let removed = wait_for(|| match daemon.socket.exists() {
         true => None,
         false => Some(()),
@@ -511,7 +511,7 @@ async fn a_client_that_waited_through_a_poll_is_busy_when_the_poll_brought_a_job
     assert!(farm.requests_ending("/runs").is_empty());
     let record = spawned(&checkout.record).await;
     assert!(record.pid > 0);
-    daemon.raise.send_replace(true);
+    daemon.raise.send_replace(Shutdown::Draining);
 }
 
 #[tokio::test]
@@ -531,7 +531,7 @@ async fn a_client_is_busy_while_a_run_holds_the_slot() {
     assert!(!output.status.success(), "{printed}");
     assert!(printed.contains("FARM-13-1"), "{printed}");
     assert!(farm.requests_ending("/runs").is_empty());
-    daemon.raise.send_replace(true);
+    daemon.raise.send_replace(Shutdown::Draining);
 }
 
 #[tokio::test]
@@ -757,7 +757,7 @@ async fn an_interrupted_client_detaches_and_leaves_the_run_going() {
     let reattached = followed.next_line().await.unwrap().unwrap();
     assert_eq!(reattached, "run local-11");
     attached.start_kill().unwrap();
-    daemon.raise.send_replace(true);
+    daemon.raise.send_replace(Shutdown::Draining);
 }
 
 #[tokio::test]
@@ -795,7 +795,7 @@ async fn a_socket_directory_the_daemon_creates_is_its_own() {
         client,
         options(&checkout.tools),
     ));
-    let (raise, shutdown) = watch::channel(false);
+    let (raise, shutdown) = watch::channel(Shutdown::Running);
     let state = checkout.dir.path().join("state");
     let socket = state.join("daemon.sock");
     tokio::spawn(ipc::serve(socket.clone(), agent, shutdown));
@@ -834,7 +834,7 @@ async fn a_socket_that_cannot_be_bound_is_an_error_the_daemon_can_report() {
         client,
         options(&checkout.tools),
     ));
-    let (raise, shutdown) = watch::channel(false);
+    let (raise, shutdown) = watch::channel(Shutdown::Running);
     let blocked = checkout.dir.path().join("not-a-directory");
     std::fs::write(&blocked, "a file sits where the directory should be").unwrap();
 

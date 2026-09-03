@@ -42,6 +42,67 @@ use crate::protocol::types::{
 
 const TERMINAL_CAPACITY: usize = 8;
 
+/// How far a shutdown of the daemon has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shutdown {
+    /// No shutdown was asked for.
+    Running,
+    /// A shutdown was asked for and a run in flight has its drain.
+    Draining,
+    /// A second signal cut the remaining drain to nothing.
+    Hurry,
+}
+
+impl Shutdown {
+    /// Returns whether a shutdown was asked for.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ralphex_macos_runner::agent::Shutdown;
+    ///
+    /// assert!(!Shutdown::Running.raised());
+    /// assert!(Shutdown::Draining.raised());
+    /// assert!(Shutdown::Hurry.raised());
+    /// ```
+    #[must_use]
+    pub fn raised(self) -> bool {
+        match self {
+            Shutdown::Running => false,
+            Shutdown::Draining => true,
+            Shutdown::Hurry => true,
+        }
+    }
+}
+
+/// Moves `raise` one step further into a shutdown and returns where it landed.
+///
+/// The first signal starts the drain; every signal after it cuts the drain to
+/// nothing, because an operator who signals twice is no longer waiting for the
+/// run to finish.
+///
+/// # Examples
+///
+/// ```
+/// use ralphex_macos_runner::agent::{Shutdown, hasten};
+/// use tokio::sync::watch;
+///
+/// let (raise, _shutdown) = watch::channel(Shutdown::Running);
+/// assert_eq!(hasten(&raise), Shutdown::Draining);
+/// assert_eq!(hasten(&raise), Shutdown::Hurry);
+/// assert_eq!(hasten(&raise), Shutdown::Hurry);
+/// ```
+pub fn hasten(raise: &watch::Sender<Shutdown>) -> Shutdown {
+    let reached = *raise.borrow();
+    let reached = match reached {
+        Shutdown::Running => Shutdown::Draining,
+        Shutdown::Draining => Shutdown::Hurry,
+        Shutdown::Hurry => Shutdown::Hurry,
+    };
+    raise.send_replace(reached);
+    reached
+}
+
 /// What the agent is doing with its only run slot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunSlot {
@@ -290,11 +351,11 @@ impl Agent {
     /// waits. A shutdown returns only once the slot is free again, so a run an
     /// `rxd` client started is drained and completed like a claimed one instead
     /// of dying with the runtime.
-    pub async fn run(&self, shutdown: watch::Receiver<bool>) -> AgentExit {
+    pub async fn run(&self, shutdown: watch::Receiver<Shutdown>) -> AgentExit {
         let request = ClaimRequest::native(self.config.name.clone());
         let mut shutdown = shutdown;
         loop {
-            if *shutdown.borrow() {
+            if shutdown.borrow().raised() {
                 return self.drained().await;
             }
             let permit = tokio::select! {
@@ -331,7 +392,7 @@ impl Agent {
                     return AgentExit::VersionMismatch { message };
                 }
             };
-            if *shutdown.borrow() {
+            if shutdown.borrow().raised() {
                 tracing::info!("run {} was claimed during a shutdown", job.run_id);
                 self.report(&job.run_id, shut_down()).await;
                 self.hold(RunSlot::Free);
@@ -378,7 +439,7 @@ impl Agent {
     pub async fn start_local(
         self: &Arc<Self>,
         request: RunRequest,
-        shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<Shutdown>,
     ) -> LocalStart {
         let permit = match self.hold_slot().await {
             Ok(permit) => permit,
@@ -390,7 +451,7 @@ impl Agent {
                 message: "the daemon is exiting".to_string(),
             };
         }
-        if *shutdown.borrow() {
+        if shutdown.borrow().raised() {
             drop(permit);
             return LocalStart::Refused {
                 message: "the runner is shutting down".to_string(),
@@ -425,7 +486,7 @@ impl Agent {
                 };
             }
         };
-        if *shutdown.borrow() {
+        if shutdown.borrow().raised() {
             tracing::info!("run {} was opened during a shutdown", job.run_id);
             self.report(&job.run_id, shut_down()).await;
             self.hold(RunSlot::Free);
@@ -465,7 +526,7 @@ impl Agent {
         &self,
         job: Job,
         local: LocalOptions,
-        shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<Shutdown>,
     ) -> RunOutcome {
         let current = self.enter(&job.run_id);
         self.serve_run(job, local, shutdown, &current).await
@@ -475,7 +536,7 @@ impl Agent {
         &self,
         job: Job,
         local: LocalOptions,
-        shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<Shutdown>,
         current: &CurrentRun,
     ) -> RunOutcome {
         let run_id = job.run_id.clone();
@@ -499,7 +560,7 @@ impl Agent {
         &self,
         job: Job,
         local: LocalOptions,
-        shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<Shutdown>,
         current: &CurrentRun,
     ) -> Finished {
         let Job {
@@ -781,10 +842,23 @@ pub(crate) enum Raised {
     Detached,
 }
 
-pub(crate) async fn raised(shutdown: &mut watch::Receiver<bool>) -> Raised {
+pub(crate) async fn raised(shutdown: &mut watch::Receiver<Shutdown>) -> Raised {
     loop {
-        if *shutdown.borrow() {
+        if shutdown.borrow().raised() {
             return Raised::Shutdown;
+        }
+        let Ok(()) = shutdown.changed().await else {
+            return Raised::Detached;
+        };
+    }
+}
+
+async fn hurried(shutdown: &mut watch::Receiver<Shutdown>) -> Raised {
+    loop {
+        match *shutdown.borrow() {
+            Shutdown::Hurry => return Raised::Shutdown,
+            Shutdown::Running => {}
+            Shutdown::Draining => {}
         }
         let Ok(()) = shutdown.changed().await else {
             return Raised::Detached;
@@ -988,7 +1062,7 @@ async fn ended(
 }
 
 async fn drain_after(
-    shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<Shutdown>,
     timeout: Duration,
     terminals: mpsc::Sender<Terminal>,
 ) {
@@ -997,7 +1071,16 @@ async fn drain_after(
         Raised::Shutdown => {}
         Raised::Detached => return,
     }
-    tokio::time::sleep(timeout).await;
+    let reached = *shutdown.borrow();
+    match reached {
+        Shutdown::Hurry => {}
+        Shutdown::Running | Shutdown::Draining => {
+            tokio::select! {
+                () = tokio::time::sleep(timeout) => {}
+                _hurried = hurried(&mut shutdown) => {}
+            }
+        }
+    }
     let _ = terminals.send(Terminal::Drain).await;
 }
 
@@ -1025,6 +1108,40 @@ mod tests {
                 panic!("a version mismatch discarded a finished run")
             }
         }
+    }
+
+    #[test]
+    fn the_first_signal_drains_and_every_one_after_it_hurries() {
+        let (raise, shutdown) = watch::channel(Shutdown::Running);
+        assert!(!shutdown.borrow().raised());
+
+        assert_eq!(hasten(&raise), Shutdown::Draining);
+        assert_eq!(*shutdown.borrow(), Shutdown::Draining);
+        assert!(shutdown.borrow().raised());
+
+        assert_eq!(hasten(&raise), Shutdown::Hurry);
+        assert_eq!(hasten(&raise), Shutdown::Hurry);
+        assert_eq!(*shutdown.borrow(), Shutdown::Hurry);
+    }
+
+    #[tokio::test]
+    async fn a_second_signal_cuts_the_remaining_drain_to_nothing() {
+        let (raise, shutdown) = watch::channel(Shutdown::Running);
+        let (terminals, mut terminal) = mpsc::channel(TERMINAL_CAPACITY);
+        let draining = tokio::spawn(drain_after(
+            shutdown,
+            Duration::from_secs(3600),
+            terminals.clone(),
+        ));
+
+        hasten(&raise);
+        hasten(&raise);
+
+        let sent = tokio::time::timeout(Duration::from_secs(5), terminal.recv()).await;
+        let Ok(Some(Terminal::Drain)) = sent else {
+            panic!("the second signal did not cut the drain short");
+        };
+        draining.await.unwrap();
     }
 
     #[test]

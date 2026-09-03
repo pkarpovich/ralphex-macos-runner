@@ -17,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch};
 
-use crate::agent::{Agent, CurrentRun, LocalStart, RunEnd, raised};
+use crate::agent::{Agent, CurrentRun, LocalStart, RunEnd, Shutdown, raised};
 use crate::job::Worktree;
 use crate::protocol::types::{Branch, CompleteRequest, CompleteStatus, CreatePr, RunId};
 
@@ -246,7 +246,7 @@ where
 pub async fn serve(
     path: PathBuf,
     agent: Arc<Agent>,
-    shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<Shutdown>,
 ) -> Result<(), IpcError> {
     let listener = match bind(&path) {
         Ok(listener) => listener,
@@ -324,7 +324,7 @@ fn abandon(staging: &Path, error: &str) -> Result<UnixListener, IpcError> {
     Err(IpcError::Io(error.to_string()))
 }
 
-async fn handle(stream: UnixStream, agent: Arc<Agent>, shutdown: watch::Receiver<bool>) {
+async fn handle(stream: UnixStream, agent: Arc<Agent>, shutdown: watch::Receiver<Shutdown>) {
     let mut stream = stream;
     let command = match receive::<Command, _>(&mut stream).await {
         Ok(command) => command,
@@ -346,7 +346,7 @@ async fn start(
     stream: &mut UnixStream,
     agent: Arc<Agent>,
     request: RunRequest,
-    shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<Shutdown>,
 ) -> Result<(), IpcError> {
     match agent.start_local(request, shutdown).await {
         LocalStart::Busy { run_id } => send(stream, &Response::Busy { run_id }).await,
