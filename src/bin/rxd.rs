@@ -59,7 +59,11 @@ enum Command {
     /// Reconnects to the run in progress and streams its output.
     Attach,
     /// Installs the daemon as a launchd user agent.
-    Install,
+    Install {
+        /// Replaces the daemon even when a run is in progress.
+        #[arg(long)]
+        force: bool,
+    },
     /// Removes the daemon's launchd user agent.
     Uninstall,
 }
@@ -112,7 +116,7 @@ async fn main() -> ExitCode {
 async fn dispatch(command: Command, socket: Option<PathBuf>) -> ExitCode {
     match command {
         Command::Attach => session(socket, ipc::Command::Attach, Notice::Quiet).await,
-        Command::Install => install().await,
+        Command::Install { force } => install(force).await,
         Command::Uninstall => uninstall().await,
     }
 }
@@ -130,8 +134,12 @@ fn given(run: &RunArgs) -> RunArgsGiven {
     }
 }
 
-async fn install() -> ExitCode {
-    match service::install().await {
+async fn install(force: bool) -> ExitCode {
+    let force = match force {
+        true => service::Force::Yes,
+        false => service::Force::No,
+    };
+    match service::install(force).await {
         Ok(installed) => {
             println!("{installed}");
             ExitCode::SUCCESS

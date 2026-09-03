@@ -18,6 +18,8 @@ rxd install
 
 `rxd install` copies the daemon binary next to `rxd` to a stable path under `~/Library/Application Support/ralphex-macos-runner/bin/`, writes `~/Library/LaunchAgents/dev.pkarpovich.ralphex-macos-runner.plist` and loads it with `launchctl bootstrap`. The plist carries the `PATH` of the shell that ran the install - launchd agents inherit no login shell, and without it the daemon finds neither `ralphex`, `claude`, `codex`, `gh` nor `xcodebuild`. It prints the paths it touched and the `launchctl` lines to stop and start the agent by hand.
 
+`rxd install` refuses while a run is in progress - `launchctl bootout` would either kill it or leave `bootstrap` failing against a label launchd has not released yet - and says which run to wait for; `--force` replaces the daemon anyway. After the bootout it waits for launchd to drop the label before handing over the new agent.
+
 `rxd uninstall` boots the agent out and removes the plist.
 
 Apple silicon only; there is no Intel build and no Linux build (the container runner covers Linux).
@@ -50,7 +52,7 @@ rxd docs/plans/20260902-my-plan.md
 ```
 rxd <plan> [--branch <name>] [--no-pr] [--worktree]
 rxd attach
-rxd install
+rxd install [--force]
 rxd uninstall
 ```
 

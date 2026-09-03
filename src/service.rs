@@ -13,14 +13,22 @@ use std::process::{Output, Stdio};
 use std::time::Duration;
 
 use nix::unistd::Uid;
+use tokio::net::UnixStream;
 use tokio::process::Command;
 
 use crate::config::{Config, DEFAULT_DRAIN_TIMEOUT};
+use crate::ipc;
 use crate::paths::{self, APP_NAME, PathError};
 use crate::protocol::types::{
-    COMPLETE_BUDGET, LOG_CLOSE_TIMEOUT, PR_BUDGET, REQUEST_TIMEOUT, RETRY_MAX_DELAY, STOP_GRACE,
-    VALIDATE_TIMEOUT,
+    COMPLETE_BUDGET, LOG_CLOSE_TIMEOUT, PR_BUDGET, REQUEST_TIMEOUT, RETRY_MAX_DELAY, RunId,
+    STOP_GRACE, VALIDATE_TIMEOUT,
 };
+
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+const BOOTOUT_MARGIN: Duration = Duration::from_secs(10);
+
+const BOOTOUT_POLL: Duration = Duration::from_millis(500);
 
 /// The file launchd writes the daemon's standard output to.
 pub const STDOUT_FILE: &str = "daemon.out.log";
@@ -59,6 +67,87 @@ pub enum ServiceError {
         /// What launchctl said.
         message: String,
     },
+    /// The daemon that is running would lose a run.
+    #[error("{0}")]
+    Busy(String),
+}
+
+/// Whether `rxd install` replaces a daemon that is busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Force {
+    /// The install goes ahead whatever the daemon is doing.
+    Yes,
+    /// A run in flight stops the install.
+    No,
+}
+
+/// What the daemon answered when it was asked whether it holds a run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Daemon {
+    /// Nothing answered on the socket.
+    Absent,
+    /// A daemon answered and holds no run.
+    Idle,
+    /// A daemon answered and holds a run.
+    Busy {
+        /// The identifier of the run in flight.
+        run_id: RunId,
+    },
+    /// A daemon answered something an attach never gets.
+    Unclear {
+        /// What the answer was.
+        message: String,
+    },
+}
+
+/// Whether the daemon in this state may be booted out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Replace {
+    /// The install goes ahead.
+    Proceed,
+    /// The install stops, for the reason this carries.
+    Refuse(String),
+}
+
+/// Returns whether a daemon that answered `daemon` may be replaced.
+///
+/// `launchctl bootout` is fire and forget and the drain that follows it can run
+/// for minutes, so replacing a daemon that holds a run either kills that run or
+/// leaves `bootstrap` failing against a label launchd has not released yet.
+///
+/// # Examples
+///
+/// ```
+/// use ralphex_macos_runner::protocol::types::RunId;
+/// use ralphex_macos_runner::service::{Daemon, Force, Replace, replaceable};
+///
+/// assert_eq!(replaceable(&Daemon::Idle, Force::No), Replace::Proceed);
+/// assert_eq!(replaceable(&Daemon::Absent, Force::No), Replace::Proceed);
+///
+/// let busy = Daemon::Busy {
+///     run_id: RunId("local-1".to_string()),
+/// };
+/// assert_eq!(replaceable(&busy, Force::Yes), Replace::Proceed);
+/// let Replace::Refuse(message) = replaceable(&busy, Force::No) else {
+///     panic!("a run in flight stops an install");
+/// };
+/// assert!(message.contains("local-1"));
+/// ```
+#[must_use]
+pub fn replaceable(daemon: &Daemon, force: Force) -> Replace {
+    match force {
+        Force::Yes => Replace::Proceed,
+        Force::No => match daemon {
+            Daemon::Absent => Replace::Proceed,
+            Daemon::Idle => Replace::Proceed,
+            Daemon::Busy { run_id } => Replace::Refuse(format!(
+                "a run is in progress (run {run_id}); wait for it or pass --force"
+            )),
+            Daemon::Unclear { message } => Replace::Refuse(format!(
+                "the daemon answered {message}, so a run may be in progress; wait for it or pass --force"
+            )),
+        },
+    }
 }
 
 impl From<PathError> for ServiceError {
@@ -224,16 +313,26 @@ pub fn generate_plist(
 ///
 /// The daemon binary is taken from the directory of the running executable,
 /// copied to the stable path under the application directory and registered
-/// with the installing shell's `PATH`.
+/// with the installing shell's `PATH`. A daemon that is running is asked first
+/// whether it holds a run, and the old agent is waited out of launchd's records
+/// before the new one is handed over, because `bootstrap` refuses a label that
+/// is still registered.
 ///
 /// # Errors
 ///
-/// Returns [`ServiceError::Exe`] when the running binary cannot be located,
-/// [`ServiceError::DaemonMissing`] when the daemon does not sit next to it,
-/// [`ServiceError::Path`] when a location cannot be resolved,
+/// Returns [`ServiceError::Busy`] when a run is in flight and `force` is
+/// [`Force::No`], [`ServiceError::Exe`] when the running binary cannot be
+/// located, [`ServiceError::DaemonMissing`] when the daemon does not sit next
+/// to it, [`ServiceError::Path`] when a location cannot be resolved,
 /// [`ServiceError::Write`] when a directory or a file cannot be written and
-/// [`ServiceError::Launchctl`] when launchd refuses the agent.
-pub async fn install() -> Result<Installed, ServiceError> {
+/// [`ServiceError::Launchctl`] when the old agent outlasts its exit timeout or
+/// launchd refuses the new one.
+pub async fn install(force: Force) -> Result<Installed, ServiceError> {
+    let socket = paths::socket_path()?;
+    match replaceable(&ask_daemon(&socket).await, force) {
+        Replace::Proceed => {}
+        Replace::Refuse(message) => return Err(ServiceError::Busy(message)),
+    }
     let source = daemon_source()?;
     let daemon_path = paths::daemon_binary_path()?;
     let plist_path = paths::launch_agent_path()?;
@@ -250,13 +349,9 @@ pub async fn install() -> Result<Installed, ServiceError> {
     place_daemon(&source, &daemon_path)?;
 
     let path_env = std::env::var("PATH").unwrap_or_default();
-    let plist = generate_plist(
-        &paths::launchd_label(),
-        &daemon_path,
-        &path_env,
-        &log_dir,
-        exit_timeout(configured_drain_timeout()),
-    );
+    let label = paths::launchd_label();
+    let exit_timeout = exit_timeout(configured_drain_timeout());
+    let plist = generate_plist(&label, &daemon_path, &path_env, &log_dir, exit_timeout);
     if let Err(error) = std::fs::write(&plist_path, plist) {
         return Err(ServiceError::Write {
             path: plist_path.display().to_string(),
@@ -266,6 +361,7 @@ pub async fn install() -> Result<Installed, ServiceError> {
 
     let uid = Uid::current().as_raw();
     let _booted_out = launchctl("bootout", uid, &plist_path).await;
+    unregistered(uid, &label, exit_timeout + BOOTOUT_MARGIN).await?;
     launchctl("bootstrap", uid, &plist_path).await?;
 
     Ok(Installed {
@@ -319,6 +415,81 @@ pub fn by_hand(uid: u32, plist_path: &Path) -> String {
     format!(
         "stop    launchctl bootout gui/{uid} {plist_path}\nstart   launchctl bootstrap gui/{uid} {plist_path}"
     )
+}
+
+async fn ask_daemon(socket: &Path) -> Daemon {
+    let asked = tokio::time::timeout(PROBE_TIMEOUT, attached(socket)).await;
+    let Ok(answered) = asked else {
+        return Daemon::Unclear {
+            message: format!("nothing within {PROBE_TIMEOUT:?}"),
+        };
+    };
+    answered
+}
+
+async fn attached(socket: &Path) -> Daemon {
+    let Ok(mut stream) = UnixStream::connect(socket).await else {
+        return Daemon::Absent;
+    };
+    if ipc::send(&mut stream, &ipc::Command::Attach).await.is_err() {
+        return Daemon::Absent;
+    }
+    let Ok(answered) = ipc::receive::<ipc::Response, _>(&mut stream).await else {
+        return Daemon::Absent;
+    };
+    match answered {
+        ipc::Response::NoRun => Daemon::Idle,
+        ipc::Response::Started {
+            run_id,
+            dashboard_url: _,
+        } => Daemon::Busy { run_id },
+        ipc::Response::Busy { run_id } => Daemon::Busy { run_id },
+        ipc::Response::Line { text: _ } => Daemon::Unclear {
+            message: "a line of a run's output".to_string(),
+        },
+        ipc::Response::Ended {
+            status: _,
+            pr_url: _,
+            fail_reason: _,
+        } => Daemon::Unclear {
+            message: "a run that had just ended".to_string(),
+        },
+        ipc::Response::Error { message } => Daemon::Unclear { message },
+    }
+}
+
+async fn unregistered(uid: u32, label: &str, budget: Duration) -> Result<(), ServiceError> {
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut announced = false;
+    loop {
+        if !listed(uid, label).await {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ServiceError::Launchctl {
+                action: "bootout",
+                message: format!("{label} was still registered after {budget:?}"),
+            });
+        }
+        if !announced {
+            println!("waiting for the old daemon to exit");
+            announced = true;
+        }
+        tokio::time::sleep(BOOTOUT_POLL).await;
+    }
+}
+
+async fn listed(uid: u32, label: &str) -> bool {
+    let mut command = Command::new("launchctl");
+    command.arg("print");
+    command.arg(format!("gui/{uid}/{label}"));
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+    let Ok(status) = command.status().await else {
+        return false;
+    };
+    status.success()
 }
 
 fn configured_drain_timeout() -> Duration {
@@ -684,6 +855,94 @@ mod tests {
             report.contains("launchctl bootout gui/501 /agents/dev.pkarpovich.plist"),
             "{report}"
         );
+    }
+
+    #[test]
+    fn an_idle_or_absent_daemon_may_be_replaced() {
+        assert_eq!(replaceable(&Daemon::Idle, Force::No), Replace::Proceed);
+        assert_eq!(replaceable(&Daemon::Absent, Force::No), Replace::Proceed);
+    }
+
+    #[test]
+    fn a_daemon_holding_a_run_stops_the_install_and_names_the_run() {
+        let busy = Daemon::Busy {
+            run_id: RunId("FARM-12-1753180800000".to_string()),
+        };
+        let Replace::Refuse(message) = replaceable(&busy, Force::No) else {
+            panic!("a run in flight stops an install");
+        };
+        assert!(message.contains("a run is in progress"), "{message}");
+        assert!(message.contains("FARM-12-1753180800000"), "{message}");
+        assert!(message.contains("--force"), "{message}");
+    }
+
+    #[test]
+    fn a_daemon_that_answers_something_else_stops_the_install_too() {
+        let unclear = Daemon::Unclear {
+            message: "a line of a run's output".to_string(),
+        };
+        let Replace::Refuse(message) = replaceable(&unclear, Force::No) else {
+            panic!("an answer an attach never gets stops an install");
+        };
+        assert!(message.contains("may be in progress"), "{message}");
+        assert!(message.contains("--force"), "{message}");
+    }
+
+    #[test]
+    fn force_replaces_a_daemon_whatever_it_is_doing() {
+        let busy = Daemon::Busy {
+            run_id: RunId("local-1".to_string()),
+        };
+        let unclear = Daemon::Unclear {
+            message: "nothing".to_string(),
+        };
+        assert_eq!(replaceable(&busy, Force::Yes), Replace::Proceed);
+        assert_eq!(replaceable(&unclear, Force::Yes), Replace::Proceed);
+        assert_eq!(replaceable(&Daemon::Idle, Force::Yes), Replace::Proceed);
+    }
+
+    #[tokio::test]
+    async fn a_socket_nothing_listens_on_reads_as_an_absent_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("daemon.sock");
+
+        assert_eq!(ask_daemon(&socket).await, Daemon::Absent);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_answers_an_attach_is_read_from_its_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let idle = dir.path().join("idle.sock");
+        let busy = dir.path().join("busy.sock");
+        answer(&idle, ipc::Response::NoRun);
+        answer(
+            &busy,
+            ipc::Response::Started {
+                run_id: RunId("local-9".to_string()),
+                dashboard_url: "http://farm.example/#/run/local-9".to_string(),
+            },
+        );
+
+        assert_eq!(ask_daemon(&idle).await, Daemon::Idle);
+        assert_eq!(
+            ask_daemon(&busy).await,
+            Daemon::Busy {
+                run_id: RunId("local-9".to_string())
+            }
+        );
+    }
+
+    fn answer(socket: &Path, response: ipc::Response) {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            let Ok((mut stream, _address)) = listener.accept().await else {
+                return;
+            };
+            let Ok(_command) = ipc::receive::<ipc::Command, _>(&mut stream).await else {
+                return;
+            };
+            let _sent = ipc::send(&mut stream, &response).await;
+        });
     }
 
     #[test]
