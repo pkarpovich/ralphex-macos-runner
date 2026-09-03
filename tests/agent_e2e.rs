@@ -584,6 +584,38 @@ async fn a_shutdown_before_the_first_claim_stops_the_agent_at_once() {
 }
 
 #[tokio::test]
+async fn an_empty_claim_paces_the_loop_and_the_pause_ends_on_a_shutdown() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    farm.always_claim(Reply::NoJob);
+    let mut options = options(&checkout.tools);
+    options.claim_retry_delay = Duration::from_secs(120);
+    let running = start(agent(&farm, config(&farm, &ralphex), options));
+
+    let polled = wait_for(|| match farm.requests_ending("/claim").is_empty() {
+        true => None,
+        false => Some(()),
+    })
+    .await;
+    assert!(polled.is_some(), "the loop never polled");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        farm.requests_ending("/claim").len(),
+        1,
+        "an empty claim was not paced"
+    );
+
+    running.raise.send_replace(true);
+    let exit = tokio::time::timeout(Duration::from_secs(5), running.handle).await;
+
+    let Ok(exit) = exit else {
+        panic!("the shutdown waited the pause out");
+    };
+    assert_eq!(exit.unwrap(), AgentExit::Shutdown);
+}
+
+#[tokio::test]
 async fn a_job_claimed_during_a_shutdown_is_completed_without_being_started() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_SLEEP", "120")]);

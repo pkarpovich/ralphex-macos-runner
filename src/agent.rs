@@ -260,7 +260,10 @@ impl Agent {
     /// instant before an abort would be lost on the wire and finalized as a lost
     /// run three minutes later. A claim that comes back empty hands the slot to
     /// a local request that is already waiting for it, because the queue behind
-    /// the slot serves its waiters in order. A job that comes back from a claim
+    /// the slot serves its waiters in order, and is then paced like a failed one,
+    /// so a farm that answers without holding the poll open cannot turn the loop
+    /// into a spin against it. That pause ends on a shutdown rather than being
+    /// waited out. A job that comes back from a claim
     /// the shutdown overtook is completed as `runner_shutdown` without being
     /// started, because spawning it would burn the whole drain timeout on work
     /// that is killed at its end and would push the exit past the time launchd
@@ -288,7 +291,10 @@ impl Agent {
                 Ok(None) => {
                     self.hold(RunSlot::Free);
                     drop(permit);
-                    continue;
+                    tokio::select! {
+                        () = tokio::time::sleep(self.options.claim_retry_delay) => continue,
+                        _raised = raised(&mut shutdown) => return self.drained().await,
+                    }
                 }
                 Err(error) => {
                     self.hold(RunSlot::Free);
