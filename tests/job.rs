@@ -258,7 +258,10 @@ async fn a_megabyte_long_line_is_chunked_for_the_farm_and_split_for_subscribers(
         printed += line.len();
     }
     assert_eq!(printed, length);
-    assert_eq!(replay.len(), length / MAX_LOG_CHUNK + 1);
+    assert_eq!(replay.len(), length / MAX_LOG_CHUNK);
+    for line in &replay {
+        assert!(!line.is_empty(), "a forced cut left an empty line behind");
+    }
 
     log.close().await;
     let mut delivered = 0;

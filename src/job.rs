@@ -454,26 +454,42 @@ where
 
 struct LineAssembler {
     pending: Vec<u8>,
+    cut: bool,
 }
 
 impl LineAssembler {
     fn new() -> Self {
         LineAssembler {
             pending: Vec::new(),
+            cut: false,
         }
     }
 
     fn feed(&mut self, bytes: &[u8], log: &LogStream) {
         for byte in bytes {
             if *byte == b'\n' {
+                if self.cut {
+                    self.cut = false;
+                    log.push_break();
+                    continue;
+                }
                 self.emit(log, Terminator::Newline);
                 continue;
             }
+            self.cut = false;
             self.pending.push(*byte);
-            if self.pending.len() == MAX_LOG_CHUNK {
-                self.emit(log, Terminator::Cut);
+            if self.pending.len() >= MAX_LOG_CHUNK {
+                self.force(log);
             }
         }
+    }
+
+    fn force(&mut self, log: &LogStream) {
+        let boundary = floor_boundary(&self.pending);
+        let carried = self.pending.split_off(boundary);
+        let piece = std::mem::replace(&mut self.pending, carried);
+        log.push_line(&piece, Terminator::Cut);
+        self.cut = self.pending.is_empty();
     }
 
     fn emit(&mut self, log: &LogStream, terminator: Terminator) {
@@ -486,6 +502,16 @@ impl LineAssembler {
             return;
         }
         self.emit(log, Terminator::Cut);
+    }
+}
+
+fn floor_boundary(bytes: &[u8]) -> usize {
+    let Err(error) = std::str::from_utf8(bytes) else {
+        return bytes.len();
+    };
+    match error.error_len() {
+        Some(_invalid) => bytes.len(),
+        None => error.valid_up_to(),
     }
 }
 
@@ -535,6 +561,71 @@ mod tests {
             "spawn_failed"
         );
         assert_eq!(JobError::Wait(String::new()).fail_reason(), "spawn_failed");
+    }
+
+    fn detached_log() -> LogStream {
+        let client = Arc::new(
+            crate::protocol::client::FarmClient::new(
+                "http://127.0.0.1:1",
+                "t",
+                Arc::new(crate::protocol::client::TokioSleeper),
+            )
+            .unwrap(),
+        );
+        LogStream::new(
+            client,
+            crate::protocol::types::RunId("local-1".to_string()),
+            Arc::new(crate::logstream::IntervalTicker),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_line_cut_at_the_cap_keeps_its_characters_whole() {
+        let log = detached_log();
+        let mut printed = vec![b'a'; MAX_LOG_CHUNK - 1];
+        printed.extend("\u{20ac}".as_bytes());
+        printed.push(b'\n');
+
+        let mut lines = LineAssembler::new();
+        lines.feed(&printed, &log);
+        lines.finish(&log);
+
+        let (replay, _live) = log.subscribe();
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].len(), MAX_LOG_CHUNK - 1);
+        assert_eq!(replay[1], "\u{20ac}");
+        for line in &replay {
+            assert!(
+                !line.contains('\u{fffd}'),
+                "a character was cut in half at the chunk cap"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_newline_right_after_a_forced_cut_adds_no_empty_line() {
+        let log = detached_log();
+        let mut printed = vec![b'a'; MAX_LOG_CHUNK];
+        printed.push(b'\n');
+        printed.extend(b"after\n");
+
+        let mut lines = LineAssembler::new();
+        lines.feed(&printed, &log);
+        lines.finish(&log);
+
+        let (replay, _live) = log.subscribe();
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].len(), MAX_LOG_CHUNK);
+        assert_eq!(replay[1], "after");
+    }
+
+    #[test]
+    fn a_boundary_falls_before_a_character_the_cap_would_split() {
+        assert_eq!(floor_boundary(b"abc"), 3);
+        assert_eq!(floor_boundary("a\u{20ac}".as_bytes()), 4);
+        assert_eq!(floor_boundary(&[b'a', 0xe2, 0x82]), 1);
+        assert_eq!(floor_boundary(&[b'a', 0xe2]), 1);
+        assert_eq!(floor_boundary(&[0xff, 0xfe]), 2);
     }
 
     #[tokio::test]

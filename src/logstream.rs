@@ -244,6 +244,30 @@ impl LogStream {
         }
     }
 
+    /// Records the newline that ended a line already emitted at the chunk cap.
+    ///
+    /// The farm's copy keeps the byte, because the run printed it; the history,
+    /// the tail and the subscribers get nothing, because the line it ends
+    /// reached them at the cap and an empty line here is one the run never
+    /// wrote.
+    ///
+    /// # Panics
+    ///
+    /// Panics when another holder of the buffer lock panicked.
+    pub fn push_break(&self) {
+        let mut buffers = self.buffers.lock().unwrap();
+        buffers.outgoing.push_back(b'\n');
+        let over = buffers.outgoing.len().saturating_sub(LOG_BUFFER_BYTES);
+        if over > 0 {
+            buffers.outgoing.drain(..over);
+        }
+        let filled = buffers.outgoing.len() >= MAX_LOG_CHUNK;
+        drop(buffers);
+        if filled {
+            self.filled.notify_one();
+        }
+    }
+
     /// Returns the replay history and a receiver of the lines that follow it.
     ///
     /// The two are taken under one lock, so no line is lost or seen twice
