@@ -660,7 +660,7 @@ async fn a_completion_the_farm_refuses_is_reported_to_the_client() {
 }
 
 #[tokio::test]
-async fn a_completion_the_farm_already_holds_is_reported_as_the_run_ended() {
+async fn a_completion_the_farm_finalized_first_is_reported_as_a_forgotten_run() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
     let farm = FakeFarm::start().await;
@@ -672,9 +672,12 @@ async fn a_completion_the_farm_already_holds_is_reported_as_the_run_ended() {
     let output = client.wait_with_output().await.unwrap();
 
     let printed = text(&output);
-    assert!(output.status.success(), "{printed}");
-    assert!(printed.contains("done"), "{printed}");
-    assert!(!printed.contains("did not record it"), "{printed}");
+    assert!(!output.status.success(), "{printed}");
+    assert!(
+        printed.contains("the farm no longer knows this run"),
+        "{printed}"
+    );
+    assert!(!printed.contains("\ndone"), "{printed}");
     assert_eq!(farm.requests_ending("/complete").len(), 1);
     drop(daemon.raise);
 }

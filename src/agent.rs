@@ -70,6 +70,8 @@ pub enum RunEnd {
         /// How the run ended and why the farm did not record it.
         message: String,
     },
+    /// The farm had already finalized the run when the completion arrived.
+    Forgotten,
     /// The run ended without a completion being sent.
     Dropped,
 }
@@ -103,8 +105,10 @@ impl CurrentRun {
 
     /// Waits for the run to finish and returns what the farm's records hold.
     ///
-    /// A run the farm has forgotten, and a run whose agent is gone, resolve to
-    /// [`RunEnd::Dropped`].
+    /// A run whose agent is gone resolves to [`RunEnd::Dropped`]; a run the farm
+    /// finalized before the completion reached it resolves to
+    /// [`RunEnd::Forgotten`], because the record the dashboard shows is the
+    /// farm's, not the one this run produced.
     pub async fn ended(&self) -> RunEnd {
         let mut state = self.state.subscribe();
         let finished = state
@@ -213,12 +217,6 @@ struct PullRequest {
     ctx: PathBuf,
     spec: PrSpec,
     create_pr: CreatePr,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Record {
-    Held,
-    Missing,
 }
 
 struct Finished {
@@ -676,12 +674,18 @@ impl Agent {
         let Err(error) = self.client.complete(run_id, &completion).await else {
             return RunEnd::Reported(completion);
         };
-        match record(&error) {
-            Record::Held => {
-                tracing::warn!("run {run_id} was already completed at the farm");
-                RunEnd::Reported(completion)
+        match &error {
+            FarmError::Gone => {
+                tracing::warn!(
+                    "run {run_id} was finalized at the farm before its completion arrived"
+                );
+                RunEnd::Forgotten
             }
-            Record::Missing => {
+            FarmError::VersionMismatch { message: _ }
+            | FarmError::BadRequest(_)
+            | FarmError::Rejected(_, _)
+            | FarmError::Transport(_)
+            | FarmError::Decode(_) => {
                 tracing::warn!("run {run_id} could not be completed: {error}");
                 RunEnd::Unreported {
                     message: unreported(&completion, &error),
@@ -821,17 +825,6 @@ fn failed(fail_reason: &str, message: String, log_tail: String) -> CompleteReque
         fail_reason: fail_reason.to_string(),
         message,
         log_tail,
-    }
-}
-
-fn record(error: &FarmError) -> Record {
-    match error {
-        FarmError::Gone => Record::Held,
-        FarmError::VersionMismatch { message: _ } => Record::Missing,
-        FarmError::BadRequest(_) => Record::Missing,
-        FarmError::Rejected(_, _) => Record::Missing,
-        FarmError::Transport(_) => Record::Missing,
-        FarmError::Decode(_) => Record::Missing,
     }
 }
 
@@ -1079,19 +1072,6 @@ mod tests {
             "{broken}"
         );
         assert!(broken.contains("the farm is down"), "{broken}");
-    }
-
-    #[test]
-    fn a_completion_the_farm_already_holds_is_not_a_missing_record() {
-        assert_eq!(record(&FarmError::Gone), Record::Held);
-        assert_eq!(
-            record(&FarmError::Transport("reset".to_string())),
-            Record::Missing
-        );
-        assert_eq!(
-            record(&FarmError::Rejected(500, "down".to_string())),
-            Record::Missing
-        );
     }
 
     #[test]

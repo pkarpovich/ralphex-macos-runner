@@ -409,6 +409,15 @@ async fn follow(stream: &mut UnixStream, current: &CurrentRun) -> Result<(), Ipc
             .await
         }
         RunEnd::Unreported { message } => send(stream, &Response::Error { message }).await,
+        RunEnd::Forgotten => {
+            send(
+                stream,
+                &Response::Error {
+                    message: "the farm no longer knows this run".to_string(),
+                },
+            )
+            .await
+        }
         RunEnd::Dropped => {
             send(
                 stream,
