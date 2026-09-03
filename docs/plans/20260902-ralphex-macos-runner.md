@@ -435,12 +435,15 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Create: `tests/support/mod.rs`, `tests/support/fake_farm.rs`
 - Create: `tests/client.rs`
 
-- [ ] `FarmClient::new(farm_url, token, sleeper)`; methods `claim`, `open_run`, `append_log(run_id, seq, bytes)`, `heartbeat`, `complete`, each returning `Result<_, FarmError>` where `FarmError` is `{ Gone, VersionMismatch { message: String }, BadRequest(String), Rejected(u16, String), Transport(String), Decode(String) }`
-- [ ] the per-operation retry table from Behavioural rule 1, with the sleeper injected (`Sleeper` trait, tokio-backed in production, instant-and-recording in tests) and a clock for `COMPLETE_BUDGET`
-- [ ] `claim` returns `Ok(None)` on `204`; `409` decodes the `error` field into `VersionMismatch` (raw body when the field is absent); `410` to `Gone`; other `4xx` to `Rejected` or `BadRequest` for `400`; `5xx` and transport errors follow the table
-- [ ] `tests/support/fake_farm.rs`: an `axum` server on an ephemeral port with a scripted response queue per route, a hold-until-released claim, the farm's `seq` rule on the log route, and a recorder of `(path, headers, body)`; a helper to start it and get its URL
-- [ ] write tests: bearer header on every call; `204` claim; job decode; `409` on claim and on heartbeat carries the fake's message verbatim; `410`; `append_log` on `500,500,200` succeeds on the third attempt with two recorded sleeps; `append_log` gives up after 6 attempts of `500`; `complete` is still retrying at attempt 10 and stops when the clock passes `COMPLETE_BUDGET`; `complete` stops on `410`; `open_run` on `500` fails at once with exactly one recorded request; a non-`410` `4xx` on log does not retry
-- [ ] run the gate - must pass before task 4
+- [x] `FarmClient::new(farm_url, token, sleeper)`; methods `claim`, `open_run`, `append_log(run_id, seq, bytes)`, `heartbeat`, `complete`, each returning `Result<_, FarmError>` where `FarmError` is `{ Gone, VersionMismatch { message: String }, BadRequest(String), Rejected(u16, String), Transport(String), Decode(String) }`
+- [x] the per-operation retry table from Behavioural rule 1, with the sleeper injected (`Sleeper` trait, tokio-backed in production, instant-and-recording in tests) and a clock for `COMPLETE_BUDGET`
+- [x] `claim` returns `Ok(None)` on `204`; `409` decodes the `error` field into `VersionMismatch` (raw body when the field is absent); `410` to `Gone`; other `4xx` to `Rejected` or `BadRequest` for `400`; `5xx` and transport errors follow the table
+- [x] `tests/support/fake_farm.rs`: an `axum` server on an ephemeral port with a scripted response queue per route, a hold-until-released claim, the farm's `seq` rule on the log route, and a recorder of `(path, headers, body)`; a helper to start it and get its URL
+- [x] write tests: bearer header on every call; `204` claim; job decode; `409` on claim and on heartbeat carries the fake's message verbatim; `410`; `append_log` on `500,500,200` succeeds on the third attempt with two recorded sleeps; `append_log` gives up after 6 attempts of `500`; `complete` is still retrying at attempt 10 and stops when the clock passes `COMPLETE_BUDGET`; `complete` stops on `410`; `open_run` on `500` fails at once with exactly one recorded request; a non-`410` `4xx` on log does not retry
+- [x] run the gate - must pass before task 4
+
+➕ The `Sleeper` trait carries both `sleep` and `now`, so one injected object serves the backoff and the `COMPLETE_BUDGET` clock; the test double advances its own clock by every delay it is asked for.
+➕ The fake farm's per-route script is a queue plus an optional sticky reply the route falls back to once the queue is empty, which is how a test asks for "answer `500` until I stop asking".
 
 ### Task 4: Log pipeline
 
