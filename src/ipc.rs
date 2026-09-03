@@ -499,6 +499,15 @@ async fn follow(stream: &mut UnixStream, current: &CurrentRun) -> Result<(), Ipc
             )
             .await
         }
+        RunEnd::VersionMismatch { message } => {
+            send(
+                stream,
+                &Response::Error {
+                    message: format!("the farm speaks another protocol version: {message}"),
+                },
+            )
+            .await
+        }
         RunEnd::Dropped => {
             send(
                 stream,

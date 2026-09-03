@@ -140,6 +140,11 @@ pub enum RunEnd {
     },
     /// The farm had already finalized the run when the completion arrived.
     Forgotten,
+    /// The run was stopped because the farm speaks another protocol version.
+    VersionMismatch {
+        /// The farm's message, naming both versions.
+        message: String,
+    },
     /// The run ended without a completion being sent.
     Dropped,
 }
@@ -173,10 +178,12 @@ impl CurrentRun {
 
     /// Waits for the run to finish and returns what the farm's records hold.
     ///
-    /// A run whose agent is gone resolves to [`RunEnd::Dropped`]; a run the farm
-    /// finalized before the completion reached it resolves to
-    /// [`RunEnd::Forgotten`], because the record the dashboard shows is the
-    /// farm's, not the one this run produced.
+    /// A run whose agent is gone, and one the farm forgot the lease of, resolve
+    /// to [`RunEnd::Dropped`]; a run the farm finalized before the completion
+    /// reached it resolves to [`RunEnd::Forgotten`], because the record the
+    /// dashboard shows is the farm's, not the one this run produced; and a run
+    /// a protocol mismatch stopped resolves to [`RunEnd::VersionMismatch`],
+    /// which is a different thing from the farm having forgotten it.
     pub async fn ended(&self) -> RunEnd {
         let mut state = self.state.subscribe();
         let finished = state
@@ -563,7 +570,12 @@ impl Agent {
         } = self.execute(job, local, shutdown, current).await;
         let ended = match completion {
             Some(completion) => self.report(&run_id, completion).await,
-            None => RunEnd::Dropped,
+            None => match &outcome {
+                RunOutcome::Continue => RunEnd::Dropped,
+                RunOutcome::VersionMismatch { message } => RunEnd::VersionMismatch {
+                    message: message.clone(),
+                },
+            },
         };
         if let Some(beats) = beats {
             beats.abort();

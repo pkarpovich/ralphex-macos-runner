@@ -31,6 +31,8 @@ use tokio::net::UnixStream;
 use tokio::process::ChildStdout;
 use tokio::sync::watch;
 
+const MISMATCH: &str = r#"{"error":"the runner speaks 1, the farm speaks 2"}"#;
+
 enum Claiming {
     Yes,
     No,
@@ -652,6 +654,38 @@ async fn a_local_run_the_farm_forgets_is_reported_to_the_client() {
     assert!(
         farm.requests_ending("/complete").is_empty(),
         "a forgotten run was completed"
+    );
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_local_run_a_protocol_mismatch_stops_says_so_to_the_client() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_SLEEP", "120")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(job(&checkout, "local-15"))));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let record = spawned(&checkout.record).await;
+    farm.always_heartbeat(Reply::Status(409, MISMATCH.to_string()));
+    let output = client.wait_with_output().await.unwrap();
+
+    let printed = text(&output);
+    assert!(!output.status.success(), "{printed}");
+    assert!(
+        printed.contains("the farm speaks another protocol version"),
+        "{printed}"
+    );
+    assert!(printed.contains("the farm speaks 2"), "{printed}");
+    assert!(
+        !printed.contains("no longer knows this run"),
+        "a mismatch was reported as a forgotten run: {printed}"
+    );
+    assert!(dead(record.pid).await, "the run outlived the mismatch");
+    assert!(
+        farm.requests_ending("/complete").is_empty(),
+        "a mismatched run was completed"
     );
     drop(daemon.raise);
 }
