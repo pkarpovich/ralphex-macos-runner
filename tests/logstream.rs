@@ -98,7 +98,10 @@ async fn the_farm_refuses_a_chunk_numbered_zero() {
         .await
         .unwrap_err();
 
-    assert_eq!(error, FarmError::BadRequest("bad seq 0".to_string()));
+    assert_eq!(
+        error,
+        FarmError::BadRequest("invalid seq: must be a positive integer".to_string())
+    );
 }
 
 #[tokio::test]

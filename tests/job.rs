@@ -6,8 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nix::sys::signal::kill;
-use nix::unistd::Pid;
 use ralphex_macos_runner::job::{
     JobError, JobSpec, LocalOptions, Review, Worktree, spawn, validate,
 };
@@ -15,7 +13,9 @@ use ralphex_macos_runner::logstream::LogStream;
 use ralphex_macos_runner::protocol::client::FarmClient;
 use ralphex_macos_runner::protocol::types::{Branch, MAX_LOG_CHUNK, RunId};
 use support::fake_farm::FakeFarm;
-use support::{Record, TestSleeper, TickHandle, fake_ralphex, manual_ticker};
+use support::{
+    Record, TestSleeper, TickHandle, dead, fake_ralphex, gone_within, manual_ticker, wait_for,
+};
 use tempfile::TempDir;
 
 fn stream(farm: &FakeFarm) -> (Arc<LogStream>, TickHandle) {
@@ -57,23 +57,6 @@ fn spec(ctx: &Path, plan: &Path) -> JobSpec {
 
 fn with_env(spec: &mut JobSpec, key: &str, value: &str) {
     spec.local.env.push((key.to_string(), value.to_string()));
-}
-
-fn wait_for(deadline: Duration, mut ready: impl FnMut() -> bool) -> bool {
-    let started = Instant::now();
-    loop {
-        if ready() {
-            return true;
-        }
-        if started.elapsed() > deadline {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn alive(pid: i32) -> bool {
-    kill(Pid::from_raw(pid), None).is_ok()
 }
 
 #[tokio::test]
@@ -340,12 +323,7 @@ async fn stopping_takes_the_whole_process_group_down() {
     with_env(&mut spec, "FAKE_RALPHEX_SLEEP", "120");
 
     let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
-    let written = wait_for(Duration::from_secs(10), || {
-        let Ok(contents) = std::fs::read_to_string(&record) else {
-            return false;
-        };
-        contents.contains("child: ")
-    });
+    let written = recorded_child(&record).await;
     assert!(written, "the fake never recorded its child");
 
     let record = Record::read(&record);
@@ -357,11 +335,23 @@ async fn stopping_takes_the_whole_process_group_down() {
     job.stop(Duration::from_secs(5)).await.unwrap();
     job.drain_output(Duration::from_secs(5)).await;
 
-    let gone = wait_for(Duration::from_secs(10), || {
-        !alive(record.pid) && !alive(child)
-    });
-    assert!(gone, "the process group outlived the stop");
+    assert!(dead(record.pid).await, "the leader outlived the stop");
+    assert!(dead(child).await, "the process group outlived the stop");
     log.close().await;
+}
+
+async fn recorded_child(record: &Path) -> bool {
+    let written = wait_for(|| {
+        let Ok(contents) = std::fs::read_to_string(record) else {
+            return None;
+        };
+        if contents.contains("child: ") {
+            return Some(());
+        }
+        None
+    })
+    .await;
+    written.is_some()
 }
 
 #[tokio::test]
@@ -380,12 +370,7 @@ async fn a_group_member_that_ignores_the_signal_is_killed_within_the_grace() {
     with_env(&mut spec, "FAKE_RALPHEX_SLEEP", "120");
 
     let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
-    let written = wait_for(Duration::from_secs(10), || {
-        let Ok(contents) = std::fs::read_to_string(&record) else {
-            return false;
-        };
-        contents.contains("child: ")
-    });
+    let written = recorded_child(&record).await;
     assert!(written, "the fake never recorded its child");
     let record = Record::read(&record);
     let Some(child) = record.child else {
@@ -401,9 +386,8 @@ async fn a_group_member_that_ignores_the_signal_is_killed_within_the_grace() {
         elapsed < grace,
         "the leader outlived a signal it honours: {elapsed:?}"
     );
-    let gone = wait_for(grace, || !alive(child));
     assert!(
-        gone,
+        gone_within(child, Duration::from_secs(1)).await,
         "a group member that ignores SIGTERM outlived the stop"
     );
     job.drain_output(Duration::from_secs(5)).await;

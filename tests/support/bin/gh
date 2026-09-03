@@ -44,8 +44,8 @@ case "$key" in
     ;;
   create)
     if [ -z "${FAKE_SILENT_CREATE:-}" ]; then
-      echo "Creating pull request for the branch"
-      echo ""
+      echo "Creating pull request for the branch" >&2
+      echo "" >&2
       echo "https://github.com/owner/repo/pull/7"
     fi
     ;;

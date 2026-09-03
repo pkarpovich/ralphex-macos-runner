@@ -530,7 +530,10 @@ mod tests {
 
     fn socket_of_length(root: &Path, length: usize) -> PathBuf {
         let name = "daemon.sock";
-        let room = length - root.as_os_str().as_bytes().len() - name.len() - 2;
+        let taken = root.as_os_str().as_bytes().len() + name.len() + 2;
+        let Some(room) = length.checked_sub(taken) else {
+            panic!("the temporary directory leaves no room to pad");
+        };
         assert!(room > 0, "the temporary directory leaves no room to pad");
         root.join("d".repeat(room)).join(name)
     }

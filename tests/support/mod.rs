@@ -12,10 +12,274 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use nix::sys::signal::kill;
+use nix::unistd::Pid;
+use ralphex_macos_runner::agent::AgentOptions;
 use ralphex_macos_runner::logstream::Ticker;
+use ralphex_macos_runner::pr::PrTools;
 use ralphex_macos_runner::protocol::client::Sleeper;
+use ralphex_macos_runner::protocol::types::{Branch, CompleteRequest, CreatePr, Job, RunId};
+use tempfile::TempDir;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
+
+use fake_farm::FakeFarm;
+
+/// A git checkout with a plan in it and the paths the fakes record to.
+pub struct Checkout {
+    dir: TempDir,
+    plan: PathBuf,
+    record: PathBuf,
+    tools: PathBuf,
+}
+
+impl Checkout {
+    /// Returns a fresh git checkout holding `plan.md`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the directory cannot be made or `git init` fails.
+    #[must_use]
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.md");
+        std::fs::write(&plan, "# plan\n").unwrap();
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--quiet")
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let record = dir.path().join("ralphex-record");
+        let tools = dir.path().join("tools-record");
+        Checkout {
+            dir,
+            plan,
+            record,
+            tools,
+        }
+    }
+
+    /// Returns the checkout's directory as the temporary root named it.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        self.dir.path()
+    }
+
+    /// Returns the checkout's directory with every symlink resolved.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the directory does not resolve.
+    #[must_use]
+    pub fn path(&self) -> PathBuf {
+        self.dir.path().canonicalize().unwrap()
+    }
+
+    /// Returns the plan's path with every symlink resolved.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the plan does not resolve.
+    #[must_use]
+    pub fn plan(&self) -> PathBuf {
+        self.plan.canonicalize().unwrap()
+    }
+
+    /// Returns the file the fake ralphex records its invocation to.
+    #[must_use]
+    pub fn record(&self) -> &Path {
+        &self.record
+    }
+
+    /// Returns the file the git and GitHub CLI stand-ins record their runs to.
+    #[must_use]
+    pub fn tools(&self) -> &Path {
+        &self.tools
+    }
+
+    /// Returns a fake ralphex in this checkout, scripted with `settings`.
+    #[must_use]
+    pub fn ralphex(&self, settings: &[(&str, &str)]) -> PathBuf {
+        let mut settings = settings.to_vec();
+        let record = self.record.display().to_string();
+        settings.push(("FAKE_RALPHEX_RECORD", &record));
+        fake_ralphex_with(self.dir.path(), &settings)
+    }
+}
+
+impl Default for Checkout {
+    fn default() -> Self {
+        Checkout::new()
+    }
+}
+
+/// Returns the job a Linear ticket dispatched for `ctx` and `plan`.
+#[must_use]
+pub fn ticket_job(ctx: &Path, plan: &Path, create_pr: CreatePr) -> Job {
+    Job {
+        run_id: RunId("FARM-12-1753180800000".to_string()),
+        issue_id: "issue-uuid".to_string(),
+        identifier: "FARM-12".to_string(),
+        issue_url: "https://linear.app/example/issue/FARM-12".to_string(),
+        title: "split farm and runner".to_string(),
+        repo_slug: "owner/repo".to_string(),
+        plan_path: plan.display().to_string(),
+        branch: Branch("x".to_string()),
+        mode: String::new(),
+        lease_ttl_seconds: 180,
+        runtime: "native".to_string(),
+        ctx: ctx.display().to_string(),
+        create_pr,
+    }
+}
+
+/// Returns the job an `rxd` invocation opened in `checkout` under `run_id`.
+#[must_use]
+pub fn local_job(checkout: &Checkout, run_id: &str) -> Job {
+    Job {
+        run_id: RunId(run_id.to_string()),
+        issue_id: String::new(),
+        identifier: String::new(),
+        issue_url: String::new(),
+        title: "plan".to_string(),
+        repo_slug: String::new(),
+        plan_path: checkout.plan().display().to_string(),
+        branch: Branch("plan".to_string()),
+        mode: String::new(),
+        lease_ttl_seconds: 180,
+        runtime: "native".to_string(),
+        ctx: checkout.path().display().to_string(),
+        create_pr: CreatePr::No,
+    }
+}
+
+/// Returns the agent options the suite runs with, recording tools to `record`.
+#[must_use]
+pub fn options(record: &Path) -> AgentOptions {
+    AgentOptions {
+        heartbeat_interval: Duration::from_millis(20),
+        drain_timeout: Duration::from_millis(50),
+        stop_grace: Duration::from_millis(200),
+        claim_retry_delay: Duration::from_millis(10),
+        ticker: fixed_ticker(Duration::from_millis(20)),
+        pr_tools: PrTools {
+            git: fake_git().display().to_string(),
+            gh: fake_gh().display().to_string(),
+            env: vec![("FAKE_RECORD".to_string(), record.display().to_string())],
+            step_timeout: Duration::from_secs(30),
+        },
+    }
+}
+
+/// Polls `ready` every ten milliseconds until it answers or ten seconds pass.
+pub async fn wait_for<T>(mut ready: impl FnMut() -> Option<T>) -> Option<T> {
+    for _attempt in 0..1000 {
+        if let Some(value) = ready() {
+            return Some(value);
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
+/// Returns what the fake ralphex recorded, once it has started.
+///
+/// # Panics
+///
+/// Panics when it never starts.
+pub async fn spawned(record: &Path) -> Record {
+    let started = wait_for(|| {
+        let Ok(contents) = std::fs::read_to_string(record) else {
+            return None;
+        };
+        if contents.contains("pid: ") {
+            return Some(());
+        }
+        None
+    })
+    .await;
+    assert!(started.is_some(), "the fake ralphex never started");
+    Record::read(record)
+}
+
+/// Returns the first completion the fake farm received.
+///
+/// # Panics
+///
+/// Panics when none arrives.
+pub async fn completion(farm: &FakeFarm) -> CompleteRequest {
+    let recorded = wait_for(|| farm.requests_ending("/complete").first().cloned()).await;
+    let Some(recorded) = recorded else {
+        panic!("no completion arrived");
+    };
+    serde_json::from_slice(&recorded.body).unwrap()
+}
+
+/// Returns whether the process `pid` still exists.
+#[must_use]
+pub fn alive(pid: i32) -> bool {
+    kill(Pid::from_raw(pid), None).is_ok()
+}
+
+/// Waits up to `budget` for the process `pid` to be gone.
+pub async fn gone_within(pid: i32, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    while alive(pid) {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    true
+}
+
+/// Waits for the process `pid` to be gone and returns whether it went.
+pub async fn dead(pid: i32) -> bool {
+    gone_within(pid, Duration::from_secs(10)).await
+}
+
+/// Spawns the real `rxd` against `socket`, in `checkout`, with `args`.
+///
+/// # Panics
+///
+/// Panics when the binary cannot be started.
+#[must_use]
+pub fn rxd(
+    socket: &Path,
+    checkout: &Checkout,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> tokio::process::Child {
+    let mut argv = args.to_vec();
+    let socket = socket.display().to_string();
+    argv.push("--socket");
+    argv.push(&socket);
+    rxd_argv(checkout, &argv, env)
+}
+
+/// Spawns the real `rxd` in `checkout` with exactly `args`.
+///
+/// # Panics
+///
+/// Panics when the binary cannot be started.
+#[must_use]
+pub fn rxd_argv(checkout: &Checkout, args: &[&str], env: &[(&str, &str)]) -> tokio::process::Child {
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_rxd"));
+    for argument in args {
+        command.arg(argument);
+    }
+    command.current_dir(checkout.dir());
+    command.env_remove("CLAUDE_CONFIG_DIR");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    command.spawn().unwrap()
+}
 
 /// A [`Sleeper`] that returns at once, records every delay and advances a clock
 /// of its own by the delay it was asked for.

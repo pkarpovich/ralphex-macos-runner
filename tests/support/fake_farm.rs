@@ -2,10 +2,11 @@
 //!
 //! A test scripts each route with a queue of [`Reply`] values, or with a sticky
 //! reply the route falls back to once the queue is empty, and reads back every
-//! request the client made. The log route enforces the farm's own sequence
-//! rule, and the run route its version check, so a client that numbers a chunk
-//! below the last accepted value or speaks another protocol version meets the
-//! same answer here as at the farm.
+//! request the client made. The log route answers the way the real one does -
+//! `204` for a chunk it took and for a chunk whose sequence number it has
+//! already seen, `400` only for a number below one - and the run route runs the
+//! same version check, so a client that repeats a sequence number or speaks
+//! another protocol version meets the same answer here as at the farm.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -406,16 +407,30 @@ async fn log(
         Some(last) => *last,
         None => 0,
     };
-    if seq < 1 || seq <= last {
+    if seq < 1 {
         drop(routes);
-        return respond(Reply::Status(400, format!("bad seq {seq}")));
+        return respond(Reply::Status(
+            400,
+            "invalid seq: must be a positive integer".to_string(),
+        ));
+    }
+    if seq <= last {
+        drop(routes);
+        return accepted();
     }
     let reply = routes.log.take(Reply::Accepted);
     if accepts(&reply) {
         routes.last_seq.insert(id, seq);
     }
     drop(routes);
-    respond(reply)
+    let Reply::Accepted = reply else {
+        return respond(reply);
+    };
+    accepted()
+}
+
+fn accepted() -> Response {
+    StatusCode::NO_CONTENT.into_response()
 }
 
 async fn heartbeat(
