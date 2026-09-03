@@ -16,7 +16,10 @@
 //! abandons it without a completion at all. The heartbeat is the first thing a
 //! run starts, before the runtime is checked and before the checkout is
 //! inspected, so even a job this runner refuses is completed under a lease the
-//! farm is still seeing renewed.
+//! farm is still seeing renewed. Only a `nonzero_exit` completion carries a log
+//! tail, which is what the lifecycle table and the Go runner say: every other
+//! failure has its reason in `message`, and the run's output is already on the
+//! dashboard.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -646,7 +649,11 @@ impl Agent {
                 drain.abort();
                 log.close().await;
                 return Finished {
-                    completion: Some(failed(error.fail_reason(), error.to_string(), log.tail())),
+                    completion: Some(failed(
+                        error.fail_reason(),
+                        error.to_string(),
+                        String::new(),
+                    )),
                     outcome: RunOutcome::Continue,
                     beats: Some(beats),
                 };
@@ -664,7 +671,7 @@ impl Agent {
                 }
                 running.drain_output(self.options.stop_grace).await;
                 log.close().await;
-                return stopped(reason, &run_id, log.tail(), beats);
+                return stopped(reason, &run_id, beats);
             }
             Ended::Exited(exited) => exited,
         };
@@ -710,7 +717,7 @@ impl Agent {
             Settled::Interrupted(reason) => {
                 drop(finishing);
                 log.close().await;
-                stopped(reason, &run_id, log.tail(), beats)
+                stopped(reason, &run_id, beats)
             }
         }
     }
@@ -1021,9 +1028,8 @@ async fn finish(
 ) -> CompleteRequest {
     running.drain_output(stop_grace).await;
     log.close().await;
-    let tail = log.tail();
     let status = match exited {
-        Err(error) => return failed(error.fail_reason(), error.to_string(), tail),
+        Err(error) => return failed(error.fail_reason(), error.to_string(), String::new()),
         Ok(status) => status,
     };
     let PullRequest {
@@ -1032,21 +1038,25 @@ async fn finish(
         create_pr,
     } = pull_request;
     match status.success() {
-        false => failed("nonzero_exit", exit_message(status), tail),
+        false => failed("nonzero_exit", exit_message(status), log.tail()),
         true => match create_pr {
             CreatePr::No => done(String::new()),
             CreatePr::Yes => match open_pull_request(&ctx, &spec, tools).await {
                 Ok(PrUrl(url)) => done(url),
-                Err(error) => failed(error.fail_reason(), error.to_string(), tail),
+                Err(error) => failed(error.fail_reason(), error.to_string(), String::new()),
             },
         },
     }
 }
 
-fn stopped(reason: Terminal, run_id: &RunId, tail: String, beats: JoinHandle<()>) -> Finished {
+fn stopped(reason: Terminal, run_id: &RunId, beats: JoinHandle<()>) -> Finished {
     match reason {
         Terminal::Cancel => Finished {
-            completion: Some(failed("canceled", "the run was canceled".to_string(), tail)),
+            completion: Some(failed(
+                "canceled",
+                "the run was canceled".to_string(),
+                String::new(),
+            )),
             outcome: RunOutcome::Continue,
             beats: Some(beats),
         },
@@ -1054,7 +1064,7 @@ fn stopped(reason: Terminal, run_id: &RunId, tail: String, beats: JoinHandle<()>
             completion: Some(failed(
                 "runner_shutdown",
                 "the runner shut down while the run was in flight".to_string(),
-                tail,
+                String::new(),
             )),
             outcome: RunOutcome::Continue,
             beats: Some(beats),

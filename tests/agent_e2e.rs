@@ -329,11 +329,15 @@ async fn a_cancel_on_the_heartbeat_stops_the_run_and_completes_it_as_canceled() 
         pr_url: _,
         fail_reason,
         message: _,
-        log_tail: _,
+        log_tail,
     } = completion(&farm).await;
 
     assert_eq!(status, CompleteStatus::Error);
     assert_eq!(fail_reason, "canceled");
+    assert!(
+        log_tail.is_empty(),
+        "only a nonzero exit carries a tail: {log_tail}"
+    );
     assert!(dead(record.pid).await, "the run outlived its cancel");
 }
 
@@ -631,12 +635,16 @@ async fn a_run_that_outlasts_its_drain_completes_as_a_shutdown() {
         pr_url: _,
         fail_reason,
         message,
-        log_tail: _,
+        log_tail,
     } = completion(&farm).await;
 
     assert_eq!(status, CompleteStatus::Error);
     assert_eq!(fail_reason, "runner_shutdown");
     assert!(message.contains("shut down"), "{message}");
+    assert!(
+        log_tail.is_empty(),
+        "only a nonzero exit carries a tail: {log_tail}"
+    );
     assert!(dead(record.pid).await, "the run outlived the shutdown");
     assert_eq!(running.handle.await.unwrap(), AgentExit::Shutdown);
 }
