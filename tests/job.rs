@@ -195,6 +195,35 @@ async fn both_pipes_reach_the_log_stream() {
 }
 
 #[tokio::test]
+async fn a_line_written_in_pieces_reaches_the_farm_unbroken() {
+    let farm = FakeFarm::start().await;
+    let (log, _handle) = stream(&farm);
+    let (dir, plan) = checkout();
+    let mut spec = spec(dir.path(), &plan);
+    with_env(&mut spec, "FAKE_RALPHEX_SPLIT_LINE", "8");
+
+    let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
+    job.wait().await.unwrap();
+    job.drain_output(Duration::from_secs(5)).await;
+    log.close().await;
+
+    let mut delivered = Vec::new();
+    for request in farm.requests_ending("/log") {
+        delivered.extend(request.body);
+    }
+    let delivered = String::from_utf8(delivered).unwrap();
+    let mut whole = String::new();
+    for piece in 1..=8 {
+        whole.push_str(&format!("piece{piece}"));
+    }
+    assert!(
+        delivered.contains(&whole),
+        "the stdout line reached the farm broken by stderr: {delivered}"
+    );
+    assert!(delivered.contains("noise 8"), "{delivered}");
+}
+
+#[tokio::test]
 async fn a_nonzero_exit_code_propagates() {
     let farm = FakeFarm::start().await;
     let (log, _handle) = stream(&farm);

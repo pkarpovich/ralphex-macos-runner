@@ -29,6 +29,18 @@ while [ "$index" -le "$lines" ]; do
   index=$((index + 1))
 done
 
+split="${FAKE_RALPHEX_SPLIT_LINE:-0}"
+if [ "$split" -gt 0 ]; then
+  index=1
+  while [ "$index" -le "$split" ]; do
+    printf 'piece%d' "$index"
+    echo "noise $index" >&2
+    sleep 0.05
+    index=$((index + 1))
+  done
+  printf '\n'
+fi
+
 burst="${FAKE_RALPHEX_BURST:-0}"
 if [ "$burst" -gt 0 ]; then
   awk -v n="$burst" 'BEGIN { for (i = 1; i <= n; i++) printf "burst %d\n", i }'

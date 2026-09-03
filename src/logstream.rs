@@ -43,6 +43,15 @@ impl Ticker for IntervalTicker {
     }
 }
 
+/// How the line handed to [`LogStream::push_line`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Terminator {
+    /// The run printed a newline after it, which the farm's copy keeps.
+    Newline,
+    /// The line was cut at [`MAX_LOG_CHUNK`], so nothing is added to it.
+    Cut,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Latch {
     Open,
@@ -197,17 +206,42 @@ impl LogStream {
         }
     }
 
-    /// Records `line` in the history and the tail and sends it to subscribers.
+    /// Records one emitted line in every view of the run's output at once.
+    ///
+    /// The farm gets `line` byte for byte, followed by the newline that ended
+    /// it when `terminator` says there was one; the history, the tail and the
+    /// subscribers get its text with a trailing carriage return removed. Taking
+    /// the four under one lock is what keeps them the same log: a pipe that
+    /// wrote its own bytes in between would otherwise split this line in the
+    /// farm's copy while the other three still held it whole.
     ///
     /// # Panics
     ///
     /// Panics when another holder of the buffer lock panicked.
-    pub fn push_line(&self, line: String) {
+    pub fn push_line(&self, line: &[u8], terminator: Terminator) {
+        let text = String::from_utf8_lossy(line).into_owned();
+        let text = match text.strip_suffix('\r') {
+            Some(text) => text.to_string(),
+            None => text,
+        };
         let mut buffers = self.buffers.lock().unwrap();
-        buffers.history.push(&line);
-        buffers.tail.push(&line);
-        let _ = self.lines.send(line);
+        buffers.outgoing.extend(line);
+        match terminator {
+            Terminator::Newline => buffers.outgoing.push_back(b'\n'),
+            Terminator::Cut => {}
+        }
+        let over = buffers.outgoing.len().saturating_sub(LOG_BUFFER_BYTES);
+        if over > 0 {
+            buffers.outgoing.drain(..over);
+        }
+        let filled = buffers.outgoing.len() >= MAX_LOG_CHUNK;
+        buffers.history.push(&text);
+        buffers.tail.push(&text);
+        let _ = self.lines.send(text);
         drop(buffers);
+        if filled {
+            self.filled.notify_one();
+        }
     }
 
     /// Returns the replay history and a receiver of the lines that follow it.

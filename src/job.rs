@@ -3,9 +3,11 @@
 //! A [`JobSpec`] names everything the run needs; [`validate`] rejects a checkout
 //! or a plan the lifecycle table refuses before anything is spawned. [`spawn`]
 //! starts ralphex as the leader of its own process group and pumps both of its
-//! pipes into a [`LogStream`], as raw chunks for the farm and as capped lines
-//! for the history and the attached clients. [`RunningJob`] waits for the exit
-//! or takes the group down.
+//! pipes into a [`LogStream`] one assembled line at a time, capped at
+//! [`MAX_LOG_CHUNK`]: the two pipes share the stream, and handing it raw reads
+//! let a chunk of stderr land inside a line of stdout in the farm's copy while
+//! the history, the tail and the attached clients still held that line whole.
+//! [`RunningJob`] waits for the exit or takes the group down.
 
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
@@ -18,7 +20,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
-use crate::logstream::LogStream;
+use crate::logstream::{LogStream, Terminator};
 use crate::protocol::types::{Branch, MAX_LOG_CHUNK, VALIDATE_TIMEOUT};
 
 /// Whether ralphex runs in review mode.
@@ -445,9 +447,7 @@ where
         if read == 0 {
             break;
         }
-        let chunk = &buffer[..read];
-        log.write(chunk);
-        lines.feed(chunk, &log);
+        lines.feed(&buffer[..read], &log);
     }
     lines.finish(&log);
 }
@@ -466,31 +466,26 @@ impl LineAssembler {
     fn feed(&mut self, bytes: &[u8], log: &LogStream) {
         for byte in bytes {
             if *byte == b'\n' {
-                self.emit(log);
+                self.emit(log, Terminator::Newline);
                 continue;
             }
             self.pending.push(*byte);
             if self.pending.len() == MAX_LOG_CHUNK {
-                self.emit(log);
+                self.emit(log, Terminator::Cut);
             }
         }
     }
 
-    fn emit(&mut self, log: &LogStream) {
+    fn emit(&mut self, log: &LogStream, terminator: Terminator) {
         let line = std::mem::take(&mut self.pending);
-        let line = String::from_utf8_lossy(&line).into_owned();
-        let line = match line.strip_suffix('\r') {
-            Some(line) => line.to_string(),
-            None => line,
-        };
-        log.push_line(line);
+        log.push_line(&line, terminator);
     }
 
     fn finish(&mut self, log: &LogStream) {
         if self.pending.is_empty() {
             return;
         }
-        self.emit(log);
+        self.emit(log, Terminator::Cut);
     }
 }
 

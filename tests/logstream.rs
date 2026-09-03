@@ -5,7 +5,7 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ralphex_macos_runner::logstream::LogStream;
+use ralphex_macos_runner::logstream::{LogStream, Terminator};
 use ralphex_macos_runner::protocol::client::{FarmClient, FarmError};
 use ralphex_macos_runner::protocol::types::{
     HISTORY_LINES, LOG_BUFFER_BYTES, LOG_TAIL_LINES, MAX_LOG_CHUNK, RunId, Seq,
@@ -125,7 +125,7 @@ async fn the_tail_keeps_the_last_hundred_lines() {
     let (stream, _handle) = stream(&farm);
 
     for index in 0..150 {
-        stream.push_line(format!("line {index}"));
+        stream.push_line(format!("line {index}").as_bytes(), Terminator::Newline);
     }
 
     let tail = stream.tail();
@@ -143,8 +143,7 @@ async fn a_late_subscriber_replays_the_history_then_follows_the_live_lines() {
 
     for index in 0..50 {
         let line = format!("line {index}");
-        stream.write(line.as_bytes());
-        stream.push_line(line);
+        stream.push_line(line.as_bytes(), Terminator::Newline);
     }
     handle.drive().await;
     handle.drive().await;
@@ -155,7 +154,7 @@ async fn a_late_subscriber_replays_the_history_then_follows_the_live_lines() {
     assert_eq!(replay[0], "line 0");
     assert_eq!(replay[49], "line 49");
 
-    stream.push_line("line 50".to_string());
+    stream.push_line(b"line 50", Terminator::Newline);
     assert_eq!(live.recv().await.unwrap(), "line 50");
     stream.close().await;
 }
@@ -167,7 +166,7 @@ async fn two_subscribers_both_receive_a_line() {
 
     let (_, mut first) = stream.subscribe();
     let (_, mut second) = stream.subscribe();
-    stream.push_line("shared".to_string());
+    stream.push_line(b"shared", Terminator::Newline);
 
     assert_eq!(first.recv().await.unwrap(), "shared");
     assert_eq!(second.recv().await.unwrap(), "shared");
@@ -180,7 +179,7 @@ async fn the_history_ring_drops_the_oldest_line_past_its_bound() {
     let (stream, _handle) = stream(&farm);
 
     for index in 0..(HISTORY_LINES + 5) {
-        stream.push_line(format!("line {index}"));
+        stream.push_line(format!("line {index}").as_bytes(), Terminator::Newline);
     }
 
     let (replay, _live) = stream.subscribe();
