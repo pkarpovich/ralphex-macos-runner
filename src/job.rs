@@ -335,10 +335,21 @@ impl RunningJob {
     }
 
     /// Waits out `budget` for the tasks draining the run's pipes to finish.
+    ///
+    /// The budget covers the whole drain rather than each pipe in turn, and a
+    /// task still reading when it runs out is aborted: a helper that reparented
+    /// out of the process group holds the pipe open for as long as it lives, so
+    /// a task merely dropped here would outlive the run forever, holding the
+    /// log stream the flusher has already stopped serving.
     pub async fn drain_output(&mut self, budget: Duration) {
         let readers = std::mem::take(&mut self.readers);
-        for reader in readers {
-            let _ = tokio::time::timeout(budget, reader).await;
+        let deadline = tokio::time::Instant::now() + budget;
+        for mut reader in readers {
+            let drained = tokio::time::timeout_at(deadline, &mut reader).await;
+            match drained {
+                Ok(_joined) => {}
+                Err(_elapsed) => reader.abort(),
+            }
         }
     }
 }

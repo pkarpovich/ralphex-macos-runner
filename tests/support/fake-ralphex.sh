@@ -34,6 +34,13 @@ if [ -n "${FAKE_RALPHEX_HOLD:-}" ]; then
   sleep "$FAKE_RALPHEX_HOLD" &
 fi
 
+if [ -n "${FAKE_RALPHEX_LATE:-}" ]; then
+  {
+    sleep "$FAKE_RALPHEX_LATE"
+    echo "late"
+  } &
+fi
+
 if [ -n "${FAKE_RALPHEX_CHILD:-}" ]; then
   sleep "$FAKE_RALPHEX_CHILD" >/dev/null 2>&1 &
   if [ -n "$record" ]; then

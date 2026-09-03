@@ -14,11 +14,9 @@ use reqwest::header::CONTENT_TYPE;
 
 use crate::protocol::types::{
     CLAIM_WINDOW, COMPLETE_BUDGET, ClaimRequest, CompleteRequest, HeartbeatRequest,
-    HeartbeatResponse, Job, OpenRunRequest, RETRY_BASE_DELAY, RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY,
-    RunId, Seq,
+    HeartbeatResponse, Job, OpenRunRequest, REQUEST_TIMEOUT, RETRY_BASE_DELAY, RETRY_MAX_ATTEMPTS,
+    RETRY_MAX_DELAY, RunId, Seq,
 };
-
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const CLAIM_TIMEOUT: Duration = Duration::from_secs(CLAIM_WINDOW.as_secs() + 30);
 

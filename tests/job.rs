@@ -265,6 +265,34 @@ async fn a_helper_holding_the_pipes_does_not_hold_up_the_exit_status() {
 }
 
 #[tokio::test]
+async fn a_pipe_the_drain_gave_up_on_stops_feeding_the_log() {
+    let farm = FakeFarm::start().await;
+    let (log, _handle) = stream(&farm);
+    let (dir, plan) = checkout();
+    let mut spec = spec(dir.path(), &plan);
+    with_env(&mut spec, "FAKE_RALPHEX_LATE", "2");
+
+    let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
+    job.wait().await.unwrap();
+
+    let started = Instant::now();
+    job.drain_output(Duration::from_secs(1)).await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_millis(1800),
+        "the budget was spent once per pipe: {elapsed:?}"
+    );
+
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    log.close().await;
+    assert!(
+        !log.tail().contains("late"),
+        "an abandoned reader kept writing: {}",
+        log.tail()
+    );
+}
+
+#[tokio::test]
 async fn stopping_takes_the_whole_process_group_down() {
     let farm = FakeFarm::start().await;
     let (log, _handle) = stream(&farm);

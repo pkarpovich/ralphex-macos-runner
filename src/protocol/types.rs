@@ -58,6 +58,9 @@ pub const RETRY_MAX_DELAY: Duration = Duration::from_secs(30);
 /// The number of attempts a retried call makes before it gives up.
 pub const RETRY_MAX_ATTEMPTS: u32 = 6;
 
+/// The time a single request to the farm may take, the claim poll aside.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The time a completion keeps retrying before the lease would expire.
 pub const COMPLETE_BUDGET: Duration = LEASE_TTL;
 

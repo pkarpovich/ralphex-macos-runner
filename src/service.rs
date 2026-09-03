@@ -17,7 +17,9 @@ use tokio::process::Command;
 
 use crate::config::{Config, DEFAULT_DRAIN_TIMEOUT};
 use crate::paths::{self, APP_NAME, PathError};
-use crate::protocol::types::{COMPLETE_BUDGET, STOP_GRACE};
+use crate::protocol::types::{
+    COMPLETE_BUDGET, LOG_CLOSE_TIMEOUT, REQUEST_TIMEOUT, RETRY_MAX_DELAY, STOP_GRACE,
+};
 
 /// The file launchd writes the daemon's standard output to.
 pub const STDOUT_FILE: &str = "daemon.out.log";
@@ -111,10 +113,15 @@ impl std::fmt::Display for Uninstalled {
 
 /// Returns how long launchd must wait for the daemon after it sends `SIGTERM`.
 ///
-/// launchd's default `ExitTimeOut` is 20 seconds, which is shorter than the
-/// shutdown sequence: a run in flight is given `drain_timeout` to finish, then
-/// [`STOP_GRACE`] to stop, and the completion is retried for [`COMPLETE_BUDGET`].
-/// A `SIGKILL` before that leaves the farm to finalise the run `runner_lost`.
+/// launchd's default `ExitTimeOut` is 20 seconds, which is far shorter than the
+/// shutdown sequence, and a `SIGKILL` before that sequence ends leaves the farm
+/// to finalise a finished run `runner_lost`. The sum walks every await the
+/// daemon makes after the signal: `drain_timeout` for the run to finish,
+/// [`STOP_GRACE`] to stop the process group, another [`STOP_GRACE`] for the
+/// pipe drain, [`LOG_CLOSE_TIMEOUT`] for the log stream's last flush, and
+/// [`COMPLETE_BUDGET`] for the completion - which overruns its budget by a
+/// backoff and a request, because the budget is checked before the sleep rather
+/// than after the attempt.
 ///
 /// # Examples
 ///
@@ -125,12 +132,18 @@ impl std::fmt::Display for Uninstalled {
 ///
 /// assert_eq!(
 ///     service::exit_timeout(Duration::from_secs(120)),
-///     Duration::from_secs(120 + 10 + 180)
+///     Duration::from_secs(120 + 10 + 10 + 30 + 180 + 30 + 30)
 /// );
 /// ```
 #[must_use]
 pub fn exit_timeout(drain_timeout: Duration) -> Duration {
-    drain_timeout + STOP_GRACE + COMPLETE_BUDGET
+    drain_timeout
+        + STOP_GRACE
+        + STOP_GRACE
+        + LOG_CLOSE_TIMEOUT
+        + COMPLETE_BUDGET
+        + RETRY_MAX_DELAY
+        + REQUEST_TIMEOUT
 }
 
 /// Returns the property list launchd loads the daemon from.
@@ -483,6 +496,19 @@ mod tests {
     }
 
     #[test]
+    fn the_exit_timeout_covers_every_await_the_shutdown_makes() {
+        let drain_timeout = DEFAULT_DRAIN_TIMEOUT;
+        let stop = STOP_GRACE;
+        let pipes = STOP_GRACE;
+        let logs = LOG_CLOSE_TIMEOUT;
+        let completion = COMPLETE_BUDGET + RETRY_MAX_DELAY + REQUEST_TIMEOUT;
+        assert_eq!(
+            exit_timeout(drain_timeout),
+            drain_timeout + stop + pipes + logs + completion
+        );
+    }
+
+    #[test]
     fn a_longer_drain_timeout_buys_a_longer_exit_timeout() {
         let drain_timeout = Duration::from_secs(600);
         let plist = generate_plist(
@@ -492,7 +518,7 @@ mod tests {
             Path::new("/logs"),
             exit_timeout(drain_timeout),
         );
-        assert!(plist.contains("<integer>790</integer>"), "{plist}");
+        assert!(plist.contains("<integer>890</integer>"), "{plist}");
     }
 
     #[test]
