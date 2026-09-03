@@ -5,6 +5,8 @@
 //! local client that opens a ticketless run and streams its output to a
 //! terminal.
 
+pub mod agent;
+pub mod config;
 pub mod job;
 pub mod logstream;
 pub mod paths;

@@ -5,6 +5,7 @@
 pub mod fake_farm;
 
 use std::future::Future;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -115,6 +116,44 @@ pub fn manual_ticker() -> (Arc<ManualTicker>, TickHandle) {
 #[must_use]
 pub fn fake_ralphex() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-ralphex.sh")
+}
+
+/// Writes a wrapper in `dir` that runs the fake ralphex under `settings`.
+///
+/// The daemon spawns a claimed job with no environment of its own, so a test
+/// that has to script the fake gives the wrapper's path as the ralphex binary.
+///
+/// # Panics
+///
+/// Panics when the wrapper cannot be written or made executable.
+#[must_use]
+pub fn fake_ralphex_with(dir: &Path, settings: &[(&str, &str)]) -> PathBuf {
+    let path = dir.join("ralphex");
+    let mut script = String::from("#!/bin/sh\n");
+    for (key, value) in settings {
+        script.push_str(&format!("{key}='{value}'\nexport {key}\n"));
+    }
+    script.push_str(&format!("exec '{}' \"$@\"\n", fake_ralphex().display()));
+    std::fs::write(&path, script).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A [`Ticker`] that fires on a fixed interval.
+pub struct FixedTicker {
+    interval: Duration,
+}
+
+impl Ticker for FixedTicker {
+    fn tick(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(tokio::time::sleep(self.interval))
+    }
+}
+
+/// Returns a ticker that fires every `interval`.
+#[must_use]
+pub fn fixed_ticker(interval: Duration) -> Arc<FixedTicker> {
+    Arc::new(FixedTicker { interval })
 }
 
 /// Returns the path of the stand-in for git.

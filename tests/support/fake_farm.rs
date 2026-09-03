@@ -174,6 +174,12 @@ impl FakeFarm {
         routes.complete.queue.push_back(reply);
     }
 
+    /// Answers every unqueued claim with `reply`.
+    pub fn always_claim(&self, reply: Reply) {
+        let mut routes = self.shared.routes.lock().unwrap();
+        routes.claim.sticky = Some(reply);
+    }
+
     /// Answers every unqueued log chunk with `reply`.
     pub fn always_log(&self, reply: Reply) {
         let mut routes = self.shared.routes.lock().unwrap();
