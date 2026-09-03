@@ -587,12 +587,16 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 **Files:**
 - Modify: `docs/plans/20260902-ralphex-macos-runner.md`
 
-- [ ] `mise run check` is green
-- [ ] every row of the lifecycle table has a passing test in `tests/agent_e2e.rs`
-- [ ] `mise exec -- cargo test --test protocol_vectors` passes and the file contains every vector from Technical Details
-- [ ] the crate has no `//` line comments and no `unsafe`
-- [ ] every non-goal still holds: no git clone/fetch/reset/clean anywhere in `src/`, no progress endpoint call, no `RALPHEX_CONFIG_DIR`, no `slots` in config
-- [ ] **stop here.** Everything after this line needs the deployed farm and launchd and is the operator's to run; record any blocker with ⚠️ and continue to task 12
+- [x] `mise run check` is green
+- [x] every row of the lifecycle table has a passing test in `tests/agent_e2e.rs`
+- [x] `mise exec -- cargo test --test protocol_vectors` passes and the file contains every vector from Technical Details
+- [x] the crate has no `//` line comments and no `unsafe`
+- [x] every non-goal still holds: no git clone/fetch/reset/clean anywhere in `src/`, no progress endpoint call, no `RALPHEX_CONFIG_DIR`, no `slots` in config
+- [x] **stop here.** Everything after this line needs the deployed farm and launchd and is the operator's to run; record any blocker with ⚠️ and continue to task 12
+
+➕ Lifecycle rows to their tests in `tests/agent_e2e.rs`: exit 0 with a pull request - `a_finished_run_opens_a_pull_request`; exit 0 without one - `a_claimed_job_runs_to_done_and_its_output_reaches_the_farm`; nonzero exit - `a_nonzero_exit_completes_as_a_failure_with_its_tail`; `Cancel` - `a_cancel_on_the_heartbeat_stops_the_run_and_completes_it_as_canceled`; `Drain` - `a_run_that_outlasts_its_drain_completes_as_a_shutdown`; `Gone` - `a_forgotten_run_is_killed_and_never_completed`; `VersionMismatch` - `a_version_mismatch_on_the_claim_ends_the_agent` and `a_version_mismatch_on_the_heartbeat_stops_the_run_and_ends_the_agent`; spawn failure - `a_ralphex_that_cannot_be_started_completes_as_a_spawn_failure`; push failure - `a_push_that_fails_completes_as_a_push_failure`; pull request failure - `a_pull_request_that_fails_completes_as_a_creation_failure`; `ctx_invalid` - `a_checkout_that_is_not_a_repository_completes_as_an_invalid_context`; `plan_not_found` - `a_plan_outside_the_checkout_completes_as_a_missing_plan`; `runtime_mismatch` - `a_container_job_is_refused_without_spawning_anything`.
+➕ All 13 conformance vectors are transcribed in `tests/protocol_vectors.rs` and its 13 tests pass.
+➕ The non-goal greps find only test literals: `"reset"` appears twice as a `FarmError::Transport` message, `RALPHEX_CONFIG_DIR` only in the `tests/job.rs` assertion that it is unset, and `slots` only in the `config.rs` test that `deny_unknown_fields` refuses it. `src/pr.rs` runs `push`, `symbolic-ref`, `gh pr list/create` and `gh repo view` and nothing else; `src/job.rs` runs `git rev-parse --git-dir`.
 
 ### Task 12: Update documentation
 
