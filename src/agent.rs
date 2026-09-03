@@ -238,9 +238,13 @@ impl Agent {
     /// instant before an abort would be lost on the wire and finalized as a lost
     /// run three minutes later. A claim that comes back empty hands the slot to
     /// a local request that is already waiting for it, because the queue behind
-    /// the slot serves its waiters in order. A shutdown returns only once the
-    /// slot is free again, so a run an `rxd` client started is drained and
-    /// completed like a claimed one instead of dying with the runtime.
+    /// the slot serves its waiters in order. A job that comes back from a claim
+    /// the shutdown overtook is completed as `runner_shutdown` without being
+    /// started, because spawning it would burn the whole drain timeout on work
+    /// that is killed at its end and would push the exit past the time launchd
+    /// waits. A shutdown returns only once the slot is free again, so a run an
+    /// `rxd` client started is drained and completed like a claimed one instead
+    /// of dying with the runtime.
     pub async fn run(&self, shutdown: watch::Receiver<bool>) -> AgentExit {
         let request = ClaimRequest::native(self.config.name.clone());
         let mut shutdown = shutdown;
@@ -275,6 +279,21 @@ impl Agent {
                     return AgentExit::VersionMismatch { message };
                 }
             };
+            if *shutdown.borrow() {
+                tracing::info!("run {} was claimed during a shutdown", job.run_id);
+                self.report(
+                    &job.run_id,
+                    failed(
+                        "runner_shutdown",
+                        "the runner shut down before the run started".to_string(),
+                        String::new(),
+                    ),
+                )
+                .await;
+                self.hold(RunSlot::Free);
+                drop(permit);
+                return self.drained().await;
+            }
             self.hold(RunSlot::Running(job.run_id.clone()));
             let outcome = self
                 .run_job(job, LocalOptions::default(), shutdown.clone())

@@ -552,6 +552,49 @@ async fn a_shutdown_before_the_first_claim_stops_the_agent_at_once() {
 }
 
 #[tokio::test]
+async fn a_job_claimed_during_a_shutdown_is_completed_without_being_started() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_SLEEP", "120")]);
+    let farm = FakeFarm::start().await;
+    farm.always_claim(Reply::Hold);
+    let running = start(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(&checkout.tools),
+    ));
+
+    let polling = wait_for(|| match farm.requests_ending("/claim").is_empty() {
+        true => None,
+        false => Some(()),
+    })
+    .await;
+    assert!(polling.is_some(), "the claim never reached the farm");
+    running.raise.send_replace(true);
+    farm.release_claim(Reply::Job(Box::new(job(
+        checkout.path(),
+        &checkout.plan,
+        CreatePr::No,
+    ))));
+
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Error);
+    assert_eq!(fail_reason, "runner_shutdown");
+    assert!(message.contains("before the run started"), "{message}");
+    assert_eq!(running.handle.await.unwrap(), AgentExit::Shutdown);
+    assert!(
+        !checkout.record.exists(),
+        "ralphex was started for a job claimed during a shutdown"
+    );
+}
+
+#[tokio::test]
 async fn a_finished_run_opens_a_pull_request() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
