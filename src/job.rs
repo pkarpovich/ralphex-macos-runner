@@ -7,7 +7,7 @@
 //! for the history and the attached clients. [`RunningJob`] waits for the exit
 //! or takes the group down.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
@@ -136,19 +136,69 @@ impl JobError {
     }
 }
 
+trait Files: Send + Sync + 'static {
+    fn checkout(&self, ctx: &Path) -> Result<PathBuf, JobError>;
+
+    fn plan(&self, ctx: &Path, plan: &Path) -> Result<PathBuf, JobError>;
+}
+
+struct HostFiles;
+
+impl Files for HostFiles {
+    fn checkout(&self, ctx: &Path) -> Result<PathBuf, JobError> {
+        let Ok(resolved) = ctx.canonicalize() else {
+            return Err(JobError::CtxInvalid(format!(
+                "{} does not exist",
+                ctx.display()
+            )));
+        };
+        if !resolved.is_dir() {
+            return Err(JobError::CtxInvalid(format!(
+                "{} is not a directory",
+                resolved.display()
+            )));
+        }
+        Ok(resolved)
+    }
+
+    fn plan(&self, ctx: &Path, plan: &Path) -> Result<PathBuf, JobError> {
+        let Ok(resolved) = plan.canonicalize() else {
+            return Err(JobError::PlanNotFound(format!(
+                "{} does not exist",
+                plan.display()
+            )));
+        };
+        if !resolved.starts_with(ctx) {
+            return Err(JobError::PlanNotFound(format!(
+                "{} is outside {}",
+                resolved.display(),
+                ctx.display()
+            )));
+        }
+        Ok(resolved)
+    }
+}
+
 /// Checks that the checkout is a git checkout and the plan lies inside it.
 ///
-/// The git it runs is killed at [`VALIDATE_TIMEOUT`], because it holds the run
-/// slot before the terminal channel exists and a checkout on an unresponsive
-/// mount would otherwise wedge the slot and the shutdown behind it.
+/// [`VALIDATE_TIMEOUT`] is the budget for the whole inspection, the git child
+/// and every filesystem call alike, and the filesystem calls run on a blocking
+/// thread: the inspection holds the run slot before the terminal channel exists,
+/// and a `canonicalize` on an unresponsive mount would otherwise wedge a runtime
+/// worker forever, taking the slot and the shutdown behind it with no timeout
+/// able to reach it.
 ///
 /// # Errors
 ///
 /// Returns [`JobError::CtxInvalid`] when `ctx` does not resolve to a directory
-/// in which `git rev-parse --git-dir` succeeds within [`VALIDATE_TIMEOUT`], and
-/// [`JobError::PlanNotFound`] when the plan does not resolve to a path under
-/// `ctx`.
+/// in which `git rev-parse --git-dir` succeeds, or when the inspection outlives
+/// [`VALIDATE_TIMEOUT`], and [`JobError::PlanNotFound`] when the plan does not
+/// resolve to a path under `ctx`.
 pub async fn validate(spec: &JobSpec) -> Result<(), JobError> {
+    inspect(spec, Arc::new(HostFiles), VALIDATE_TIMEOUT).await
+}
+
+async fn inspect(spec: &JobSpec, files: Arc<dyn Files>, budget: Duration) -> Result<(), JobError> {
     let JobSpec {
         ctx,
         plan,
@@ -157,18 +207,22 @@ pub async fn validate(spec: &JobSpec) -> Result<(), JobError> {
         local: _,
         ralphex_bin: _,
     } = spec;
-    let Ok(ctx) = ctx.canonicalize() else {
-        return Err(JobError::CtxInvalid(format!(
-            "{} does not exist",
-            ctx.display()
-        )));
+    let deadline = tokio::time::Instant::now() + budget;
+
+    let asked = ctx.clone();
+    let probe = Arc::clone(&files);
+    let resolved = tokio::task::spawn_blocking(move || probe.checkout(&asked));
+    let ctx = match tokio::time::timeout_at(deadline, resolved).await {
+        Err(_elapsed) => return Err(unanswered(ctx, budget)),
+        Ok(Err(error)) => {
+            return Err(JobError::CtxInvalid(format!(
+                "{} could not be inspected: {error}",
+                ctx.display()
+            )));
+        }
+        Ok(Ok(resolved)) => resolved?,
     };
-    if !ctx.is_dir() {
-        return Err(JobError::CtxInvalid(format!(
-            "{} is not a directory",
-            ctx.display()
-        )));
-    }
+
     let mut command = Command::new("git");
     command.arg("rev-parse");
     command.arg("--git-dir");
@@ -177,11 +231,10 @@ pub async fn validate(spec: &JobSpec) -> Result<(), JobError> {
     command.stdout(Stdio::null());
     command.stderr(Stdio::null());
     command.kill_on_drop(true);
-    let inspected = tokio::time::timeout(VALIDATE_TIMEOUT, command.status()).await;
+    let inspected = tokio::time::timeout_at(deadline, command.status()).await;
     let Ok(inspected) = inspected else {
         return Err(JobError::CtxInvalid(format!(
-            "git was killed after {} seconds in {}",
-            VALIDATE_TIMEOUT.as_secs(),
+            "git was killed after {budget:?} in {}",
             ctx.display()
         )));
     };
@@ -197,20 +250,26 @@ pub async fn validate(spec: &JobSpec) -> Result<(), JobError> {
             ctx.display()
         )));
     }
-    let Ok(plan) = plan.canonicalize() else {
-        return Err(JobError::PlanNotFound(format!(
-            "{} does not exist",
+
+    let asked = plan.clone();
+    let root = ctx.clone();
+    let probe = Arc::clone(&files);
+    let resolved = tokio::task::spawn_blocking(move || probe.plan(&root, &asked));
+    match tokio::time::timeout_at(deadline, resolved).await {
+        Err(_elapsed) => Err(unanswered(plan, budget)),
+        Ok(Err(error)) => Err(JobError::PlanNotFound(format!(
+            "{} could not be inspected: {error}",
             plan.display()
-        )));
-    };
-    if !plan.starts_with(&ctx) {
-        return Err(JobError::PlanNotFound(format!(
-            "{} is outside {}",
-            plan.display(),
-            ctx.display()
-        )));
+        ))),
+        Ok(Ok(resolved)) => resolved.map(|_plan| ()),
     }
-    Ok(())
+}
+
+fn unanswered(path: &Path, budget: Duration) -> JobError {
+    JobError::CtxInvalid(format!(
+        "{} did not answer within {budget:?}",
+        path.display()
+    ))
 }
 
 /// Starts ralphex for `spec` and tees its output into `log`.
@@ -434,6 +493,8 @@ impl LineAssembler {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
 
     fn spec() -> JobSpec {
@@ -484,5 +545,48 @@ mod tests {
         spec.ctx = PathBuf::from("/tmp/ralphex-macos-runner-does-not-exist");
         let error = validate(&spec).await.unwrap_err();
         assert_eq!(error.fail_reason(), "ctx_invalid");
+    }
+
+    struct StalledFiles {
+        released: Arc<AtomicBool>,
+    }
+
+    impl StalledFiles {
+        fn wait(&self) {
+            while !self.released.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    impl Files for StalledFiles {
+        fn checkout(&self, ctx: &Path) -> Result<PathBuf, JobError> {
+            self.wait();
+            Ok(ctx.to_path_buf())
+        }
+
+        fn plan(&self, _ctx: &Path, plan: &Path) -> Result<PathBuf, JobError> {
+            self.wait();
+            Ok(plan.to_path_buf())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_checkout_whose_filesystem_never_answers_is_refused_at_the_deadline() {
+        let released = Arc::new(AtomicBool::new(false));
+        let files = Arc::new(StalledFiles {
+            released: Arc::clone(&released),
+        });
+        let budget = Duration::from_millis(50);
+
+        let error = inspect(&spec(), files, budget).await.unwrap_err();
+        released.store(true, Ordering::SeqCst);
+
+        assert_eq!(error.fail_reason(), "ctx_invalid");
+        let JobError::CtxInvalid(message) = error else {
+            panic!("a filesystem that does not answer is an invalid context");
+        };
+        assert!(message.contains("did not answer"), "{message}");
+        assert!(message.contains("50ms"), "{message}");
     }
 }
