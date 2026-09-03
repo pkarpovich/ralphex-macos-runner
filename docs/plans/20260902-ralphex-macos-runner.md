@@ -553,11 +553,16 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Create: `src/service.rs`
 - Modify: `src/lib.rs`, `src/bin/rxd.rs`
 
-- [ ] `generate_plist(daemon_path, path_env, log_dir) -> String` producing the fields from Technical Details
-- [ ] `install()`: copy the daemon binary from `current_exe()`'s directory to the stable path, write the plist, `bootout` (ignored), `bootstrap` (fatal); `uninstall()`: `bootout`, remove the plist; both print the paths they touched and the `launchctl` commands to stop and start by hand
-- [ ] wire `rxd install` and `rxd uninstall`
-- [ ] write unit tests for `generate_plist`: label, program path, `RunAtLoad`, `KeepAlive`, both log paths, and `PATH` equal to the value passed in; `install` itself needs launchd and is exercised only by the Post-Completion smoke
-- [ ] run the gate - must pass before task 10
+- [x] `generate_plist(daemon_path, path_env, log_dir) -> String` producing the fields from Technical Details
+- [x] `install()`: copy the daemon binary from `current_exe()`'s directory to the stable path, write the plist, `bootout` (ignored), `bootstrap` (fatal); `uninstall()`: `bootout`, remove the plist; both print the paths they touched and the `launchctl` commands to stop and start by hand
+- [x] wire `rxd install` and `rxd uninstall`
+- [x] write unit tests for `generate_plist`: label, program path, `RunAtLoad`, `KeepAlive`, both log paths, and `PATH` equal to the value passed in; `install` itself needs launchd and is exercised only by the Post-Completion smoke
+- [x] run the gate - must pass before task 10
+
+➕ `nix` gained the `user` feature, for `Uid::current()` in the `gui/<uid>` domain target; the alternative was reading the uid off the home directory's metadata, which is indirect for no gain.
+➕ `install` and `uninstall` return `Installed` and `Uninstalled` rather than printing themselves; each one's `Display` is the block `rxd` prints (the paths touched, then the `launchctl bootout` and `bootstrap` lines from `by_hand`), so the printed text is unit-tested instead of being a side effect of the library.
+➕ Paths and the `PATH` value are XML-escaped into the plist, and `generate_plist` builds the two log paths from the log directory with the `STDOUT_FILE` and `STDERR_FILE` constants; a test pins them equal to `paths::daemon_stdout_path()` and `paths::daemon_stderr_path()`.
+⚠️ `current_exe()` is canonicalized before its directory is taken: `/opt/homebrew/bin/rxd` is a symlink into the Cellar keg, and only the resolved directory holds the daemon binary to copy. The existing binary at the stable path is removed before the copy, because writing over a running executable fails with `ETXTBSY`.
 
 ### Task 10: Release workflow and formula
 

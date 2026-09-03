@@ -13,3 +13,4 @@ pub mod logstream;
 pub mod paths;
 pub mod pr;
 pub mod protocol;
+pub mod service;

@@ -14,6 +14,7 @@ use ralphex_macos_runner::ipc::{self, IpcError, Response, RunRequest};
 use ralphex_macos_runner::job::Worktree;
 use ralphex_macos_runner::paths;
 use ralphex_macos_runner::protocol::types::{Branch, CLAIM_WINDOW, CompleteStatus, CreatePr};
+use ralphex_macos_runner::service;
 use tokio::net::UnixStream;
 
 const FORWARDED: &str = "CLAUDE_CONFIG_DIR";
@@ -78,15 +79,35 @@ async fn main() -> ExitCode {
 
     match command {
         Some(Command::Attach) => attach(socket).await,
-        Some(Command::Install) => {
-            println!("rxd would install the launchd agent");
-            ExitCode::SUCCESS
-        }
-        Some(Command::Uninstall) => {
-            println!("rxd would remove the launchd agent");
-            ExitCode::SUCCESS
-        }
+        Some(Command::Install) => install().await,
+        Some(Command::Uninstall) => uninstall().await,
         None => start_run(socket, run).await,
+    }
+}
+
+async fn install() -> ExitCode {
+    match service::install().await {
+        Ok(installed) => {
+            println!("{installed}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("rxd: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn uninstall() -> ExitCode {
+    match service::uninstall().await {
+        Ok(uninstalled) => {
+            println!("{uninstalled}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("rxd: {error}");
+            ExitCode::FAILURE
+        }
     }
 }
 
