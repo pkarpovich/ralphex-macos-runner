@@ -6,3 +6,4 @@
 //! terminal.
 
 pub mod paths;
+pub mod protocol;

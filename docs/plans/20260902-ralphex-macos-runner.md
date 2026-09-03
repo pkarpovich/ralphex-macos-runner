@@ -419,11 +419,13 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Modify: `src/lib.rs`
 - Create: `tests/protocol_vectors.rs`
 
-- [ ] define every type and constant from Technical Details with `serde` derives; `repos`/`ready` as `Option<Vec<_>>` with `#[serde(default)]`; newtypes `RunId`, `Seq`, `RunnerName`, `Branch` with transparent serde
-- [ ] `ClaimRequest::native(name)` and `HeartbeatRequest::native(name)` constructors producing `Some(vec![])` for the slices, `image: ""`, `slots: SLOTS`, `runtime: RUNTIME`, `version: VERSION`
-- [ ] transcribe every vector from "Conformance vectors" into `tests/protocol_vectors.rs`; each test deserialises the vector, re-serialises, and asserts equality of the two `serde_json::Value`s
-- [ ] write unit tests: the native constructors serialise `repos` and `ready` as `[]`; a `null` in either deserialises to `None`; a missing key deserialises to `None`
-- [ ] run the gate - must pass before task 3
+- [x] define every type and constant from Technical Details with `serde` derives; `repos`/`ready` as `Option<Vec<_>>` with `#[serde(default)]`; newtypes `RunId`, `Seq`, `RunnerName`, `Branch` with transparent serde
+- [x] `ClaimRequest::native(name)` and `HeartbeatRequest::native(name)` constructors producing `Some(vec![])` for the slices, `image: ""`, `slots: SLOTS`, `runtime: RUNTIME`, `version: VERSION`
+- [x] transcribe every vector from "Conformance vectors" into `tests/protocol_vectors.rs`; each test deserialises the vector, re-serialises, and asserts equality of the two `serde_json::Value`s
+- [x] write unit tests: the native constructors serialise `repos` and `ready` as `[]`; a `null` in either deserialises to `None`; a missing key deserialises to `None`
+- [x] run the gate - must pass before task 3
+
+➕ `create_pr` is the `CreatePr::{Yes, No}` enum from the Code-Quality Rules, encoded as a JSON boolean through `#[serde(from = "bool", into = "bool")]`; `action` and `status` are the enums `HeartbeatAction` and `CompleteStatus` with lowercase serde renaming. Every other wire field stays a `String`, an integer or one of the four newtypes.
 
 ### Task 3: Farm client with per-call retry and status mapping
 
