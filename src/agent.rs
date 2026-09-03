@@ -7,8 +7,10 @@
 //! aborting it. A run's terminal conditions - a cancel, a lease the farm forgot,
 //! a protocol mismatch, a shutdown that outlasted its drain - all arrive on one
 //! channel, so every one of them is handled in a single place, next to the
-//! process exit it competes with.
+//! process exit it competes with - and loses to, because a status the run has
+//! already produced outranks a terminal event that arrived in the same wakeup.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
@@ -533,10 +535,7 @@ impl Agent {
         };
         tracing::info!("run {run_id} started in {ctx}");
 
-        let ended = tokio::select! {
-            exited = running.wait() => Ended::Exited(exited),
-            Some(terminal) = terminal.recv() => Ended::Terminal(terminal),
-        };
+        let ended = ended(running.wait(), &mut terminal).await;
 
         match &ended {
             Ended::Exited(_) => {}
@@ -841,13 +840,16 @@ async fn beat(
     terminals: mpsc::Sender<Terminal>,
 ) {
     let request = HeartbeatRequest::native(runner);
+    let mut canceled = false;
     loop {
         match client.heartbeat(&run_id, &request).await {
             Ok(HeartbeatResponse { action }) => match action {
                 HeartbeatAction::None => {}
                 HeartbeatAction::Cancel => {
-                    let _ = terminals.send(Terminal::Cancel).await;
-                    return;
+                    if !canceled {
+                        let _ = terminals.send(Terminal::Cancel).await;
+                        canceled = true;
+                    }
                 }
             },
             Err(FarmError::Gone) => {
@@ -875,6 +877,17 @@ async fn beat(
     }
 }
 
+async fn ended(
+    exit: impl Future<Output = Result<ExitStatus, JobError>>,
+    terminal: &mut mpsc::Receiver<Terminal>,
+) -> Ended {
+    tokio::select! {
+        biased;
+        exited = exit => Ended::Exited(exited),
+        Some(terminal) = terminal.recv() => Ended::Terminal(terminal),
+    }
+}
+
 async fn drain_after(
     shutdown: watch::Receiver<bool>,
     timeout: Duration,
@@ -896,6 +909,23 @@ mod tests {
     fn status(code: i32) -> ExitStatus {
         use std::os::unix::process::ExitStatusExt;
         ExitStatus::from_raw(code << 8)
+    }
+
+    #[tokio::test]
+    async fn a_status_the_run_produced_outranks_a_terminal_that_is_already_queued() {
+        let (terminals, mut terminal) = mpsc::channel(TERMINAL_CAPACITY);
+        terminals.send(Terminal::Drain).await.unwrap();
+
+        match ended(std::future::ready(Ok(status(0))), &mut terminal).await {
+            Ended::Exited(Ok(exited)) => assert!(exited.success()),
+            Ended::Exited(Err(error)) => panic!("the run could not be waited for: {error}"),
+            Ended::Terminal(Terminal::Cancel) => panic!("a cancel discarded a finished run"),
+            Ended::Terminal(Terminal::Drain) => panic!("a drain discarded a finished run"),
+            Ended::Terminal(Terminal::Gone) => panic!("a forgotten lease discarded a finished run"),
+            Ended::Terminal(Terminal::VersionMismatch { message: _ }) => {
+                panic!("a version mismatch discarded a finished run")
+            }
+        }
     }
 
     #[test]

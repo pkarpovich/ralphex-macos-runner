@@ -1,6 +1,11 @@
 #!/bin/sh
 set -u
 
+ignore_term="${FAKE_RALPHEX_IGNORE_TERM:-}"
+if [ -n "$ignore_term" ]; then
+  trap '' TERM
+fi
+
 record="${FAKE_RALPHEX_RECORD:-}"
 
 if [ -n "$record" ]; then
@@ -46,6 +51,12 @@ if [ -n "${FAKE_RALPHEX_CHILD:-}" ]; then
   if [ -n "$record" ]; then
     echo "child: $!" >>"$record"
   fi
+fi
+
+if [ -n "$ignore_term" ]; then
+  while :; do
+    sleep 0.05
+  done
 fi
 
 sleep "${FAKE_RALPHEX_SLEEP:-0}"

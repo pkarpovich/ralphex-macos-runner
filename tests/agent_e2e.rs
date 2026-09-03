@@ -338,6 +338,36 @@ async fn a_cancel_on_the_heartbeat_stops_the_run_and_completes_it_as_canceled() 
 }
 
 #[tokio::test]
+async fn the_lease_is_still_beaten_while_a_canceled_run_is_stopped() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_IGNORE_TERM", "1")]);
+    let farm = farm_with(job(checkout.path(), &checkout.plan, CreatePr::No)).await;
+    let mut options = options(&checkout.tools);
+    options.stop_grace = Duration::from_secs(1);
+    let _running = start(agent(&farm, config(&farm, &ralphex), options));
+
+    let record = spawned(&checkout.record).await;
+    let before = farm.requests_ending("/heartbeat").len();
+    farm.always_heartbeat(Reply::Beat(HeartbeatAction::Cancel));
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Error);
+    assert_eq!(fail_reason, "canceled");
+    assert!(dead(record.pid).await, "the run outlived its cancel");
+    let beats = farm.requests_ending("/heartbeat").len() - before;
+    assert!(
+        beats >= 20,
+        "the heartbeat stopped at the cancel: {beats} beats reached the farm while the canceled run was being stopped"
+    );
+}
+
+#[tokio::test]
 async fn a_container_job_is_refused_without_spawning_anything() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[]);
