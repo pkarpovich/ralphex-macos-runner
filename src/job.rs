@@ -325,18 +325,22 @@ impl RunningJob {
 
     /// Signals the process group, waits out `grace` and kills what is left.
     ///
+    /// The `SIGKILL` follows whether or not the leader honoured the `SIGTERM`,
+    /// because the members of its group are what the next run has to be safe
+    /// from: `claude` and `xcodebuild` ignore a `SIGTERM`, and a leader that
+    /// exits on its own within the grace would otherwise leave them editing the
+    /// checkout while the next job is spawned into it.
+    ///
     /// # Errors
     ///
     /// Returns [`JobError::Wait`] when the child cannot be waited for.
     pub async fn stop(&mut self, grace: Duration) -> Result<ExitStatus, JobError> {
         let _ = killpg(self.pgid, Signal::SIGTERM);
         let exited = tokio::time::timeout(grace, self.child.wait()).await;
+        let _ = killpg(self.pgid, Signal::SIGKILL);
         let exited = match exited {
             Ok(exited) => exited,
-            Err(_elapsed) => {
-                let _ = killpg(self.pgid, Signal::SIGKILL);
-                self.child.wait().await
-            }
+            Err(_elapsed) => self.child.wait().await,
         };
         let exited = match exited {
             Ok(exited) => exited,

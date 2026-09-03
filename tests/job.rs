@@ -333,6 +333,52 @@ async fn stopping_takes_the_whole_process_group_down() {
 }
 
 #[tokio::test]
+async fn a_group_member_that_ignores_the_signal_is_killed_within_the_grace() {
+    let farm = FakeFarm::start().await;
+    let (log, _handle) = stream(&farm);
+    let (dir, plan) = checkout();
+    let record = dir.path().join("record");
+    let mut spec = spec(dir.path(), &plan);
+    with_env(
+        &mut spec,
+        "FAKE_RALPHEX_RECORD",
+        &record.display().to_string(),
+    );
+    with_env(&mut spec, "FAKE_RALPHEX_STUBBORN_CHILD", "1");
+    with_env(&mut spec, "FAKE_RALPHEX_SLEEP", "120");
+
+    let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
+    let written = wait_for(Duration::from_secs(10), || {
+        let Ok(contents) = std::fs::read_to_string(&record) else {
+            return false;
+        };
+        contents.contains("child: ")
+    });
+    assert!(written, "the fake never recorded its child");
+    let record = Record::read(&record);
+    let Some(child) = record.child else {
+        panic!("the fake recorded no child");
+    };
+
+    let grace = Duration::from_secs(5);
+    let started = Instant::now();
+    job.stop(grace).await.unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < grace,
+        "the leader outlived a signal it honours: {elapsed:?}"
+    );
+    let gone = wait_for(grace, || !alive(child));
+    assert!(
+        gone,
+        "a group member that ignores SIGTERM outlived the stop"
+    );
+    job.drain_output(Duration::from_secs(5)).await;
+    log.close().await;
+}
+
+#[tokio::test]
 async fn a_missing_checkout_fails_validation() {
     let (dir, plan) = checkout();
     let mut spec = spec(dir.path(), &plan);

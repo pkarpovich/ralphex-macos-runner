@@ -53,6 +53,18 @@ if [ -n "${FAKE_RALPHEX_CHILD:-}" ]; then
   fi
 fi
 
+if [ -n "${FAKE_RALPHEX_STUBBORN_CHILD:-}" ]; then
+  sh -c '
+    trap "" TERM
+    while :; do
+      sleep 0.05
+    done
+  ' >/dev/null 2>&1 &
+  if [ -n "$record" ]; then
+    echo "child: $!" >>"$record"
+  fi
+fi
+
 if [ -n "$ignore_term" ]; then
   while :; do
     sleep 0.05
