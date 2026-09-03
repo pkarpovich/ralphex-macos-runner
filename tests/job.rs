@@ -177,6 +177,7 @@ async fn both_pipes_reach_the_log_stream() {
 
     let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
     job.wait().await.unwrap();
+    job.drain_output(Duration::from_secs(5)).await;
 
     let tail = log.tail();
     for expected in ["out 1", "err 1", "out 2", "err 2"] {
@@ -219,6 +220,7 @@ async fn a_megabyte_long_line_is_chunked_for_the_farm_and_split_for_subscribers(
 
     let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
     job.wait().await.unwrap();
+    job.drain_output(Duration::from_secs(5)).await;
 
     let (replay, _live) = log.subscribe();
     let mut printed = 0;
@@ -239,6 +241,27 @@ async fn a_megabyte_long_line_is_chunked_for_the_farm_and_split_for_subscribers(
         delivered += request.body.len();
     }
     assert_eq!(delivered, length + 1);
+}
+
+#[tokio::test]
+async fn a_helper_holding_the_pipes_does_not_hold_up_the_exit_status() {
+    let farm = FakeFarm::start().await;
+    let (log, _handle) = stream(&farm);
+    let (dir, plan) = checkout();
+    let mut spec = spec(dir.path(), &plan);
+    with_env(&mut spec, "FAKE_RALPHEX_HOLD", "120");
+
+    let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
+    let exited = tokio::time::timeout(Duration::from_secs(3), job.wait()).await;
+
+    let Ok(Ok(exited)) = exited else {
+        panic!("waiting outlived the leader that had already exited");
+    };
+    assert!(exited.success());
+
+    job.stop(Duration::from_secs(5)).await.unwrap();
+    job.drain_output(Duration::from_secs(5)).await;
+    log.close().await;
 }
 
 #[tokio::test]
@@ -272,6 +295,7 @@ async fn stopping_takes_the_whole_process_group_down() {
     assert_eq!(job.pgid(), record.pid);
 
     job.stop(Duration::from_secs(5)).await.unwrap();
+    job.drain_output(Duration::from_secs(5)).await;
 
     let gone = wait_for(Duration::from_secs(10), || {
         !alive(record.pid) && !alive(child)

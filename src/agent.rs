@@ -494,6 +494,7 @@ impl Agent {
                 }
             }
         }
+        running.drain_output(self.options.stop_grace).await;
         drain.abort();
         log.close().await;
         let tail = log.tail();

@@ -98,7 +98,7 @@ Homebrew only replaces the binaries in its prefix; `rxd install` copies the new 
 
 The daemon exits **2** when the farm answers `409` to a claim or a heartbeat, meaning the two no longer speak the same protocol version. A running job is stopped through the normal signal sequence first, the log line names both versions, and launchd's `KeepAlive` restarts the daemon under its own throttle - so a mismatch shows up as a restart loop in the log, not as a silent runner that claims nothing. Exit 1 is a missing or invalid `config.toml` at startup; exit 0 is a clean shutdown after a drain. A farm that cannot be reached is not a startup failure: the claim loop logs `the claim failed: ...` once per poll and keeps trying.
 
-On `SIGTERM` or `SIGINT` the daemon stops claiming and lets a running job finish for up to `drain_timeout`, then stops it and reports it as `runner_shutdown`. A run `rxd` started is drained the same way: the daemon leaves only once its slot is free again.
+On `SIGTERM` or `SIGINT` the daemon stops claiming and lets a running job finish for up to `drain_timeout`, then stops it and reports it as `runner_shutdown`. A run `rxd` started is drained the same way: the daemon leaves only once its slot is free again. The plist carries an `ExitTimeOut` covering the whole sequence - `drain_timeout` plus the stop grace plus the budget the completion is retried for - because launchd's default of 20 seconds would `SIGKILL` the daemon mid-drain and leave the farm to finalise the run `runner_lost`. Raising `drain_timeout` therefore needs another `rxd install` to rewrite the plist.
 
 ## Development
 

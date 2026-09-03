@@ -10,11 +10,14 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
+use std::time::Duration;
 
 use nix::unistd::Uid;
 use tokio::process::Command;
 
+use crate::config::{Config, DEFAULT_DRAIN_TIMEOUT};
 use crate::paths::{self, APP_NAME, PathError};
+use crate::protocol::types::{COMPLETE_BUDGET, STOP_GRACE};
 
 /// The file launchd writes the daemon's standard output to.
 pub const STDOUT_FILE: &str = "daemon.out.log";
@@ -106,12 +109,37 @@ impl std::fmt::Display for Uninstalled {
     }
 }
 
+/// Returns how long launchd must wait for the daemon after it sends `SIGTERM`.
+///
+/// launchd's default `ExitTimeOut` is 20 seconds, which is shorter than the
+/// shutdown sequence: a run in flight is given `drain_timeout` to finish, then
+/// [`STOP_GRACE`] to stop, and the completion is retried for [`COMPLETE_BUDGET`].
+/// A `SIGKILL` before that leaves the farm to finalise the run `runner_lost`.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use ralphex_macos_runner::service;
+///
+/// assert_eq!(
+///     service::exit_timeout(Duration::from_secs(120)),
+///     Duration::from_secs(120 + 10 + 180)
+/// );
+/// ```
+#[must_use]
+pub fn exit_timeout(drain_timeout: Duration) -> Duration {
+    drain_timeout + STOP_GRACE + COMPLETE_BUDGET
+}
+
 /// Returns the property list launchd loads the daemon from.
 ///
 /// # Examples
 ///
 /// ```
 /// use std::path::Path;
+/// use std::time::Duration;
 ///
 /// use ralphex_macos_runner::service;
 ///
@@ -120,18 +148,27 @@ impl std::fmt::Display for Uninstalled {
 ///     Path::new("/data/ralphex-macos-runner/bin/ralphex-macos-runner"),
 ///     "/opt/homebrew/bin:/usr/bin",
 ///     Path::new("/logs/ralphex-macos-runner"),
+///     Duration::from_secs(310),
 /// );
 /// assert!(plist.contains("<string>dev.pkarpovich.ralphex-macos-runner</string>"));
 /// assert!(plist.contains("<string>/opt/homebrew/bin:/usr/bin</string>"));
 /// assert!(plist.contains("<string>/logs/ralphex-macos-runner/daemon.out.log</string>"));
+/// assert!(plist.contains("<integer>310</integer>"));
 /// ```
 #[must_use]
-pub fn generate_plist(label: &str, daemon_path: &Path, path_env: &str, log_dir: &Path) -> String {
+pub fn generate_plist(
+    label: &str,
+    daemon_path: &Path,
+    path_env: &str,
+    log_dir: &Path,
+    exit_timeout: Duration,
+) -> String {
     let label = escape(label);
     let daemon_path = escape(&daemon_path.display().to_string());
     let path_env = escape(path_env);
     let stdout_path = escape(&log_dir.join(STDOUT_FILE).display().to_string());
     let stderr_path = escape(&log_dir.join(STDERR_FILE).display().to_string());
+    let exit_timeout = exit_timeout.as_secs();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -147,6 +184,8 @@ pub fn generate_plist(label: &str, daemon_path: &Path, path_env: &str, log_dir: 
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<key>ExitTimeOut</key>
+	<integer>{exit_timeout}</integer>
 	<key>StandardOutPath</key>
 	<string>{stdout_path}</string>
 	<key>StandardErrorPath</key>
@@ -192,7 +231,13 @@ pub async fn install() -> Result<Installed, ServiceError> {
     place_daemon(&source, &daemon_path)?;
 
     let path_env = std::env::var("PATH").unwrap_or_default();
-    let plist = generate_plist(&paths::launchd_label(), &daemon_path, &path_env, &log_dir);
+    let plist = generate_plist(
+        &paths::launchd_label(),
+        &daemon_path,
+        &path_env,
+        &log_dir,
+        exit_timeout(configured_drain_timeout()),
+    );
     if let Err(error) = std::fs::write(&plist_path, plist) {
         return Err(ServiceError::Write {
             path: plist_path.display().to_string(),
@@ -255,6 +300,16 @@ pub fn by_hand(uid: u32, plist_path: &Path) -> String {
     format!(
         "stop    launchctl bootout gui/{uid} {plist_path}\nstart   launchctl bootstrap gui/{uid} {plist_path}"
     )
+}
+
+fn configured_drain_timeout() -> Duration {
+    let Ok(path) = paths::config_path() else {
+        return DEFAULT_DRAIN_TIMEOUT;
+    };
+    let Ok(config) = Config::load(&path) else {
+        return DEFAULT_DRAIN_TIMEOUT;
+    };
+    config.drain_timeout
 }
 
 /// Copies the daemon binary from `source` to `daemon_path`.
@@ -387,6 +442,7 @@ mod tests {
             Path::new("/data/ralphex-macos-runner/bin/ralphex-macos-runner"),
             "/opt/homebrew/bin:/usr/bin:/bin",
             Path::new("/logs/ralphex-macos-runner"),
+            exit_timeout(DEFAULT_DRAIN_TIMEOUT),
         )
     }
 
@@ -411,6 +467,32 @@ mod tests {
         let plist = plist();
         assert!(plist.contains("<key>RunAtLoad</key>\n\t<true/>"), "{plist}");
         assert!(plist.contains("<key>KeepAlive</key>\n\t<true/>"), "{plist}");
+    }
+
+    #[test]
+    fn launchd_waits_out_the_whole_shutdown_before_it_kills_the_daemon() {
+        let plist = plist();
+        let seconds = exit_timeout(DEFAULT_DRAIN_TIMEOUT).as_secs();
+        assert!(
+            plist.contains(&format!(
+                "<key>ExitTimeOut</key>\n\t<integer>{seconds}</integer>"
+            )),
+            "{plist}"
+        );
+        assert!(seconds > DEFAULT_DRAIN_TIMEOUT.as_secs(), "{seconds}");
+    }
+
+    #[test]
+    fn a_longer_drain_timeout_buys_a_longer_exit_timeout() {
+        let drain_timeout = Duration::from_secs(600);
+        let plist = generate_plist(
+            &paths::launchd_label(),
+            Path::new("/bin/daemon"),
+            "/usr/bin",
+            Path::new("/logs"),
+            exit_timeout(drain_timeout),
+        );
+        assert!(plist.contains("<integer>790</integer>"), "{plist}");
     }
 
     #[test]
@@ -447,6 +529,7 @@ mod tests {
             Path::new("/bin/daemon"),
             "/usr/bin",
             &log_dir,
+            exit_timeout(DEFAULT_DRAIN_TIMEOUT),
         );
         let stdout_path = paths::daemon_stdout_path().unwrap();
         let stderr_path = paths::daemon_stderr_path().unwrap();
@@ -522,6 +605,7 @@ mod tests {
             Path::new("/data/a&b/daemon"),
             "/usr/bin:/opt/<x>",
             Path::new("/logs"),
+            exit_timeout(DEFAULT_DRAIN_TIMEOUT),
         );
         assert!(
             plist.contains("<string>/data/a&amp;b/daemon</string>"),

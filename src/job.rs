@@ -19,7 +19,7 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
 use crate::logstream::LogStream;
-use crate::protocol::types::{Branch, MAX_LOG_CHUNK, STOP_GRACE};
+use crate::protocol::types::{Branch, MAX_LOG_CHUNK};
 
 /// Whether ralphex runs in review mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,18 +295,21 @@ impl RunningJob {
         self.pgid.as_raw()
     }
 
-    /// Waits for the run to exit and for its output to be drained.
+    /// Waits for the run to exit.
+    ///
+    /// The pipes are emptied separately by [`RunningJob::drain_output`]: a
+    /// helper that reparented out of the process group holds them open after
+    /// the leader is gone, and draining here would let a terminal event that
+    /// arrives in that window discard a status the run already produced.
     ///
     /// # Errors
     ///
     /// Returns [`JobError::Wait`] when the child cannot be waited for.
     pub async fn wait(&mut self) -> Result<ExitStatus, JobError> {
-        let exited = match self.child.wait().await {
-            Ok(exited) => exited,
-            Err(error) => return Err(JobError::Wait(error.to_string())),
-        };
-        self.drain(STOP_GRACE).await;
-        Ok(exited)
+        match self.child.wait().await {
+            Ok(exited) => Ok(exited),
+            Err(error) => Err(JobError::Wait(error.to_string())),
+        }
     }
 
     /// Signals the process group, waits out `grace` and kills what is left.
@@ -328,11 +331,11 @@ impl RunningJob {
             Ok(exited) => exited,
             Err(error) => return Err(JobError::Wait(error.to_string())),
         };
-        self.drain(grace).await;
         Ok(exited)
     }
 
-    async fn drain(&mut self, budget: Duration) {
+    /// Waits out `budget` for the tasks draining the run's pipes to finish.
+    pub async fn drain_output(&mut self, budget: Duration) {
         let readers = std::mem::take(&mut self.readers);
         for reader in readers {
             let _ = tokio::time::timeout(budget, reader).await;
