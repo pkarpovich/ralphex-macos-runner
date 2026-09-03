@@ -29,6 +29,11 @@ while [ "$index" -le "$lines" ]; do
   index=$((index + 1))
 done
 
+burst="${FAKE_RALPHEX_BURST:-0}"
+if [ "$burst" -gt 0 ]; then
+  awk -v n="$burst" 'BEGIN { for (i = 1; i <= n; i++) printf "burst %d\n", i }'
+fi
+
 long="${FAKE_RALPHEX_LONG_LINE:-0}"
 if [ "$long" -gt 0 ]; then
   printf '%*s' "$long" '' | tr ' ' 'L'

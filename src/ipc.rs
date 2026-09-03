@@ -4,7 +4,10 @@
 //! JSON, and nothing over [`MAX_MESSAGE_BYTES`] is written or read. [`serve`]
 //! owns the daemon's end: it binds the socket with mode `0600`, hands a `Run`
 //! command to the agent's run slot and streams the run's output back as
-//! [`Response::Line`] messages until the run ends.
+//! [`Response::Line`] messages until the run ends. A client the run outran is
+//! sent a line naming how many it missed rather than being left with a silent
+//! hole, and the drain that follows the run reads on past a lag instead of
+//! stopping at it, so the last lines a run printed are never lost to one.
 
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -382,12 +385,33 @@ async fn follow(stream: &mut UnixStream, current: &CurrentRun) -> Result<(), Ipc
         };
         match received {
             Ok(text) => send(stream, &Response::Line { text }).await?,
-            Err(broadcast::error::RecvError::Lagged(_missed)) => {}
+            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                send(
+                    stream,
+                    &Response::Line {
+                        text: skipped(missed),
+                    },
+                )
+                .await?;
+            }
             Err(broadcast::error::RecvError::Closed) => break current.ended().await,
         }
     };
-    while let Ok(text) = lines.try_recv() {
-        send(stream, &Response::Line { text }).await?;
+    loop {
+        match lines.try_recv() {
+            Ok(text) => send(stream, &Response::Line { text }).await?,
+            Err(broadcast::error::TryRecvError::Lagged(missed)) => {
+                send(
+                    stream,
+                    &Response::Line {
+                        text: skipped(missed),
+                    },
+                )
+                .await?;
+            }
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Closed) => break,
+        }
     }
     match ended {
         RunEnd::Reported(completion) => {
@@ -428,6 +452,10 @@ async fn follow(stream: &mut UnixStream, current: &CurrentRun) -> Result<(), Ipc
             .await
         }
     }
+}
+
+fn skipped(missed: u64) -> String {
+    format!("... {missed} lines skipped")
 }
 
 #[cfg(test)]

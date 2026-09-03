@@ -363,6 +363,25 @@ async fn a_local_run_streams_its_output_and_ends_as_done() {
 }
 
 #[tokio::test]
+async fn a_client_the_run_outran_is_told_how_many_lines_it_missed() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_BURST", "5000")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(job(&checkout, "local-14"))));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let output = client.wait_with_output().await.unwrap();
+
+    let printed = text(&output);
+    assert!(output.status.success(), "{printed}");
+    assert!(printed.contains("lines skipped"), "{printed}");
+    assert!(printed.contains("burst 5000"), "{printed}");
+    assert!(printed.contains("done"), "{printed}");
+    drop(daemon.raise);
+}
+
+#[tokio::test]
 async fn a_failed_local_run_ends_the_client_with_a_failure() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1"), ("FAKE_RALPHEX_EXIT", "3")]);
