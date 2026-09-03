@@ -13,7 +13,10 @@
 //! and the pull-request sequence run for minutes under a lease the heartbeat is
 //! still renewing: a cancel that lands there abandons the pull request and
 //! completes the run `canceled`, and a forgotten lease or a protocol mismatch
-//! abandons it without a completion at all.
+//! abandons it without a completion at all. The heartbeat is the first thing a
+//! run starts, before the runtime is checked and before the checkout is
+//! inspected, so even a job this runner refuses is completed under a lease the
+//! farm is still seeing renewed.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -515,6 +518,15 @@ impl Agent {
             create_pr,
         } = job;
 
+        let (terminals, mut terminal) = mpsc::channel(TERMINAL_CAPACITY);
+        let beats = tokio::spawn(beat(
+            Arc::clone(&self.client),
+            run_id.clone(),
+            self.config.name.clone(),
+            self.options.heartbeat_interval,
+            terminals.clone(),
+        ));
+
         if runtime != RUNTIME {
             return Finished {
                 completion: Some(failed(
@@ -523,7 +535,7 @@ impl Agent {
                     String::new(),
                 )),
                 outcome: RunOutcome::Continue,
-                beats: None,
+                beats: Some(beats),
             };
         }
 
@@ -543,19 +555,11 @@ impl Agent {
                     String::new(),
                 )),
                 outcome: RunOutcome::Continue,
-                beats: None,
+                beats: Some(beats),
             };
         }
 
         let log = current.log();
-        let (terminals, mut terminal) = mpsc::channel(TERMINAL_CAPACITY);
-        let beats = tokio::spawn(beat(
-            Arc::clone(&self.client),
-            run_id.clone(),
-            self.config.name.clone(),
-            self.options.heartbeat_interval,
-            terminals.clone(),
-        ));
         let drain = tokio::spawn(drain_after(
             shutdown,
             self.options.drain_timeout,

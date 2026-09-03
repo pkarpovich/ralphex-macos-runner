@@ -216,6 +216,14 @@ impl FakeFarm {
         self.shared.release.notify_one();
     }
 
+    /// Releases a held completion, which then answers `reply`.
+    pub fn release_complete(&self, reply: Reply) {
+        let mut routes = self.shared.routes.lock().unwrap();
+        routes.complete.queue.push_front(reply);
+        drop(routes);
+        self.shared.release.notify_one();
+    }
+
     /// Returns every request this farm received, in order.
     #[must_use]
     pub fn requests(&self) -> Vec<Recorded> {
@@ -433,7 +441,11 @@ async fn complete(
 ) -> Response {
     record(&shared, &uri, &headers, &body);
     let reply = take(&shared, RouteName::Complete, Reply::Accepted);
-    respond(reply)
+    let Reply::Hold = reply else {
+        return respond(reply);
+    };
+    shared.release.notified().await;
+    respond(take(&shared, RouteName::Complete, Reply::Accepted))
 }
 
 #[derive(Debug, Clone, Copy)]

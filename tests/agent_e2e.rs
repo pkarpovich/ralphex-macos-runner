@@ -395,6 +395,80 @@ async fn a_container_job_is_refused_without_spawning_anything() {
 }
 
 #[tokio::test]
+async fn a_job_of_the_wrong_runtime_is_beaten_for_while_its_completion_is_in_flight() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let mut asked = job(checkout.path(), &checkout.plan, CreatePr::No);
+    asked.runtime = "container".to_string();
+    let farm = farm_with(asked).await;
+    farm.push_complete(Reply::Hold);
+    let _running = start(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(&checkout.tools),
+    ));
+
+    let beaten = wait_for(|| match farm.requests_ending("/heartbeat").is_empty() {
+        true => None,
+        false => Some(()),
+    })
+    .await;
+    assert!(
+        beaten.is_some(),
+        "a refused job was completed under a lease nobody renewed"
+    );
+    farm.release_complete(Reply::Accepted);
+
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Error);
+    assert_eq!(fail_reason, "runtime_mismatch");
+    assert!(!checkout.record.exists(), "ralphex was spawned anyway");
+}
+
+#[tokio::test]
+async fn a_job_whose_checkout_is_unusable_is_beaten_for_while_its_completion_is_in_flight() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let absent = checkout.path().join("absent");
+    let farm = farm_with(job(&absent, &checkout.plan, CreatePr::No)).await;
+    farm.push_complete(Reply::Hold);
+    let _running = start(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(&checkout.tools),
+    ));
+
+    let beaten = wait_for(|| match farm.requests_ending("/heartbeat").is_empty() {
+        true => None,
+        false => Some(()),
+    })
+    .await;
+    assert!(
+        beaten.is_some(),
+        "a job that failed validation was completed under a lease nobody renewed"
+    );
+    farm.release_complete(Reply::Accepted);
+
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Error);
+    assert_eq!(fail_reason, "ctx_invalid");
+}
+
+#[tokio::test]
 async fn a_version_mismatch_on_the_claim_ends_the_agent() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[]);
