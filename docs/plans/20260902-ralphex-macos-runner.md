@@ -470,12 +470,18 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Modify: `tests/support/mod.rs`
 - Create: `tests/job.rs`
 
-- [ ] `JobSpec { ctx, plan, branch, review: Review, local: LocalOptions, ralphex_bin }` with `LocalOptions { worktree: Worktree, env: Vec<(String, String)> }` and `validate(&JobSpec) -> Result<(), JobError>` implementing the ctx and plan checks from the lifecycle table
-- [ ] `spawn(spec, log: &LogStream) -> Result<RunningJob, JobError>` building the argv and environment from Technical Details, `stdin` null, `process_group(0)`, one task per pipe reading 64 KiB chunks into `write` and a capped line assembler into `push_line`
-- [ ] `RunningJob::wait() -> ExitStatus` and `RunningJob::stop(grace).await` doing `SIGTERM` group, the grace, `SIGKILL` group
-- [ ] `fake-ralphex.sh`: prints `FAKE_RALPHEX_LINES` lines alternating stdout/stderr, prints one unbroken line of `FAKE_RALPHEX_LONG_LINE` bytes when set, records its argv, cwd and full environment to `FAKE_RALPHEX_RECORD`, spawns a sleeping child when `FAKE_RALPHEX_CHILD` is set, sleeps `FAKE_RALPHEX_SLEEP` seconds, exits `FAKE_RALPHEX_EXIT`
-- [ ] write tests: argv contains `--branch x` and the plan path and, when asked, `--worktree` and `--review`; cwd is `ctx`; an entry in `LocalOptions.env` reaches the recorded environment; stdout and stderr both reach the log stream; exit code propagates; a 1 MiB unbroken line reaches the farm buffer in chunks and the subscribers as lines no longer than 64 KiB; a sleeping fake with a child is stopped with both processes gone within the grace; a missing ctx and a plan outside ctx fail validation with the named error
-- [ ] run the gate - must pass before task 6
+- [x] `JobSpec { ctx, plan, branch, review: Review, local: LocalOptions, ralphex_bin }` with `LocalOptions { worktree: Worktree, env: Vec<(String, String)> }` and `validate(&JobSpec) -> Result<(), JobError>` implementing the ctx and plan checks from the lifecycle table
+- [x] `spawn(spec, log: &LogStream) -> Result<RunningJob, JobError>` building the argv and environment from Technical Details, `stdin` null, `process_group(0)`, one task per pipe reading 64 KiB chunks into `write` and a capped line assembler into `push_line`
+- [x] `RunningJob::wait() -> ExitStatus` and `RunningJob::stop(grace).await` doing `SIGTERM` group, the grace, `SIGKILL` group
+- [x] `fake-ralphex.sh`: prints `FAKE_RALPHEX_LINES` lines alternating stdout/stderr, prints one unbroken line of `FAKE_RALPHEX_LONG_LINE` bytes when set, records its argv, cwd and full environment to `FAKE_RALPHEX_RECORD`, spawns a sleeping child when `FAKE_RALPHEX_CHILD` is set, sleeps `FAKE_RALPHEX_SLEEP` seconds, exits `FAKE_RALPHEX_EXIT`
+- [x] write tests: argv contains `--branch x` and the plan path and, when asked, `--worktree` and `--review`; cwd is `ctx`; an entry in `LocalOptions.env` reaches the recorded environment; stdout and stderr both reach the log stream; exit code propagates; a 1 MiB unbroken line reaches the farm buffer in chunks and the subscribers as lines no longer than 64 KiB; a sleeping fake with a child is stopped with both processes gone within the grace; a missing ctx and a plan outside ctx fail validation with the named error
+- [x] run the gate - must pass before task 6
+
+➕ `spawn` takes `Arc<LogStream>`, not `&LogStream`: the two pipe readers are `tokio::spawn`ed tasks and need an owned `'static` handle on the stream.
+➕ `validate` is `async` because the ctx check runs `git rev-parse --git-dir` through `tokio::process`.
+➕ `wait` and `stop` return `Result<ExitStatus, JobError>` with a `JobError::Wait` variant rather than a bare `ExitStatus`, so an unwaitable child is reported instead of panicking; `Wait` reuses the `spawn_failed` fail reason. Both drain the pipe readers before returning, so no output is lost between the exit and the completion.
+➕ The line assembler emits a line whenever the pending bytes reach `MAX_LOG_CHUNK`, so an unbroken 1 MiB line becomes 16 capped lines plus the empty remainder its newline closes.
+⚠️ The fake records `pwd -P`, not `pwd`: a child inherits the daemon's `PWD`, so only the physical path can be compared against a canonicalised `ctx`. Its background child redirects both pipes to `/dev/null`, otherwise a reparented grandchild would hold the pipe open and the reader drain would never see EOF.
 
 ### Task 6: Pull request
 

@@ -5,6 +5,7 @@
 pub mod fake_farm;
 
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -108,6 +109,83 @@ pub fn manual_ticker() -> (Arc<ManualTicker>, TickHandle) {
         acks: AsyncMutex::new(finished),
     };
     (ticker, handle)
+}
+
+/// Returns the path of the stand-in for the ralphex binary.
+#[must_use]
+pub fn fake_ralphex() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-ralphex.sh")
+}
+
+/// What one run of the fake ralphex saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Record {
+    /// The arguments the run was given, without the program name.
+    pub argv: Vec<String>,
+    /// The working directory the run had, with every symlink resolved.
+    pub cwd: String,
+    /// The process id of the run.
+    pub pid: i32,
+    /// The process id of the child the run left behind, when it left one.
+    pub child: Option<i32>,
+    /// The environment the run saw.
+    pub env: Vec<(String, String)>,
+}
+
+impl Record {
+    /// Reads the record the fake ralphex wrote to `path`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the file is missing, unreadable or does not name a process id.
+    #[must_use]
+    pub fn read(path: &Path) -> Self {
+        let contents = std::fs::read_to_string(path).unwrap();
+        let mut argv = Vec::new();
+        let mut cwd = String::new();
+        let mut pid = None;
+        let mut child = None;
+        let mut env = Vec::new();
+        for line in contents.lines() {
+            let Some((key, value)) = line.split_once(": ") else {
+                continue;
+            };
+            match key {
+                "argv" => argv.push(value.to_string()),
+                "cwd" => cwd = value.to_string(),
+                "pid" => pid = Some(value.parse().unwrap()),
+                "child" => child = Some(value.parse().unwrap()),
+                "env" => {
+                    let Some((name, setting)) = value.split_once('=') else {
+                        continue;
+                    };
+                    env.push((name.to_string(), setting.to_string()));
+                }
+                other => panic!("unexpected record key {other}"),
+            }
+        }
+        let Some(pid) = pid else {
+            panic!("the record names no process id");
+        };
+        Record {
+            argv,
+            cwd,
+            pid,
+            child,
+            env,
+        }
+    }
+
+    /// Returns the value the environment gave `name`.
+    #[must_use]
+    pub fn env_value(&self, name: &str) -> Option<String> {
+        for (key, value) in &self.env {
+            if key == name {
+                return Some(value.clone());
+            }
+        }
+        None
+    }
 }
 
 impl Ticker for ManualTicker {
