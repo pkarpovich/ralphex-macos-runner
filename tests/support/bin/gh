@@ -30,6 +30,10 @@ if [ -n "${FAKE_DELAY:-}" ]; then
   sleep "$FAKE_DELAY"
 fi
 
+if [ -n "${FAKE_GH_SLEEP:-}" ]; then
+  sleep "$FAKE_GH_SLEEP"
+fi
+
 case "$key" in
   list)
     if [ -n "${FAKE_EXISTING_PR:-}" ]; then

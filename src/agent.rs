@@ -9,6 +9,11 @@
 //! channel, so every one of them is handled in a single place, next to the
 //! process exit it competes with - and loses to, because a status the run has
 //! already produced outranks a terminal event that arrived in the same wakeup.
+//! The channel is read on past that exit, because the pipe drain, the log close
+//! and the pull-request sequence run for minutes under a lease the heartbeat is
+//! still renewing: a cancel that lands there abandons the pull request and
+//! completes the run `canceled`, and a forgotten lease or a protocol mismatch
+//! abandons it without a completion at all.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -21,7 +26,7 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::ipc::RunRequest;
-use crate::job::{self, JobError, JobSpec, LocalOptions, Review};
+use crate::job::{self, JobError, JobSpec, LocalOptions, Review, RunningJob};
 use crate::logstream::{IntervalTicker, LogStream, Ticker};
 use crate::pr::{PrSpec, PrTools, PrUrl, RunOrigin, open_pull_request};
 use crate::protocol::client::{FarmClient, FarmError};
@@ -197,6 +202,17 @@ enum Terminal {
 enum Ended {
     Exited(Result<ExitStatus, JobError>),
     Terminal(Terminal),
+}
+
+enum Settled {
+    Finished(CompleteRequest),
+    Interrupted(Terminal),
+}
+
+struct PullRequest {
+    ctx: PathBuf,
+    spec: PrSpec,
+    create_pr: CreatePr,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -543,72 +559,63 @@ impl Agent {
         tracing::info!("run {run_id} started in {ctx}");
 
         let ended = ended(running.wait(), &mut terminal).await;
+        drain.abort();
 
-        match &ended {
-            Ended::Exited(_) => {}
-            Ended::Terminal(_) => {
+        let exited = match ended {
+            Ended::Terminal(reason) => {
                 if let Err(error) = running.stop(self.options.stop_grace).await {
                     tracing::warn!("run {run_id} could not be stopped: {error}");
                 }
+                running.drain_output(self.options.stop_grace).await;
+                log.close().await;
+                return stopped(reason, &run_id, log.tail(), beats);
             }
-        }
-        running.drain_output(self.options.stop_grace).await;
-        drain.abort();
-        log.close().await;
-        let tail = log.tail();
+            Ended::Exited(exited) => exited,
+        };
 
-        let (completion, outcome) = match ended {
-            Ended::Exited(Err(error)) => (
-                Some(failed(error.fail_reason(), error.to_string(), tail)),
-                RunOutcome::Continue,
-            ),
-            Ended::Exited(Ok(status)) => match status.success() {
-                false => (
-                    Some(failed("nonzero_exit", exit_message(status), tail)),
-                    RunOutcome::Continue,
-                ),
-                true => match create_pr {
-                    CreatePr::No => (Some(done(String::new())), RunOutcome::Continue),
-                    CreatePr::Yes => {
-                        let origin = origin(identifier, issue_url, title);
-                        let spec = PrSpec::describe(branch, &origin, &plan_path, &run_id);
-                        let opened =
-                            open_pull_request(&PathBuf::from(&ctx), &spec, &self.options.pr_tools)
-                                .await;
-                        match opened {
-                            Ok(PrUrl(url)) => (Some(done(url)), RunOutcome::Continue),
-                            Err(error) => (
-                                Some(failed(error.fail_reason(), error.to_string(), tail)),
-                                RunOutcome::Continue,
-                            ),
-                        }
-                    }
-                },
-            },
-            Ended::Terminal(Terminal::Cancel) => (
-                Some(failed("canceled", "the run was canceled".to_string(), tail)),
-                RunOutcome::Continue,
-            ),
-            Ended::Terminal(Terminal::Drain) => (
-                Some(failed(
-                    "runner_shutdown",
-                    "the runner shut down while the run was in flight".to_string(),
-                    tail,
-                )),
-                RunOutcome::Continue,
-            ),
-            Ended::Terminal(Terminal::Gone) => {
-                tracing::warn!("run {run_id} is unknown to the farm and was stopped");
-                (None, RunOutcome::Continue)
-            }
-            Ended::Terminal(Terminal::VersionMismatch { message }) => {
-                (None, RunOutcome::VersionMismatch { message })
+        let origin = origin(identifier, issue_url, title);
+        let pull_request = PullRequest {
+            ctx: PathBuf::from(&ctx),
+            spec: PrSpec::describe(branch, &origin, &plan_path, &run_id),
+            create_pr,
+        };
+        let mut finishing = Box::pin(finish(
+            &mut running,
+            &log,
+            self.options.stop_grace,
+            exited,
+            pull_request,
+            &self.options.pr_tools,
+        ));
+        let settled = loop {
+            let interrupt = tokio::select! {
+                biased;
+                completion = finishing.as_mut() => break Settled::Finished(completion),
+                received = terminal.recv() => received,
+            };
+            let Some(interrupt) = interrupt else {
+                break Settled::Finished(finishing.as_mut().await);
+            };
+            match interrupt {
+                Terminal::Drain => {}
+                Terminal::Cancel => break Settled::Interrupted(Terminal::Cancel),
+                Terminal::Gone => break Settled::Interrupted(Terminal::Gone),
+                Terminal::VersionMismatch { message } => {
+                    break Settled::Interrupted(Terminal::VersionMismatch { message });
+                }
             }
         };
-        Finished {
-            completion,
-            outcome,
-            beats: Some(beats),
+        match settled {
+            Settled::Finished(completion) => Finished {
+                completion: Some(completion),
+                outcome: RunOutcome::Continue,
+                beats: Some(beats),
+            },
+            Settled::Interrupted(reason) => {
+                drop(finishing);
+                log.close().await;
+                stopped(reason, &run_id, log.tail(), beats)
+            }
         }
     }
 
@@ -881,6 +888,70 @@ async fn beat(
             }
         }
         tokio::time::sleep(interval).await;
+    }
+}
+
+async fn finish(
+    running: &mut RunningJob,
+    log: &LogStream,
+    stop_grace: Duration,
+    exited: Result<ExitStatus, JobError>,
+    pull_request: PullRequest,
+    tools: &PrTools,
+) -> CompleteRequest {
+    running.drain_output(stop_grace).await;
+    log.close().await;
+    let tail = log.tail();
+    let status = match exited {
+        Err(error) => return failed(error.fail_reason(), error.to_string(), tail),
+        Ok(status) => status,
+    };
+    let PullRequest {
+        ctx,
+        spec,
+        create_pr,
+    } = pull_request;
+    match status.success() {
+        false => failed("nonzero_exit", exit_message(status), tail),
+        true => match create_pr {
+            CreatePr::No => done(String::new()),
+            CreatePr::Yes => match open_pull_request(&ctx, &spec, tools).await {
+                Ok(PrUrl(url)) => done(url),
+                Err(error) => failed(error.fail_reason(), error.to_string(), tail),
+            },
+        },
+    }
+}
+
+fn stopped(reason: Terminal, run_id: &RunId, tail: String, beats: JoinHandle<()>) -> Finished {
+    match reason {
+        Terminal::Cancel => Finished {
+            completion: Some(failed("canceled", "the run was canceled".to_string(), tail)),
+            outcome: RunOutcome::Continue,
+            beats: Some(beats),
+        },
+        Terminal::Drain => Finished {
+            completion: Some(failed(
+                "runner_shutdown",
+                "the runner shut down while the run was in flight".to_string(),
+                tail,
+            )),
+            outcome: RunOutcome::Continue,
+            beats: Some(beats),
+        },
+        Terminal::Gone => {
+            tracing::warn!("run {run_id} is unknown to the farm and was stopped");
+            Finished {
+                completion: None,
+                outcome: RunOutcome::Continue,
+                beats: Some(beats),
+            }
+        }
+        Terminal::VersionMismatch { message } => Finished {
+            completion: None,
+            outcome: RunOutcome::VersionMismatch { message },
+            beats: Some(beats),
+        },
     }
 }
 

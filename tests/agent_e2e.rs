@@ -785,6 +785,86 @@ async fn a_finished_run_opens_a_pull_request() {
 }
 
 #[tokio::test]
+async fn a_cancel_that_lands_while_the_pull_request_is_opened_abandons_it() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = farm_with(job(checkout.path(), &checkout.plan, CreatePr::Yes)).await;
+    let mut options = options(&checkout.tools);
+    options
+        .pr_tools
+        .env
+        .push(("FAKE_GH_SLEEP".to_string(), "30".to_string()));
+    let _running = start(agent(&farm, config(&farm, &ralphex), options));
+
+    let listing = wait_for(|| match invocations(&checkout.tools).is_empty() {
+        true => None,
+        false => Some(()),
+    })
+    .await;
+    assert!(listing.is_some(), "the pull-request sequence never started");
+    farm.always_heartbeat(Reply::Beat(HeartbeatAction::Cancel));
+
+    let CompleteRequest {
+        status,
+        pr_url,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Error);
+    assert_eq!(fail_reason, "canceled");
+    assert!(pr_url.is_empty());
+    for run in invocations(&checkout.tools) {
+        assert!(
+            !run.starts_with(&["pr", "create"]),
+            "a canceled run opened a pull request anyway"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_forgotten_lease_while_the_pull_request_is_opened_leaves_no_completion() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = farm_with(job(checkout.path(), &checkout.plan, CreatePr::Yes)).await;
+    let mut options = options(&checkout.tools);
+    options
+        .pr_tools
+        .env
+        .push(("FAKE_GH_SLEEP".to_string(), "30".to_string()));
+    let running = start(agent(&farm, config(&farm, &ralphex), options));
+
+    let listing = wait_for(|| match invocations(&checkout.tools).is_empty() {
+        true => None,
+        false => Some(()),
+    })
+    .await;
+    assert!(listing.is_some(), "the pull-request sequence never started");
+    farm.always_heartbeat(Reply::Status(410, String::new()));
+
+    let freed = wait_for(|| match running.agent.slot() {
+        RunSlot::Running(_) => None,
+        RunSlot::Opening => None,
+        RunSlot::Free => Some(()),
+        RunSlot::Polling => Some(()),
+    })
+    .await;
+
+    assert!(freed.is_some(), "the run slot was never released");
+    assert!(
+        farm.requests_ending("/complete").is_empty(),
+        "a forgotten run was completed"
+    );
+    for run in invocations(&checkout.tools) {
+        assert!(
+            !run.starts_with(&["pr", "create"]),
+            "a forgotten run opened a pull request anyway"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_review_job_runs_ralphex_in_review_mode() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
