@@ -571,10 +571,16 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Create: `docs/formula-template.rb`
 - Modify: `mise.toml`
 
-- [ ] `release.yml` with the eight steps from Technical Details, the certificate-import sequence written out, and the formula-rewrite job
-- [ ] `docs/formula-template.rb` as specified, kept in the repository so a change to it is reviewed here
-- [ ] extend `mise run check` with `ruby -c docs/formula-template.rb` and a structural check on `release.yml`: it must contain `security import`, `set-key-partition-list`, two `codesign --sign` invocations and two `codesign --verify` invocations, checked with `grep -c`
-- [ ] run the gate (`actionlint` now covers both workflows) - must pass before task 11
+- [x] `release.yml` with the eight steps from Technical Details, the certificate-import sequence written out, and the formula-rewrite job
+- [x] `docs/formula-template.rb` as specified, kept in the repository so a change to it is reviewed here
+- [x] extend `mise run check` with `ruby -c docs/formula-template.rb` and a structural check on `release.yml`: it must contain `security import`, `set-key-partition-list`, two `codesign --sign` invocations and two `codesign --verify` invocations, checked with `grep -c`
+- [x] run the gate (`actionlint` now covers both workflows) - must pass before task 11
+
+➕ The release job publishes `version` and `sha256` as job outputs, so the formula job substitutes them into the template with `sed` instead of downloading the tarball again to hash it. The template's placeholders are `@VERSION@` and `@SHA256@`, both inside string literals so `ruby -c` parses the template as it stands in the repository.
+➕ The release itself is `softprops/action-gh-release@v2`, which is what carries the `generate_release_notes` input the plan names. The formula job pushes nothing when the rendered formula is byte-identical to the one already in the tap.
+➕ The structural check is its own `check-release` task that `check` calls, because the shell it needs does not fit an entry of `check`'s run array.
+⚠️ BSD `grep` treats `$` as an end-of-line anchor in the middle of a basic regular expression too, so `grep -c -- '--sign "$SIGN_IDENTITY"'` counted zero matches against lines that plainly contain it. The check uses `grep -cF` for every pattern, and a `|| true` so a zero count reaches the comparison instead of tripping `set -e`.
+⚠️ `security list-keychains -d user -s` replaces the whole search list, so the existing entries are read into a bash array and passed back alongside the new keychain; splitting the command substitution unquoted would have been the shorter way and is what shellcheck rejects.
 
 ### Task 11: Verify acceptance criteria
 
