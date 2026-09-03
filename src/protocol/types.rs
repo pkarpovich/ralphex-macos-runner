@@ -365,6 +365,8 @@ pub struct HeartbeatResponse {
 pub struct OpenRunRequest {
     /// The name of the runner that will execute the run.
     pub runner: RunnerName,
+    /// The protocol version the runner speaks.
+    pub version: String,
     /// The runtime class the run needs.
     pub runtime: String,
     /// The repository name the dashboard shows.

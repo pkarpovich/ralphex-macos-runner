@@ -82,14 +82,14 @@ fn heartbeat_response_none() {
 #[test]
 fn open_run_request_full() {
     round_trip::<OpenRunRequest>(
-        r#"{"runner":"mbp-native","runtime":"native","repo":"ralphex-farm","ctx":"/abs/checkout","plan":"/abs/checkout/docs/plans/x.md","branch":"x","create_pr":true}"#,
+        r#"{"runner":"mbp","version":"1","runtime":"native","repo":"ralphex-farm","ctx":"/abs/checkout","plan":"/abs/checkout/docs/plans/x.md","branch":"x","create_pr":true}"#,
     );
 }
 
 #[test]
 fn open_run_request_empty() {
     round_trip::<OpenRunRequest>(
-        r#"{"runner":"","runtime":"","repo":"","ctx":"","plan":"","branch":"","create_pr":false}"#,
+        r#"{"runner":"","version":"","runtime":"","repo":"","ctx":"","plan":"","branch":"","create_pr":false}"#,
     );
 }
 

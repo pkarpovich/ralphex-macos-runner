@@ -28,7 +28,7 @@ use crate::protocol::client::{FarmClient, FarmError};
 use crate::protocol::types::{
     ClaimRequest, CompleteRequest, CompleteStatus, CreatePr, HEARTBEAT_INTERVAL, HeartbeatAction,
     HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest, RETRY_BASE_DELAY, RUNTIME, RunId,
-    RunnerName, STOP_GRACE,
+    RunnerName, STOP_GRACE, VERSION,
 };
 
 const TERMINAL_CAPACITY: usize = 8;
@@ -370,6 +370,7 @@ impl Agent {
         } = request;
         let opened = OpenRunRequest {
             runner: self.config.name.clone(),
+            version: VERSION.to_string(),
             runtime: RUNTIME.to_string(),
             repo: repo_name(Path::new(&ctx)),
             ctx,

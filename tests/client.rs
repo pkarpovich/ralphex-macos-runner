@@ -9,7 +9,7 @@ use ralphex_macos_runner::protocol::client::{FarmClient, FarmError};
 use ralphex_macos_runner::protocol::types::{
     Branch, COMPLETE_BUDGET, ClaimRequest, CompleteRequest, CompleteStatus, CreatePr,
     HeartbeatAction, HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest, RunId, RunnerName,
-    Seq,
+    Seq, VERSION,
 };
 use support::TestSleeper;
 use support::fake_farm::{FakeFarm, Reply, job_reply};
@@ -29,6 +29,7 @@ fn heartbeat_request() -> HeartbeatRequest {
 fn open_run_request() -> OpenRunRequest {
     OpenRunRequest {
         runner: RunnerName("mbp-native".to_string()),
+        version: VERSION.to_string(),
         runtime: "native".to_string(),
         repo: "ralphex-farm".to_string(),
         ctx: "/abs/checkout".to_string(),
@@ -369,6 +370,37 @@ async fn an_opened_run_decodes_and_carries_the_request_body() {
     assert_eq!(body["runtime"], "native");
     assert_eq!(body["create_pr"], true);
     assert_eq!(requests[0].content_type, "application/json");
+}
+
+#[tokio::test]
+async fn an_opened_run_carries_the_protocol_version_the_farm_gates_on() {
+    let farm = FakeFarm::start().await;
+    farm.push_runs(job_reply("local-1"));
+    let client = client(&farm, Arc::new(TestSleeper::new()));
+
+    let job = client.open_run(&open_run_request()).await.unwrap();
+
+    assert_eq!(job.run_id, RunId("local-1".to_string()));
+    let requests = farm.requests_ending("/runs");
+    let body: serde_json::Value = serde_json::from_str(&requests[0].text()).unwrap();
+    assert_eq!(body["version"], VERSION);
+}
+
+#[tokio::test]
+async fn an_opened_run_that_speaks_another_version_is_refused_with_a_mismatch() {
+    let farm = FakeFarm::start().await;
+    farm.push_runs(job_reply("local-1"));
+    let client = client(&farm, Arc::new(TestSleeper::new()));
+    let mut request = open_run_request();
+    request.version = "0".to_string();
+
+    let error = client.open_run(&request).await.unwrap_err();
+
+    let FarmError::VersionMismatch { message } = error else {
+        panic!("a run opened under another version is a mismatch");
+    };
+    assert!(message.contains("speaks"), "{message}");
+    assert!(message.contains("farm speaks"), "{message}");
 }
 
 #[tokio::test]

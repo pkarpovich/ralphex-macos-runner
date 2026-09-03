@@ -3,7 +3,9 @@
 //! A test scripts each route with a queue of [`Reply`] values, or with a sticky
 //! reply the route falls back to once the queue is empty, and reads back every
 //! request the client made. The log route enforces the farm's own sequence
-//! rule, so a client that reuses a sequence number is refused here too.
+//! rule, and the run route its version check, so a client that numbers a chunk
+//! below the last accepted value or speaks another protocol version meets the
+//! same answer here as at the farm.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -15,7 +17,7 @@ use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use ralphex_macos_runner::protocol::types::{
-    Branch, CreatePr, HeartbeatAction, HeartbeatResponse, Job, RunId,
+    Branch, CreatePr, HeartbeatAction, HeartbeatResponse, Job, OpenRunRequest, RunId, VERSION,
 };
 use tokio::sync::Notify;
 
@@ -337,6 +339,9 @@ async fn runs(
     body: Bytes,
 ) -> Response {
     record(&shared, &uri, &headers, &body);
+    if let Some(mismatch) = version_mismatch(&body) {
+        return respond(mismatch);
+    }
     let reply = take(
         &shared,
         RouteName::Runs,
@@ -350,6 +355,31 @@ async fn runs(
         &shared,
         RouteName::Runs,
         Reply::Status(400, "no run scripted".to_string()),
+    ))
+}
+
+fn version_mismatch(body: &Bytes) -> Option<Reply> {
+    let Ok(request) = serde_json::from_slice::<OpenRunRequest>(body) else {
+        return None;
+    };
+    let OpenRunRequest {
+        runner,
+        version,
+        runtime: _,
+        repo: _,
+        ctx: _,
+        plan: _,
+        branch: _,
+        create_pr: _,
+    } = request;
+    if version == VERSION {
+        return None;
+    }
+    Some(Reply::Status(
+        409,
+        format!(
+            r#"{{"error":"protocol version mismatch: runner \"{runner}\" speaks \"{version}\", farm speaks \"{VERSION}\""}}"#
+        ),
     ))
 }
 
