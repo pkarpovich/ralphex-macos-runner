@@ -18,7 +18,7 @@ use tokio::process::Command;
 use crate::config::{Config, DEFAULT_DRAIN_TIMEOUT};
 use crate::paths::{self, APP_NAME, PathError};
 use crate::protocol::types::{
-    COMPLETE_BUDGET, LOG_CLOSE_TIMEOUT, REQUEST_TIMEOUT, RETRY_MAX_DELAY, STOP_GRACE,
+    COMPLETE_BUDGET, LOG_CLOSE_TIMEOUT, PR_BUDGET, REQUEST_TIMEOUT, RETRY_MAX_DELAY, STOP_GRACE,
 };
 
 /// The file launchd writes the daemon's standard output to.
@@ -118,8 +118,9 @@ impl std::fmt::Display for Uninstalled {
 /// to finalise a finished run `runner_lost`. The sum walks every await the
 /// daemon makes after the signal: `drain_timeout` for the run to finish,
 /// [`STOP_GRACE`] to stop the process group, another [`STOP_GRACE`] for the
-/// pipe drain, [`LOG_CLOSE_TIMEOUT`] for the log stream's last flush, and
-/// [`COMPLETE_BUDGET`] for the completion - which overruns its budget by a
+/// pipe drain, [`LOG_CLOSE_TIMEOUT`] for the log stream's last flush,
+/// [`PR_BUDGET`] for a pull-request sequence a run that exited `0` still owes,
+/// and [`COMPLETE_BUDGET`] for the completion - which overruns its budget by a
 /// backoff and a request, because the budget is checked before the sleep rather
 /// than after the attempt.
 ///
@@ -132,7 +133,7 @@ impl std::fmt::Display for Uninstalled {
 ///
 /// assert_eq!(
 ///     service::exit_timeout(Duration::from_secs(120)),
-///     Duration::from_secs(120 + 10 + 10 + 30 + 180 + 30 + 30)
+///     Duration::from_secs(120 + 10 + 10 + 30 + 600 + 180 + 30 + 30)
 /// );
 /// ```
 #[must_use]
@@ -141,6 +142,7 @@ pub fn exit_timeout(drain_timeout: Duration) -> Duration {
         + STOP_GRACE
         + STOP_GRACE
         + LOG_CLOSE_TIMEOUT
+        + PR_BUDGET
         + COMPLETE_BUDGET
         + RETRY_MAX_DELAY
         + REQUEST_TIMEOUT
@@ -501,10 +503,11 @@ mod tests {
         let stop = STOP_GRACE;
         let pipes = STOP_GRACE;
         let logs = LOG_CLOSE_TIMEOUT;
+        let pull_request = PR_BUDGET;
         let completion = COMPLETE_BUDGET + RETRY_MAX_DELAY + REQUEST_TIMEOUT;
         assert_eq!(
             exit_timeout(drain_timeout),
-            drain_timeout + stop + pipes + logs + completion
+            drain_timeout + stop + pipes + logs + pull_request + completion
         );
     }
 
@@ -518,7 +521,7 @@ mod tests {
             Path::new("/logs"),
             exit_timeout(drain_timeout),
         );
-        assert!(plist.contains("<integer>890</integer>"), "{plist}");
+        assert!(plist.contains("<integer>1490</integer>"), "{plist}");
     }
 
     #[test]

@@ -3,6 +3,7 @@
 mod support;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use ralphex_macos_runner::pr::{PrError, PrSpec, PrTools, PrUrl, RunOrigin, open_pull_request};
 use ralphex_macos_runner::protocol::types::{Branch, RunId};
@@ -20,6 +21,7 @@ fn tools(record: &Path) -> PrTools {
         git: fake_git().display().to_string(),
         gh: fake_gh().display().to_string(),
         env: vec![("FAKE_RECORD".to_string(), record.display().to_string())],
+        step_timeout: Duration::from_secs(30),
     }
 }
 
@@ -217,6 +219,26 @@ async fn a_failed_push_is_a_push_error_with_the_farms_name() {
         PrError::Push(message) => assert!(message.contains("fake git push failed")),
         other => panic!("{other} is not a push error"),
     }
+}
+
+#[tokio::test]
+async fn a_step_that_hangs_is_killed_and_fails_its_step() {
+    let (dir, record) = checkout();
+    let mut tools = tools(&record);
+    tools.step_timeout = Duration::from_millis(200);
+    with(&mut tools, "FAKE_DELAY", "5");
+
+    let error = open_pull_request(dir.path(), &spec(), &tools)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.fail_reason(), "pr_create");
+    match error {
+        PrError::List(message) => assert!(message.contains("was killed after"), "{message}"),
+        other => panic!("{other} is not a list error"),
+    }
+    let runs = invocations(&record);
+    assert_eq!(programs(&runs), vec!["gh pr list"]);
 }
 
 #[tokio::test]

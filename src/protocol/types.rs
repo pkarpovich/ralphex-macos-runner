@@ -70,6 +70,15 @@ pub const LOG_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The grace between the `SIGTERM` and the `SIGKILL` of a stopped process group.
 pub const STOP_GRACE: Duration = Duration::from_secs(10);
 
+/// The time one step of the pull-request sequence may take before it is killed.
+pub const PR_STEP_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The number of steps the longest pull-request sequence runs.
+pub const PR_STEPS: u64 = 5;
+
+/// The time the whole pull-request sequence may take.
+pub const PR_BUDGET: Duration = Duration::from_secs(PR_STEP_TIMEOUT.as_secs() * PR_STEPS);
+
 /// The identifier the farm gives a run.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -580,5 +589,9 @@ mod tests {
         assert_eq!(COMPLETE_BUDGET, LEASE_TTL);
         assert_eq!(MAX_LOG_CHUNK, 65536);
         assert_eq!(LOG_BUFFER_BYTES, 4 * 1024 * 1024);
+        assert_eq!(
+            PR_BUDGET,
+            PR_STEP_TIMEOUT * u32::try_from(PR_STEPS).unwrap()
+        );
     }
 }

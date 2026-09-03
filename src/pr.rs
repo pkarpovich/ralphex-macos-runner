@@ -5,14 +5,18 @@
 //! base branch and calls `gh pr create`. A branch that already has a pull
 //! request is only pushed, and the existing URL is reported. [`PrSpec::describe`]
 //! builds the title and the body a run gets, for a ticket job and for a local
-//! run alike.
+//! run alike. Every step is bounded by [`PrTools::step_timeout`], because the
+//! sequence runs after the terminal channel stops being read and while the run
+//! slot is still held: a `git push` that hangs on the wire would otherwise wedge
+//! the daemon until it is restarted by hand.
 
 use std::path::Path;
 use std::process::{Output, Stdio};
+use std::time::Duration;
 
 use tokio::process::Command;
 
-use crate::protocol::types::{Branch, RunId};
+use crate::protocol::types::{Branch, PR_STEP_TIMEOUT, RunId};
 
 /// The URL of a pull request.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -66,6 +70,8 @@ pub struct PrTools {
     pub gh: String,
     /// Environment entries added to the daemon's own.
     pub env: Vec<(String, String)>,
+    /// The time one step may take before its process is killed and the step fails.
+    pub step_timeout: Duration,
 }
 
 impl Default for PrTools {
@@ -74,6 +80,7 @@ impl Default for PrTools {
             git: "git".to_string(),
             gh: "gh".to_string(),
             env: Vec::new(),
+            step_timeout: PR_STEP_TIMEOUT,
         }
     }
 }
@@ -218,7 +225,8 @@ impl PrError {
 /// Returns [`PrError::List`] when the lookup fails, [`PrError::Push`] when the
 /// push fails, [`PrError::Base`] when neither git nor the GitHub CLI names the
 /// default branch, and [`PrError::Create`] when the creation fails or prints no
-/// URL.
+/// URL. A step that outlives [`PrTools::step_timeout`] is killed and fails as
+/// the step it is.
 pub async fn open_pull_request(
     ctx: &Path,
     spec: &PrSpec,
@@ -229,7 +237,13 @@ pub async fn open_pull_request(
         title,
         body,
     } = spec;
-    let PrTools { git, gh, env } = tools;
+    let PrTools {
+        git,
+        gh,
+        env,
+        step_timeout,
+    } = tools;
+    let step_timeout = *step_timeout;
     let branch = branch.as_str();
 
     let listed = match step(
@@ -239,6 +253,7 @@ pub async fn open_pull_request(
             "pr", "list", "--head", branch, "--state", "open", "--json", "url", "--jq", ".[0].url",
         ],
         env,
+        step_timeout,
     )
     .await
     {
@@ -252,14 +267,22 @@ pub async fn open_pull_request(
     };
 
     if let Some(existing) = existing {
-        match step(ctx, git, &["push", "origin", branch], env).await {
+        match step(ctx, git, &["push", "origin", branch], env, step_timeout).await {
             Ok(_pushed) => {}
             Err(message) => return Err(PrError::Push(message)),
         }
         return Ok(existing);
     }
 
-    match step(ctx, git, &["push", "-u", "origin", branch], env).await {
+    match step(
+        ctx,
+        git,
+        &["push", "-u", "origin", branch],
+        env,
+        step_timeout,
+    )
+    .await
+    {
         Ok(_pushed) => {}
         Err(message) => return Err(PrError::Push(message)),
     }
@@ -273,6 +296,7 @@ pub async fn open_pull_request(
             "pr", "create", "--head", branch, "--base", &base, "--title", title, "--body", body,
         ],
         env,
+        step_timeout,
     )
     .await
     {
@@ -296,12 +320,19 @@ pub async fn open_pull_request(
 }
 
 async fn resolve_base(ctx: &Path, tools: &PrTools) -> Result<String, PrError> {
-    let PrTools { git, gh, env } = tools;
+    let PrTools {
+        git,
+        gh,
+        env,
+        step_timeout,
+    } = tools;
+    let step_timeout = *step_timeout;
     let symbolic = step(
         ctx,
         git,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
         env,
+        step_timeout,
     )
     .await;
     if let Ok(base) = symbolic {
@@ -326,6 +357,7 @@ async fn resolve_base(ctx: &Path, tools: &PrTools) -> Result<String, PrError> {
             ".defaultBranchRef.name",
         ],
         env,
+        step_timeout,
     )
     .await;
     let base = match viewed {
@@ -346,6 +378,7 @@ async fn step(
     program: &str,
     args: &[&str],
     env: &[(String, String)],
+    step_timeout: Duration,
 ) -> Result<String, String> {
     let mut command = Command::new(program);
     for arg in args {
@@ -358,10 +391,15 @@ async fn step(
     command.stdin(Stdio::null());
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
+    command.kill_on_drop(true);
     let label = label(program, args);
-    let output = match command.output().await {
-        Ok(output) => output,
-        Err(error) => return Err(format!("{label} could not be run: {error}")),
+    let output = match tokio::time::timeout(step_timeout, command.output()).await {
+        Ok(Ok(output)) => output,
+        Ok(Err(error)) => return Err(format!("{label} could not be run: {error}")),
+        Err(_elapsed) => {
+            let seconds = step_timeout.as_secs();
+            return Err(format!("{label} was killed after {seconds} seconds"));
+        }
     };
     let Output {
         status,
@@ -517,9 +555,15 @@ mod tests {
 
     #[test]
     fn the_default_tools_are_the_ones_on_the_path() {
-        let PrTools { git, gh, env } = PrTools::default();
+        let PrTools {
+            git,
+            gh,
+            env,
+            step_timeout,
+        } = PrTools::default();
         assert_eq!(git, "git");
         assert_eq!(gh, "gh");
         assert!(env.is_empty());
+        assert_eq!(step_timeout, PR_STEP_TIMEOUT);
     }
 }

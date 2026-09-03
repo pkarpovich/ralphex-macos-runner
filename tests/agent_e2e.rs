@@ -112,6 +112,7 @@ fn options(record: &Path) -> AgentOptions {
             git: fake_git().display().to_string(),
             gh: fake_gh().display().to_string(),
             env: vec![("FAKE_RECORD".to_string(), record.display().to_string())],
+            step_timeout: Duration::from_secs(30),
         },
     }
 }
