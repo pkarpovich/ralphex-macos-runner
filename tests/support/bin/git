@@ -25,8 +25,12 @@ for want in ${FAKE_FAIL:-}; do
   fi
 done
 
+if [ -n "${FAKE_DELAY:-}" ]; then
+  sleep "$FAKE_DELAY"
+fi
+
 case "$key" in
-  symbolic-ref) echo "origin/main" ;;
+  symbolic-ref) echo "${FAKE_ORIGIN_HEAD-origin/main}" ;;
 esac
 
 exit 0

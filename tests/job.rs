@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
-use ralphex_macos_runner::job::{JobSpec, LocalOptions, Review, Worktree, spawn, validate};
+use ralphex_macos_runner::job::{
+    JobError, JobSpec, LocalOptions, Review, Worktree, spawn, validate,
+};
 use ralphex_macos_runner::logstream::LogStream;
 use ralphex_macos_runner::protocol::client::FarmClient;
 use ralphex_macos_runner::protocol::types::{Branch, MAX_LOG_CHUNK, RunId};
@@ -297,6 +299,22 @@ async fn a_checkout_without_a_repository_fails_validation() {
     let error = validate(&spec).await.unwrap_err();
 
     assert_eq!(error.fail_reason(), "ctx_invalid");
+}
+
+#[tokio::test]
+async fn a_checkout_that_is_a_file_fails_validation() {
+    let (dir, plan) = checkout();
+    git_init(dir.path());
+    let mut spec = spec(dir.path(), &plan);
+    spec.ctx = plan.clone();
+
+    let error = validate(&spec).await.unwrap_err();
+
+    assert_eq!(error.fail_reason(), "ctx_invalid");
+    let JobError::CtxInvalid(message) = error else {
+        panic!("a checkout that is a file is an invalid context");
+    };
+    assert!(message.contains("is not a directory"), "{message}");
 }
 
 #[tokio::test]

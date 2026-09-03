@@ -207,6 +207,16 @@ fn first_index(farm: &FakeFarm, suffix: &str) -> Option<usize> {
     None
 }
 
+fn last_index(farm: &FakeFarm, suffix: &str) -> Option<usize> {
+    let mut last = None;
+    for (index, request) in farm.requests().iter().enumerate() {
+        if request.path.ends_with(suffix) {
+            last = Some(index);
+        }
+    }
+    last
+}
+
 #[tokio::test]
 async fn a_claimed_job_runs_to_done_and_its_output_reaches_the_farm() {
     let checkout = Checkout::new();
@@ -571,6 +581,76 @@ async fn a_finished_run_opens_a_pull_request() {
         runs[3]
             .args
             .contains(&"FARM-12: split farm and runner".to_string())
+    );
+}
+
+#[tokio::test]
+async fn a_review_job_runs_ralphex_in_review_mode() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let mut asked = job(checkout.path(), &checkout.plan, CreatePr::No);
+    asked.mode = "review".to_string();
+    let farm = farm_with(asked).await;
+    let _running = start(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(&checkout.tools),
+    ));
+
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason: _,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Done);
+    let record = Record::read(&checkout.record);
+    assert_eq!(
+        record.argv,
+        vec![
+            "--branch".to_string(),
+            "x".to_string(),
+            "--review".to_string(),
+            checkout.plan.display().to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_lease_is_still_beaten_while_the_pull_request_is_opened() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = farm_with(job(checkout.path(), &checkout.plan, CreatePr::Yes)).await;
+    let mut options = options(&checkout.tools);
+    options
+        .pr_tools
+        .env
+        .push(("FAKE_DELAY".to_string(), "0.3".to_string()));
+    let _running = start(agent(&farm, config(&farm, &ralphex), options));
+
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason: _,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Done);
+    let Some(last_chunk) = last_index(&farm, "/log") else {
+        panic!("no log chunk was sent");
+    };
+    let mut beats = 0;
+    for request in farm.requests().iter().skip(last_chunk + 1) {
+        if request.path.ends_with("/heartbeat") {
+            beats += 1;
+        }
+    }
+    assert!(
+        beats >= 5,
+        "the heartbeat stopped at the process exit: {beats} beats reached the farm while the pull request was opened"
     );
 }
 

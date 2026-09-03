@@ -143,9 +143,16 @@ async fn start_run(socket: Option<PathBuf>, run: RunArgs) -> ExitCode {
             }
         }
     };
-    match answer(first) {
-        Answer::Streaming => follow(&mut stream).await,
-        Answer::Ended(code) => code,
+    let first = match first {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("rxd: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match show(first) {
+        Some(code) => code,
+        None => follow(&mut stream).await,
     }
 }
 
@@ -162,25 +169,20 @@ async fn attach(socket: Option<PathBuf>) -> ExitCode {
         eprintln!("rxd: {error}");
         return ExitCode::FAILURE;
     }
-    match answer(ipc::receive::<Response, _>(&mut stream).await) {
-        Answer::Streaming => follow(&mut stream).await,
-        Answer::Ended(code) => code,
-    }
-}
-
-enum Answer {
-    Streaming,
-    Ended(ExitCode),
-}
-
-fn answer(received: Result<Response, IpcError>) -> Answer {
-    let response = match received {
+    let first = match ipc::receive::<Response, _>(&mut stream).await {
         Ok(response) => response,
         Err(error) => {
             eprintln!("rxd: {error}");
-            return Answer::Ended(ExitCode::FAILURE);
+            return ExitCode::FAILURE;
         }
     };
+    match show(first) {
+        Some(code) => code,
+        None => follow(&mut stream).await,
+    }
+}
+
+fn show(response: Response) -> Option<ExitCode> {
     match response {
         Response::Started {
             run_id,
@@ -188,29 +190,29 @@ fn answer(received: Result<Response, IpcError>) -> Answer {
         } => {
             println!("run {run_id}");
             println!("{dashboard_url}");
-            Answer::Streaming
-        }
-        Response::Busy { run_id } => {
-            eprintln!("rxd: the daemon is running {run_id}");
-            Answer::Ended(ExitCode::FAILURE)
-        }
-        Response::NoRun => {
-            eprintln!("rxd: nothing is running");
-            Answer::Ended(ExitCode::FAILURE)
-        }
-        Response::Error { message } => {
-            eprintln!("rxd: {message}");
-            Answer::Ended(ExitCode::FAILURE)
+            None
         }
         Response::Line { text } => {
             println!("{text}");
-            Answer::Streaming
+            None
         }
         Response::Ended {
             status,
             pr_url,
             fail_reason,
-        } => Answer::Ended(report(status, &pr_url, &fail_reason)),
+        } => Some(report(status, &pr_url, &fail_reason)),
+        Response::Busy { run_id } => {
+            eprintln!("rxd: the daemon is running {run_id}");
+            Some(ExitCode::FAILURE)
+        }
+        Response::NoRun => {
+            eprintln!("rxd: nothing is running");
+            Some(ExitCode::FAILURE)
+        }
+        Response::Error { message } => {
+            eprintln!("rxd: {message}");
+            Some(ExitCode::FAILURE)
+        }
     }
 }
 
@@ -234,29 +236,8 @@ async fn follow(stream: &mut UnixStream) -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        match response {
-            Response::Line { text } => println!("{text}"),
-            Response::Ended {
-                status,
-                pr_url,
-                fail_reason,
-            } => return report(status, &pr_url, &fail_reason),
-            Response::Error { message } => {
-                eprintln!("rxd: {message}");
-                return ExitCode::FAILURE;
-            }
-            Response::Started {
-                run_id,
-                dashboard_url: _,
-            } => println!("run {run_id}"),
-            Response::Busy { run_id } => {
-                eprintln!("rxd: the daemon is running {run_id}");
-                return ExitCode::FAILURE;
-            }
-            Response::NoRun => {
-                eprintln!("rxd: nothing is running");
-                return ExitCode::FAILURE;
-            }
+        if let Some(code) = show(response) {
+            return code;
         }
     }
 }

@@ -14,7 +14,7 @@ use std::process::{Output, Stdio};
 use nix::unistd::Uid;
 use tokio::process::Command;
 
-use crate::paths::{self, APP_NAME, LAUNCHD_LABEL, PathError};
+use crate::paths::{self, APP_NAME, PathError};
 
 /// The file launchd writes the daemon's standard output to.
 pub const STDOUT_FILE: &str = "daemon.out.log";
@@ -116,6 +116,7 @@ impl std::fmt::Display for Uninstalled {
 /// use ralphex_macos_runner::service;
 ///
 /// let plist = service::generate_plist(
+///     "dev.pkarpovich.ralphex-macos-runner",
 ///     Path::new("/data/ralphex-macos-runner/bin/ralphex-macos-runner"),
 ///     "/opt/homebrew/bin:/usr/bin",
 ///     Path::new("/logs/ralphex-macos-runner"),
@@ -125,7 +126,8 @@ impl std::fmt::Display for Uninstalled {
 /// assert!(plist.contains("<string>/logs/ralphex-macos-runner/daemon.out.log</string>"));
 /// ```
 #[must_use]
-pub fn generate_plist(daemon_path: &Path, path_env: &str, log_dir: &Path) -> String {
+pub fn generate_plist(label: &str, daemon_path: &Path, path_env: &str, log_dir: &Path) -> String {
+    let label = escape(label);
     let daemon_path = escape(&daemon_path.display().to_string());
     let path_env = escape(path_env);
     let stdout_path = escape(&log_dir.join(STDOUT_FILE).display().to_string());
@@ -136,7 +138,7 @@ pub fn generate_plist(daemon_path: &Path, path_env: &str, log_dir: &Path) -> Str
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>{LAUNCHD_LABEL}</string>
+	<string>{label}</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>{daemon_path}</string>
@@ -187,26 +189,10 @@ pub async fn install() -> Result<Installed, ServiceError> {
     }
     create_dir(&log_dir)?;
 
-    match std::fs::remove_file(&daemon_path) {
-        Ok(()) => {}
-        Err(error) => {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(ServiceError::Write {
-                    path: daemon_path.display().to_string(),
-                    message: error.to_string(),
-                });
-            }
-        }
-    }
-    if let Err(error) = std::fs::copy(&source, &daemon_path) {
-        return Err(ServiceError::Write {
-            path: daemon_path.display().to_string(),
-            message: format!("{} could not be copied: {error}", source.display()),
-        });
-    }
+    place_daemon(&source, &daemon_path)?;
 
     let path_env = std::env::var("PATH").unwrap_or_default();
-    let plist = generate_plist(&daemon_path, &path_env, &log_dir);
+    let plist = generate_plist(&paths::launchd_label(), &daemon_path, &path_env, &log_dir);
     if let Err(error) = std::fs::write(&plist_path, plist) {
         return Err(ServiceError::Write {
             path: plist_path.display().to_string(),
@@ -269,6 +255,37 @@ pub fn by_hand(uid: u32, plist_path: &Path) -> String {
     format!(
         "stop    launchctl bootout gui/{uid} {plist_path}\nstart   launchctl bootstrap gui/{uid} {plist_path}"
     )
+}
+
+/// Copies the daemon binary from `source` to `daemon_path`.
+///
+/// The old file is removed before the copy: overwriting the binary launchd is
+/// running fails with `ETXTBSY`, and unlinking it leaves the running daemon on
+/// the inode it already opened.
+///
+/// # Errors
+///
+/// Returns [`ServiceError::Write`] when the old binary cannot be removed or the
+/// new one cannot be copied into place.
+pub fn place_daemon(source: &Path, daemon_path: &Path) -> Result<(), ServiceError> {
+    match std::fs::remove_file(daemon_path) {
+        Ok(()) => {}
+        Err(error) => {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(ServiceError::Write {
+                    path: daemon_path.display().to_string(),
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+    if let Err(error) = std::fs::copy(source, daemon_path) {
+        return Err(ServiceError::Write {
+            path: daemon_path.display().to_string(),
+            message: format!("{} could not be copied: {error}", source.display()),
+        });
+    }
+    Ok(())
 }
 
 fn daemon_source() -> Result<PathBuf, ServiceError> {
@@ -366,6 +383,7 @@ mod tests {
 
     fn plist() -> String {
         generate_plist(
+            &paths::launchd_label(),
             Path::new("/data/ralphex-macos-runner/bin/ralphex-macos-runner"),
             "/opt/homebrew/bin:/usr/bin:/bin",
             Path::new("/logs/ralphex-macos-runner"),
@@ -377,7 +395,7 @@ mod tests {
         let plist = plist();
         assert!(plist.contains("<key>Label</key>"), "{plist}");
         assert!(
-            plist.contains(&format!("<string>{LAUNCHD_LABEL}</string>")),
+            plist.contains(&format!("<string>{}</string>", paths::launchd_label())),
             "{plist}"
         );
         assert!(
@@ -424,7 +442,12 @@ mod tests {
     #[test]
     fn the_log_paths_are_the_ones_paths_names() {
         let log_dir = paths::log_dir().unwrap();
-        let plist = generate_plist(Path::new("/bin/daemon"), "/usr/bin", &log_dir);
+        let plist = generate_plist(
+            &paths::launchd_label(),
+            Path::new("/bin/daemon"),
+            "/usr/bin",
+            &log_dir,
+        );
         let stdout_path = paths::daemon_stdout_path().unwrap();
         let stderr_path = paths::daemon_stderr_path().unwrap();
         assert!(
@@ -438,8 +461,64 @@ mod tests {
     }
 
     #[test]
+    fn a_development_build_registers_under_a_label_of_its_own() {
+        let plist = plist();
+        assert!(
+            plist.contains("<string>dev.pkarpovich.ralphex-macos-runner-dev</string>"),
+            "{plist}"
+        );
+        assert!(
+            !plist.contains("<string>dev.pkarpovich.ralphex-macos-runner</string>"),
+            "{plist}"
+        );
+    }
+
+    #[test]
+    fn a_daemon_is_placed_over_the_binary_that_was_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("new-daemon");
+        let installed = dir.path().join("ralphex-macos-runner");
+        std::fs::write(&source, "new").unwrap();
+        std::fs::write(&installed, "old").unwrap();
+
+        place_daemon(&source, &installed).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&installed).unwrap(), "new");
+    }
+
+    #[test]
+    fn a_daemon_is_placed_where_none_was() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("new-daemon");
+        let installed = dir.path().join("bin").join("ralphex-macos-runner");
+        std::fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        std::fs::write(&source, "new").unwrap();
+
+        place_daemon(&source, &installed).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&installed).unwrap(), "new");
+    }
+
+    #[test]
+    fn a_source_that_is_not_there_is_reported_with_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("absent-daemon");
+        let installed = dir.path().join("ralphex-macos-runner");
+
+        let error = place_daemon(&source, &installed).unwrap_err();
+
+        let ServiceError::Write { path, message } = error else {
+            panic!("a copy that fails is a write failure");
+        };
+        assert_eq!(path, installed.display().to_string());
+        assert!(message.contains("absent-daemon"), "{message}");
+        assert!(!installed.exists());
+    }
+
+    #[test]
     fn markup_in_a_path_is_escaped() {
         let plist = generate_plist(
+            "dev.pkarpovich.ralphex-macos-runner",
             Path::new("/data/a&b/daemon"),
             "/usr/bin:/opt/<x>",
             Path::new("/logs"),

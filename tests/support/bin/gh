@@ -26,18 +26,26 @@ for want in ${FAKE_FAIL:-}; do
   fi
 done
 
+if [ -n "${FAKE_DELAY:-}" ]; then
+  sleep "$FAKE_DELAY"
+fi
+
 case "$key" in
   list)
     if [ -n "${FAKE_EXISTING_PR:-}" ]; then
       echo "$FAKE_EXISTING_PR"
+    else
+      echo "${FAKE_NO_PR_OUTPUT-null}"
     fi
     ;;
   create)
-    echo "Creating pull request for the branch"
-    echo ""
-    echo "https://github.com/owner/repo/pull/7"
+    if [ -z "${FAKE_SILENT_CREATE:-}" ]; then
+      echo "Creating pull request for the branch"
+      echo ""
+      echo "https://github.com/owner/repo/pull/7"
+    fi
     ;;
-  repo-view) echo "main" ;;
+  repo-view) echo "${FAKE_DEFAULT_BRANCH-main}" ;;
 esac
 
 exit 0

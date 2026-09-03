@@ -35,7 +35,8 @@ A native runner for ralphex-farm: it claims jobs from the farm over HTTP and run
 - `agent.rs`: the config-driven agent - the run slot, the claim loop, the heartbeat task, `execute` (the one execution path), drain and completion. `CurrentRun` is what `Attach` follows.
 - `ipc.rs`: length-prefixed JSON over the Unix socket, the `Command`/`Response` enums and `serve`.
 - `config.rs`, `paths.rs`, `service.rs`: `config.toml`, profile-dependent locations, the launchd plist and install/uninstall.
-- `tests/support/`: the `axum` fake farm with a scripted queue per route, `fake-ralphex.sh`, and `git`/`gh` shims that record their arguments. Nothing in the suite touches the real farm, Linear, launchd or the network.
+- `tests/support/`: the `axum` fake farm with a scripted queue per route, `fake-ralphex.sh`, and `git`/`gh` shims that record their arguments and answer what the real tools do (`gh pr list` prints `null` when there is none). Nothing in the suite touches the real farm, Linear, launchd or the network.
+- `tests/daemon_process.rs`: the daemon as launchd runs it - a real process driven by `--config`/`--socket` and signals, for the exit statuses and the shutdown drain, which an in-process `Agent` cannot show.
 
 ### Key Patterns
 
@@ -48,7 +49,9 @@ A native runner for ralphex-farm: it claims jobs from the farm over HTTP and run
 - **Retry is per operation**: `claim` never retries (the loop polls again); `open_run` never retries (it mints a run id and a lease per call, so a retry after a lost response orphans a run); `append_log` and `heartbeat` back off 1 s doubling to 30 s for at most 6 attempts, and any `4xx` is final; `complete` retries with the same backoff **without an attempt limit** until the farm accepts it, answers `410`, or `COMPLETE_BUDGET` elapses - giving up early lets the lease expire and a successful run be finalised `runner_lost`.
 - **`seq` is 1-based and spent per attempt**: every send attempt consumes the next value whether or not it lands. Gaps are normal; the farm rejects `seq = 0` and any value not above the last it accepted.
 - **Every interval is injectable**: `AgentOptions` carries the heartbeat interval, drain timeout, stop grace, claim retry delay, ticker and `PrTools`, so no test waits on wall-clock time.
-- **Profile-based paths**: `cfg!(debug_assertions)` picks `ralphex-macos-runner-dev` over `ralphex-macos-runner` for the application and log directories, so a development daemon never collides with the installed one. All of it lives in `paths.rs`.
+- **Profile-based paths**: `cfg!(debug_assertions)` picks `ralphex-macos-runner-dev` over `ralphex-macos-runner` for the application and log directories **and for the launchd label** (`paths::launchd_label`), so neither a development daemon nor a development `rxd install` ever collides with the installed one. All of it lives in `paths.rs`; `service::generate_plist` takes the label rather than reading it.
+- **A shutdown waits for the slot**: `Agent::run` returns `Shutdown` only after re-acquiring the run permit, because a run `rxd` started lives in a detached task that the runtime would otherwise drop unfinished - no `complete`, an orphaned process group and a lease the farm finalises `runner_lost`.
+- **The heartbeat outlives the process**: the beat task is aborted in `serve_run` after `complete`, not at the process exit, so the log close, the `git push`/`gh pr create` sequence and the completion all happen under a lease that is still being renewed.
 
 ### Non-goals (do not add without changing the plan first)
 

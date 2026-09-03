@@ -14,7 +14,8 @@ use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, watch};
+use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::ipc::RunRequest;
@@ -77,12 +78,6 @@ impl CurrentRun {
     #[must_use]
     pub fn log(&self) -> Arc<LogStream> {
         Arc::clone(&self.log)
-    }
-
-    /// Returns the replay history and a receiver of the lines that follow it.
-    #[must_use]
-    pub fn subscribe(&self) -> (Vec<String>, broadcast::Receiver<String>) {
-        self.log.subscribe()
     }
 
     /// Waits for the run to finish and returns the completion it reported.
@@ -188,6 +183,12 @@ enum Ended {
     Terminal(Terminal),
 }
 
+struct Finished {
+    completion: Option<CompleteRequest>,
+    outcome: RunOutcome,
+    beats: Option<JoinHandle<()>>,
+}
+
 /// The runner's claim loop and its single run slot.
 pub struct Agent {
     config: Config,
@@ -237,25 +238,22 @@ impl Agent {
     /// instant before an abort would be lost on the wire and finalized as a lost
     /// run three minutes later. A claim that comes back empty hands the slot to
     /// a local request that is already waiting for it, because the queue behind
-    /// the slot serves its waiters in order.
+    /// the slot serves its waiters in order. A shutdown returns only once the
+    /// slot is free again, so a run an `rxd` client started is drained and
+    /// completed like a claimed one instead of dying with the runtime.
     pub async fn run(&self, shutdown: watch::Receiver<bool>) -> AgentExit {
         let request = ClaimRequest::native(self.config.name.clone());
         let mut shutdown = shutdown;
         loop {
             if *shutdown.borrow() {
-                self.hold(RunSlot::Free);
-                return AgentExit::Shutdown;
+                return self.drained().await;
             }
             let permit = tokio::select! {
                 permit = Arc::clone(&self.permits).acquire_owned() => permit,
-                _raised = raised(&mut shutdown) => {
-                    self.hold(RunSlot::Free);
-                    return AgentExit::Shutdown;
-                }
+                _raised = raised(&mut shutdown) => return self.drained().await,
             };
             let Ok(permit) = permit else {
-                self.hold(RunSlot::Free);
-                return AgentExit::Shutdown;
+                return self.drained().await;
             };
             self.hold(RunSlot::Polling);
             let claimed = self.client.claim(&request).await;
@@ -384,9 +382,16 @@ impl Agent {
         current: &CurrentRun,
     ) -> RunOutcome {
         let run_id = job.run_id.clone();
-        let (completion, outcome) = self.execute(job, local, shutdown, current).await;
+        let Finished {
+            completion,
+            outcome,
+            beats,
+        } = self.execute(job, local, shutdown, current).await;
         if let Some(completion) = completion.clone() {
             self.report(&run_id, completion).await;
+        }
+        if let Some(beats) = beats {
+            beats.abort();
         }
         self.leave(current, completion);
         outcome
@@ -398,7 +403,7 @@ impl Agent {
         local: LocalOptions,
         shutdown: watch::Receiver<bool>,
         current: &CurrentRun,
-    ) -> (Option<CompleteRequest>, RunOutcome) {
+    ) -> Finished {
         let Job {
             run_id,
             issue_id: _,
@@ -416,14 +421,15 @@ impl Agent {
         } = job;
 
         if runtime != RUNTIME {
-            return (
-                Some(failed(
+            return Finished {
+                completion: Some(failed(
                     "runtime_mismatch",
                     format!("this runner serves {RUNTIME}, the job asks for {runtime}"),
                     String::new(),
                 )),
-                RunOutcome::Continue,
-            );
+                outcome: RunOutcome::Continue,
+                beats: None,
+            };
         }
 
         let spec = JobSpec {
@@ -435,14 +441,15 @@ impl Agent {
             ralphex_bin: self.config.ralphex_bin.clone(),
         };
         if let Err(error) = job::validate(&spec).await {
-            return (
-                Some(failed(
+            return Finished {
+                completion: Some(failed(
                     error.fail_reason(),
                     error.to_string(),
                     String::new(),
                 )),
-                RunOutcome::Continue,
-            );
+                outcome: RunOutcome::Continue,
+                beats: None,
+            };
         }
 
         let log = current.log();
@@ -463,13 +470,13 @@ impl Agent {
         let mut running = match job::spawn(&spec, Arc::clone(&log)) {
             Ok(running) => running,
             Err(error) => {
-                beats.abort();
                 drain.abort();
                 log.close().await;
-                return (
-                    Some(failed(error.fail_reason(), error.to_string(), log.tail())),
-                    RunOutcome::Continue,
-                );
+                return Finished {
+                    completion: Some(failed(error.fail_reason(), error.to_string(), log.tail())),
+                    outcome: RunOutcome::Continue,
+                    beats: Some(beats),
+                };
             }
         };
         tracing::info!("run {run_id} started in {ctx}");
@@ -487,24 +494,21 @@ impl Agent {
                 }
             }
         }
-        beats.abort();
         drain.abort();
         log.close().await;
         let tail = log.tail();
 
-        match ended {
+        let (completion, outcome) = match ended {
             Ended::Exited(Err(error)) => (
                 Some(failed(error.fail_reason(), error.to_string(), tail)),
                 RunOutcome::Continue,
             ),
-            Ended::Exited(Ok(status)) => {
-                if !status.success() {
-                    return (
-                        Some(failed("nonzero_exit", exit_message(status), tail)),
-                        RunOutcome::Continue,
-                    );
-                }
-                match create_pr {
+            Ended::Exited(Ok(status)) => match status.success() {
+                false => (
+                    Some(failed("nonzero_exit", exit_message(status), tail)),
+                    RunOutcome::Continue,
+                ),
+                true => match create_pr {
                     CreatePr::No => (Some(done(String::new())), RunOutcome::Continue),
                     CreatePr::Yes => {
                         let origin = origin(identifier, issue_url, title);
@@ -520,8 +524,8 @@ impl Agent {
                             ),
                         }
                     }
-                }
-            }
+                },
+            },
             Ended::Terminal(Terminal::Cancel) => (
                 Some(failed("canceled", "the run was canceled".to_string(), tail)),
                 RunOutcome::Continue,
@@ -541,11 +545,22 @@ impl Agent {
             Ended::Terminal(Terminal::VersionMismatch { message }) => {
                 (None, RunOutcome::VersionMismatch { message })
             }
+        };
+        Finished {
+            completion,
+            outcome,
+            beats: Some(beats),
         }
     }
 
     fn hold(&self, state: RunSlot) {
         self.slot.send_replace(state);
+    }
+
+    async fn drained(&self) -> AgentExit {
+        let _held = Arc::clone(&self.permits).acquire_owned().await;
+        self.hold(RunSlot::Free);
+        AgentExit::Shutdown
     }
 
     async fn hold_slot(&self) -> Result<OwnedSemaphorePermit, RunId> {
@@ -652,12 +667,12 @@ async fn running(slot: &mut watch::Receiver<RunSlot>) -> RunId {
     }
 }
 
-enum Raised {
+pub(crate) enum Raised {
     Shutdown,
     Detached,
 }
 
-async fn raised(shutdown: &mut watch::Receiver<bool>) -> Raised {
+pub(crate) async fn raised(shutdown: &mut watch::Receiver<bool>) -> Raised {
     loop {
         if *shutdown.borrow() {
             return Raised::Shutdown;

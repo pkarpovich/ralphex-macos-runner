@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 /// The application directory name a release build uses.
 pub const APP_NAME: &str = "ralphex-macos-runner";
 
-/// The launchd label of the daemon's user agent.
-pub const LAUNCHD_LABEL: &str = "dev.pkarpovich.ralphex-macos-runner";
+/// The prefix every launchd label of this daemon carries.
+pub const LAUNCHD_PREFIX: &str = "dev.pkarpovich";
 
 /// The build profile that decides which application directory is used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +212,26 @@ pub fn daemon_stderr_path() -> Result<PathBuf, PathError> {
     Ok(log_dir()?.join("daemon.err.log"))
 }
 
+/// Returns the launchd label of the daemon's user agent for this profile.
+///
+/// A development build registers under a label of its own, so `rxd install`
+/// from the target directory never boots the installed daemon out.
+///
+/// # Examples
+///
+/// ```
+/// use ralphex_macos_runner::paths::{self, Profile};
+///
+/// assert_eq!(
+///     paths::launchd_label(),
+///     format!("dev.pkarpovich.{}", Profile::current().app_dir_name())
+/// );
+/// ```
+#[must_use]
+pub fn launchd_label() -> String {
+    format!("{LAUNCHD_PREFIX}.{}", Profile::current().app_dir_name())
+}
+
 /// Returns the path of the daemon's launchd property list.
 ///
 /// # Errors
@@ -222,7 +242,7 @@ pub fn daemon_stderr_path() -> Result<PathBuf, PathError> {
 ///
 /// ```
 /// let path = ralphex_macos_runner::paths::launch_agent_path().unwrap();
-/// assert!(path.ends_with("dev.pkarpovich.ralphex-macos-runner.plist"));
+/// assert!(path.ends_with("dev.pkarpovich.ralphex-macos-runner-dev.plist"));
 /// ```
 pub fn launch_agent_path() -> Result<PathBuf, PathError> {
     let Some(home) = dirs::home_dir() else {
@@ -231,7 +251,7 @@ pub fn launch_agent_path() -> Result<PathBuf, PathError> {
     Ok(home
         .join("Library")
         .join("LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist")))
+        .join(format!("{}.plist", launchd_label())))
 }
 
 #[cfg(test)]
@@ -299,7 +319,16 @@ mod tests {
         assert!(path.starts_with(home.join("Library").join("LaunchAgents")));
         assert_eq!(
             path.file_name().unwrap(),
-            format!("{LAUNCHD_LABEL}.plist").as_str()
+            format!("{}.plist", launchd_label()).as_str()
+        );
+    }
+
+    #[test]
+    fn the_launchd_label_carries_the_profile_of_the_build() {
+        assert_eq!(launchd_label(), "dev.pkarpovich.ralphex-macos-runner-dev");
+        assert_ne!(
+            launchd_label(),
+            format!("{LAUNCHD_PREFIX}.{}", Profile::Release.app_dir_name())
         );
     }
 }

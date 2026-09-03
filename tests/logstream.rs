@@ -8,7 +8,7 @@ use std::time::Duration;
 use ralphex_macos_runner::logstream::LogStream;
 use ralphex_macos_runner::protocol::client::{FarmClient, FarmError};
 use ralphex_macos_runner::protocol::types::{
-    HISTORY_LINES, LOG_TAIL_LINES, MAX_LOG_CHUNK, RunId, Seq,
+    HISTORY_LINES, LOG_BUFFER_BYTES, LOG_TAIL_LINES, MAX_LOG_CHUNK, RunId, Seq,
 };
 use support::fake_farm::{FakeFarm, Reply};
 use support::{TestSleeper, TickHandle, manual_ticker};
@@ -217,6 +217,28 @@ async fn a_closed_stream_can_be_closed_again() {
     stream.close().await;
 
     assert_eq!(farm.requests_ending("/log").len(), 1);
+}
+
+#[tokio::test]
+async fn a_buffer_past_its_bound_drops_its_oldest_bytes() {
+    let farm = FakeFarm::start().await;
+    let (stream, handle) = stream(&farm);
+
+    let mut written = vec![b'o'; MAX_LOG_CHUNK];
+    written.extend(vec![b'n'; LOG_BUFFER_BYTES]);
+    stream.write(&written);
+    handle.drive().await;
+
+    let mut delivered = Vec::new();
+    for request in farm.requests_ending("/log") {
+        delivered.extend(request.body);
+    }
+    assert_eq!(delivered.len(), LOG_BUFFER_BYTES);
+    assert!(
+        !delivered.contains(&b'o'),
+        "the oldest bytes outlived the bound"
+    );
+    stream.close().await;
 }
 
 #[tokio::test]

@@ -55,6 +55,7 @@ rxd uninstall
 ```
 
 - The checkout is the current directory, the plan is made absolute against it, and the branch defaults to the plan file's stem. A pull request is opened unless `--no-pr`.
+- `--worktree` is passed straight to ralphex, which then works in a git worktree of the checkout instead of the checkout itself. A claimed job never gets it.
 - `rxd` prints `run <run_id>` and the dashboard URL before the first output line, so you can leave immediately.
 - Ctrl-C prints `detached; the run continues` and exits 0. `rxd attach` reconnects, replays what has already been printed and then follows live; several terminals may attach at once.
 - Staying attached to the end exits 0 for `done` and 1 for `error`.
@@ -78,7 +79,7 @@ branch: my-feature-branch
 -->
 ```
 
-Both paths are absolute and the plan must sit inside `ctx` - the farm holds no checkout, so whether they exist is this runner's business. `pr: false` ends the run at the pushed branch. `mode: review` re-runs only the review pipeline.
+Both paths are absolute and the plan must sit inside `ctx` - the farm holds no checkout, so whether they exist is this runner's business. `pr: false` ends the run at the local branch in the checkout - nothing is pushed and no pull request is opened. `mode: review` re-runs only the review pipeline.
 
 ## Pull request
 
@@ -95,9 +96,9 @@ Homebrew only replaces the binaries in its prefix; `rxd install` copies the new 
 
 ## Exit codes and restarts
 
-The daemon exits **2** when the farm answers `409` to a claim or a heartbeat, meaning the two no longer speak the same protocol version. A running job is stopped through the normal signal sequence first, the log line names both versions, and launchd's `KeepAlive` restarts the daemon under its own throttle - so a mismatch shows up as a restart loop in the log, not as a silent runner that claims nothing. Exit 1 is a bad configuration or an unreachable farm URL at startup; exit 0 is a clean shutdown after a drain.
+The daemon exits **2** when the farm answers `409` to a claim or a heartbeat, meaning the two no longer speak the same protocol version. A running job is stopped through the normal signal sequence first, the log line names both versions, and launchd's `KeepAlive` restarts the daemon under its own throttle - so a mismatch shows up as a restart loop in the log, not as a silent runner that claims nothing. Exit 1 is a missing or invalid `config.toml` at startup; exit 0 is a clean shutdown after a drain. A farm that cannot be reached is not a startup failure: the claim loop logs `the claim failed: ...` once per poll and keeps trying.
 
-On `SIGTERM` or `SIGINT` the daemon stops claiming and lets a running job finish for up to `drain_timeout`, then stops it and reports it as `runner_shutdown`.
+On `SIGTERM` or `SIGINT` the daemon stops claiming and lets a running job finish for up to `drain_timeout`, then stops it and reports it as `runner_shutdown`. A run `rxd` started is drained the same way: the daemon leaves only once its slot is free again.
 
 ## Development
 
@@ -107,4 +108,14 @@ mise exec -- cargo test        # tests only
 mise exec -- cargo run --bin ralphex-macos-runner -- --config /tmp/config.toml
 ```
 
-A debug build uses `ralphex-macos-runner-dev` for its application and log directories, so it never collides with the installed daemon. The test suite talks to a fake farm, a fake ralphex and `git`/`gh` shims - nothing touches the real farm, Linear, launchd or the network.
+A debug build uses `ralphex-macos-runner-dev` for its application and log directories and for its launchd label, so neither the daemon nor `rxd install` ever collides with the installed release. The test suite talks to a fake farm, a fake ralphex and `git`/`gh` shims - nothing touches the real farm, Linear, launchd or the network.
+
+## Release
+
+```fish
+# bump version in Cargo.toml, commit, then
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The tag must match `version` in `Cargo.toml` exactly; the workflow fails if it does not. It runs `mise run check`, builds for `aarch64-apple-darwin`, signs both binaries with a Developer ID, publishes the tarball as a GitHub release and rewrites `Formula/ralphex-macos-runner.rb` in `pkarpovich/homebrew-apps` from `docs/formula-template.rb`. It needs the secrets `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD` and `HOMEBREW_TAP_TOKEN`, and the repository variable `SIGN_IDENTITY`.

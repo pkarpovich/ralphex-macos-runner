@@ -253,6 +253,97 @@ async fn a_failed_creation_is_a_create_error() {
 }
 
 #[tokio::test]
+async fn an_empty_lookup_is_no_pull_request_whether_it_prints_null_or_nothing() {
+    for printed in ["null", ""] {
+        let (dir, record) = checkout();
+        let mut tools = tools(&record);
+        with(&mut tools, "FAKE_NO_PR_OUTPUT", printed);
+
+        let url = open_pull_request(dir.path(), &spec(), &tools)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            url,
+            PrUrl("https://github.com/owner/repo/pull/7".to_string()),
+            "{printed} was taken for an existing pull request"
+        );
+        assert_eq!(
+            programs(&invocations(&record)),
+            vec![
+                "gh pr list".to_string(),
+                "git push -u".to_string(),
+                "git symbolic-ref --short".to_string(),
+                "gh pr create".to_string(),
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_creation_that_prints_no_url_is_a_create_error() {
+    let (dir, record) = checkout();
+    let mut tools = tools(&record);
+    with(&mut tools, "FAKE_SILENT_CREATE", "1");
+
+    let error = open_pull_request(dir.path(), &spec(), &tools)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.fail_reason(), "pr_create");
+    match error {
+        PrError::Create(message) => assert_eq!(message, "gh pr create printed no pull request URL"),
+        other => panic!("{other} is not a create error"),
+    }
+}
+
+#[tokio::test]
+async fn a_blank_origin_head_falls_back_to_the_repository_view() {
+    let (dir, record) = checkout();
+    let mut tools = tools(&record);
+    with(&mut tools, "FAKE_ORIGIN_HEAD", "");
+    with(&mut tools, "FAKE_DEFAULT_BRANCH", "trunk");
+
+    open_pull_request(dir.path(), &spec(), &tools)
+        .await
+        .unwrap();
+
+    let runs = invocations(&record);
+    assert_eq!(
+        programs(&runs),
+        vec![
+            "gh pr list".to_string(),
+            "git push -u".to_string(),
+            "git symbolic-ref --short".to_string(),
+            "gh repo view".to_string(),
+            "gh pr create".to_string(),
+        ]
+    );
+    let created = &runs[4];
+    assert!(created.starts_with(&["pr", "create", "--head", "farm-runner", "--base", "trunk"]));
+}
+
+#[tokio::test]
+async fn a_base_the_repository_view_leaves_blank_is_a_base_error() {
+    let (dir, record) = checkout();
+    let mut tools = tools(&record);
+    with(&mut tools, "FAKE_ORIGIN_HEAD", "");
+    with(&mut tools, "FAKE_DEFAULT_BRANCH", "");
+
+    let error = open_pull_request(dir.path(), &spec(), &tools)
+        .await
+        .unwrap_err();
+
+    assert_eq!(error.fail_reason(), "pr_create");
+    match error {
+        PrError::Base(message) => {
+            assert_eq!(message, "neither git nor gh named the default branch");
+        }
+        other => panic!("{other} is not a base error"),
+    }
+}
+
+#[tokio::test]
 async fn a_missing_binary_is_reported_rather_than_panicking() {
     let (dir, record) = checkout();
     let mut tools = tools(&record);

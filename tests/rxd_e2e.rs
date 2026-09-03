@@ -8,15 +8,23 @@ use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
 
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use ralphex_macos_runner::agent::{Agent, AgentOptions};
 use ralphex_macos_runner::config::Config;
-use ralphex_macos_runner::ipc::{self, Command, IpcError, MAX_MESSAGE_BYTES, Response, RunRequest};
+use ralphex_macos_runner::ipc::{
+    self, Command, DIRECTORY_MODE, IpcError, MAX_MESSAGE_BYTES, Response, RunRequest,
+};
 use ralphex_macos_runner::job::Worktree;
 use ralphex_macos_runner::pr::PrTools;
 use ralphex_macos_runner::protocol::client::FarmClient;
-use ralphex_macos_runner::protocol::types::{Branch, CreatePr, Job, RunId, RunnerName};
+use ralphex_macos_runner::protocol::types::{
+    Branch, CompleteRequest, CompleteStatus, CreatePr, Job, RunId, RunnerName,
+};
 use support::fake_farm::{FakeFarm, Reply};
-use support::{Record, TestSleeper, fake_gh, fake_git, fake_ralphex_with, fixed_ticker};
+use support::{
+    Record, TestSleeper, fake_gh, fake_git, fake_ralphex_with, fixed_ticker, invocations,
+};
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixStream;
@@ -226,6 +234,23 @@ async fn spawned(record: &Path) -> Record {
     .await;
     assert!(started.is_some(), "the fake ralphex never started");
     Record::read(record)
+}
+
+async fn completion(farm: &FakeFarm) -> CompleteRequest {
+    let recorded = wait_for(|| farm.requests_ending("/complete").first().cloned()).await;
+    let Some(recorded) = recorded else {
+        panic!("no completion arrived");
+    };
+    serde_json::from_slice(&recorded.body).unwrap()
+}
+
+fn alive(pid: i32) -> bool {
+    kill(Pid::from_raw(pid), None).is_ok()
+}
+
+async fn dead(pid: i32) -> bool {
+    let gone = wait_for(|| if alive(pid) { None } else { Some(()) }).await;
+    gone.is_some()
 }
 
 #[tokio::test]
@@ -518,6 +543,212 @@ async fn an_attach_without_a_run_says_so() {
 }
 
 #[tokio::test]
+async fn a_local_run_that_asks_for_one_opens_a_pull_request() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = FakeFarm::start().await;
+    let mut asked = job(&checkout, "local-7");
+    asked.create_pr = CreatePr::Yes;
+    farm.push_runs(Reply::Job(Box::new(asked)));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md"], &[]);
+    let output = client.wait_with_output().await.unwrap();
+
+    let printed = text(&output);
+    assert!(output.status.success(), "{printed}");
+    assert!(
+        printed.contains("https://github.com/owner/repo/pull/7"),
+        "{printed}"
+    );
+    let opened = farm.requests_ending("/runs");
+    assert!(opened[0].text().contains(r#""create_pr":true"#));
+    let runs = invocations(&checkout.tools);
+    assert!(runs[0].starts_with(&["pr", "list", "--head", "plan"]));
+    assert!(runs[1].starts_with(&["push", "-u", "origin", "plan"]));
+    assert!(runs[3].starts_with(&["pr", "create", "--head", "plan", "--base", "main"]));
+    assert!(runs[3].args.contains(&"plan".to_string()));
+    let CompleteRequest {
+        status,
+        pr_url,
+        fail_reason: _,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+    assert_eq!(status, CompleteStatus::Done);
+    assert_eq!(pr_url, "https://github.com/owner/repo/pull/7");
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_branch_the_client_names_reaches_the_farm() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(job(&checkout, "local-8"))));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(
+        &daemon.socket,
+        &checkout,
+        &["plan.md", "--no-pr", "--branch", "other"],
+        &[],
+    );
+    let output = client.wait_with_output().await.unwrap();
+
+    assert!(output.status.success(), "{}", text(&output));
+    let opened = farm.requests_ending("/runs");
+    assert!(opened[0].text().contains(r#""branch":"other""#));
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_local_run_the_farm_forgets_is_reported_to_the_client() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_SLEEP", "120")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(job(&checkout, "local-10"))));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let record = spawned(&checkout.record).await;
+    farm.always_heartbeat(Reply::Status(410, String::new()));
+    let output = client.wait_with_output().await.unwrap();
+
+    let printed = text(&output);
+    assert!(!output.status.success(), "{printed}");
+    assert!(
+        printed.contains("the farm no longer knows this run"),
+        "{printed}"
+    );
+    assert!(dead(record.pid).await, "the run outlived its lease");
+    assert!(
+        farm.requests_ending("/complete").is_empty(),
+        "a forgotten run was completed"
+    );
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn an_interrupted_client_detaches_and_leaves_the_run_going() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1"), ("FAKE_RALPHEX_SLEEP", "120")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(job(&checkout, "local-11"))));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let mut client = rxd(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let mut printed = lines_of(&mut client);
+    let started = printed.next_line().await.unwrap().unwrap();
+    assert_eq!(started, "run local-11");
+    let record = spawned(&checkout.record).await;
+    let Some(client_pid) = client.id() else {
+        panic!("the client reported no process id");
+    };
+    let client_pid = Pid::from_raw(i32::try_from(client_pid).unwrap());
+    kill(client_pid, Signal::SIGINT).unwrap();
+
+    let left = tokio::time::timeout(Duration::from_secs(10), client.wait()).await;
+    let Ok(status) = left else {
+        panic!("the client never left");
+    };
+    let status = status.unwrap();
+
+    assert!(status.success(), "{status}");
+    let mut rest = String::new();
+    while let Ok(Some(line)) = printed.next_line().await {
+        rest.push_str(&line);
+        rest.push('\n');
+    }
+    assert!(rest.contains("detached; the run continues"), "{rest}");
+    assert!(alive(record.pid), "the run died with its client");
+    let mut attached = rxd(&daemon.socket, &checkout, &["attach"], &[]);
+    let mut followed = lines_of(&mut attached);
+    let reattached = followed.next_line().await.unwrap().unwrap();
+    assert_eq!(reattached, "run local-11");
+    attached.start_kill().unwrap();
+    daemon.raise.send_replace(true);
+}
+
+#[tokio::test]
+async fn a_client_without_a_plan_says_what_it_needs() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let missing = rxd(&daemon.socket, &checkout, &[], &[]);
+    let missing = missing.wait_with_output().await.unwrap();
+    let absent = rxd(&daemon.socket, &checkout, &["absent.md"], &[]);
+    let absent = absent.wait_with_output().await.unwrap();
+
+    let printed = text(&missing);
+    assert!(!missing.status.success(), "{printed}");
+    assert!(printed.contains("a plan path is required"), "{printed}");
+    let printed = text(&absent);
+    assert!(!absent.status.success(), "{printed}");
+    assert!(printed.contains("absent.md"), "{printed}");
+    assert!(farm.requests_ending("/runs").is_empty());
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_socket_directory_the_daemon_creates_is_its_own() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    let client = Arc::new(
+        FarmClient::new(farm.url(), "secret-token", Arc::new(TestSleeper::new())).unwrap(),
+    );
+    let agent = Arc::new(Agent::new(
+        config(&farm, &ralphex),
+        client,
+        options(&checkout.tools),
+    ));
+    let (raise, shutdown) = watch::channel(false);
+    let state = checkout.dir.path().join("state");
+    let socket = state.join("daemon.sock");
+    tokio::spawn(ipc::serve(socket.clone(), agent, shutdown));
+
+    let bound = wait_for(|| match socket.exists() {
+        true => Some(()),
+        false => None,
+    })
+    .await;
+
+    assert!(bound.is_some(), "the socket was never bound");
+    let mode = std::fs::metadata(&state).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, DIRECTORY_MODE);
+    drop(raise);
+}
+
+#[tokio::test]
+async fn a_socket_that_cannot_be_bound_is_an_error_the_daemon_can_report() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    let client = Arc::new(
+        FarmClient::new(farm.url(), "secret-token", Arc::new(TestSleeper::new())).unwrap(),
+    );
+    let agent = Arc::new(Agent::new(
+        config(&farm, &ralphex),
+        client,
+        options(&checkout.tools),
+    ));
+    let (raise, shutdown) = watch::channel(false);
+    let blocked = checkout.dir.path().join("not-a-directory");
+    std::fs::write(&blocked, "a file sits where the directory should be").unwrap();
+
+    let served = ipc::serve(blocked.join("daemon.sock"), agent, shutdown).await;
+
+    let Err(IpcError::Io(message)) = served else {
+        panic!("a socket that cannot be bound is an io failure");
+    };
+    assert!(!message.is_empty());
+    drop(raise);
+}
+
+#[tokio::test]
 async fn two_attached_clients_replay_the_history_and_follow_the_run() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "2"), ("FAKE_RALPHEX_SLEEP", "1")]);
@@ -527,7 +758,7 @@ async fn two_attached_clients_replay_the_history_and_follow_the_run() {
     let daemon = daemon(&farm, &checkout, &ralphex, Claiming::Yes).await;
     let history = wait_for(|| {
         let current = daemon.agent.current()?;
-        let (replay, _live) = current.subscribe();
+        let (replay, _live) = current.log().subscribe();
         match replay.len() >= 4 {
             true => Some(replay),
             false => None,

@@ -6,7 +6,7 @@
 //! command to the agent's run slot and streams the run's output back as
 //! [`Response::Line`] messages until the run ends.
 
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch};
 
-use crate::agent::{Agent, CurrentRun, LocalStart};
+use crate::agent::{Agent, CurrentRun, LocalStart, raised};
 use crate::job::Worktree;
 use crate::protocol::types::{Branch, CompleteRequest, CompleteStatus, CreatePr, RunId};
 
@@ -25,6 +25,13 @@ pub const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
 
 /// The permissions the daemon's socket carries.
 pub const SOCKET_MODE: u32 = 0o600;
+
+/// The permissions a directory the daemon creates for its socket carries.
+///
+/// An existing directory keeps the permissions it has: the socket path can be
+/// given on the command line, and a shared directory is not the daemon's to
+/// close down.
+pub const DIRECTORY_MODE: u32 = 0o700;
 
 /// What `rxd` asks the daemon to run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -227,13 +234,22 @@ pub async fn serve(
     agent: Arc<Agent>,
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), IpcError> {
-    let listener = bind(&path)?;
+    let listener = match bind(&path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(
+                "the client socket {} could not be bound: {error}; rxd cannot reach this daemon",
+                path.display()
+            );
+            return Err(error);
+        }
+    };
     tracing::info!("the client socket is {}", path.display());
     let mut shutdown = shutdown;
     loop {
         let accepted = tokio::select! {
             accepted = listener.accept() => accepted,
-            () = raised(&mut shutdown) => break,
+            _raised = raised(&mut shutdown) => break,
         };
         let Ok((stream, _address)) = accepted else {
             continue;
@@ -247,7 +263,10 @@ pub async fn serve(
 
 fn bind(path: &Path) -> Result<UnixListener, IpcError> {
     if let Some(parent) = path.parent()
-        && let Err(error) = std::fs::create_dir_all(parent)
+        && let Err(error) = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(DIRECTORY_MODE)
+            .create(parent)
     {
         return Err(IpcError::Io(error.to_string()));
     }
@@ -261,17 +280,6 @@ fn bind(path: &Path) -> Result<UnixListener, IpcError> {
         return Err(IpcError::Io(error.to_string()));
     }
     Ok(listener)
-}
-
-async fn raised(shutdown: &mut watch::Receiver<bool>) {
-    loop {
-        if *shutdown.borrow() {
-            return;
-        }
-        let Ok(()) = shutdown.changed().await else {
-            return;
-        };
-    }
 }
 
 async fn handle(stream: UnixStream, agent: Arc<Agent>, shutdown: watch::Receiver<bool>) {
@@ -321,7 +329,7 @@ async fn follow(stream: &mut UnixStream, current: &CurrentRun) -> Result<(), Ipc
         },
     )
     .await?;
-    let (replay, mut lines) = current.subscribe();
+    let (replay, mut lines) = current.log().subscribe();
     for text in replay {
         send(stream, &Response::Line { text }).await?;
     }

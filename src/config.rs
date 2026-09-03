@@ -370,4 +370,17 @@ drain_timeout = "soon"
         } = Config::load(&path).unwrap();
         assert_eq!(farm_url, "http://farm.example:7077");
     }
+
+    #[test]
+    fn a_file_others_can_read_is_warned_about_and_used_anyway() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, MINIMAL).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let loaded = Config::load(&path);
+
+        assert!(permissions_warning(0o644).is_some());
+        assert!(loaded.is_ok(), "{loaded:?}");
+    }
 }

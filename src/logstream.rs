@@ -226,7 +226,9 @@ impl LogStream {
 
     /// Flushes what is buffered and stops the flusher task.
     ///
-    /// The final flush has [`LOG_CLOSE_TIMEOUT`] as its total budget.
+    /// [`LOG_CLOSE_TIMEOUT`] is the total budget, whether the flusher was idle
+    /// or already sending when the close was asked for; a flusher that outlasts
+    /// it is dropped with its buffer.
     ///
     /// # Panics
     ///
@@ -237,10 +239,14 @@ impl LogStream {
             let mut flusher = self.flusher.lock().unwrap();
             flusher.take()
         };
-        let Some(flusher) = flusher else {
+        let Some(mut flusher) = flusher else {
             return;
         };
-        let _ = flusher.await;
+        let stopped = tokio::time::timeout(LOG_CLOSE_TIMEOUT, &mut flusher).await;
+        match stopped {
+            Ok(_joined) => {}
+            Err(_elapsed) => flusher.abort(),
+        }
     }
 }
 
@@ -263,8 +269,7 @@ async fn flush_loop(
                 seq = flush(&client, &run_id, &buffers, &gone, seq).await;
             }
             Phase::Closing => {
-                let remainder = flush(&client, &run_id, &buffers, &gone, seq);
-                let _ = tokio::time::timeout(LOG_CLOSE_TIMEOUT, remainder).await;
+                let _remainder = flush(&client, &run_id, &buffers, &gone, seq).await;
                 return;
             }
         }
