@@ -20,6 +20,16 @@ pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// The ralphex binary a configuration without `ralphex_bin` runs.
 pub const DEFAULT_RALPHEX_BIN: &str = "ralphex";
 
+/// A configuration and what was worth saying about the file it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Loaded {
+    /// The configuration itself.
+    pub config: Config,
+    /// What the file deserves to be warned about, such as permissions that
+    /// leak the runner token.
+    pub warnings: Vec<String>,
+}
+
 /// Everything the daemon reads out of `config.toml`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -70,7 +80,9 @@ struct FileConfig {
 impl Config {
     /// Reads and parses the configuration at `path`.
     ///
-    /// A file other users can read is logged as a warning and used anyway.
+    /// A file other users can read is returned as a warning and used anyway.
+    /// The warnings come back as data rather than through `tracing`, because
+    /// `rxd` installs no subscriber and would otherwise swallow them.
     ///
     /// # Errors
     ///
@@ -78,7 +90,7 @@ impl Config {
     /// [`ConfigError::Parse`] when it is not the expected TOML,
     /// [`ConfigError::Missing`] when a required setting is absent and
     /// [`ConfigError::Duration`] when `drain_timeout` names no duration.
-    pub fn load(path: &Path) -> Result<Config, ConfigError> {
+    pub fn load(path: &Path) -> Result<Loaded, ConfigError> {
         let contents = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
             Err(error) => {
@@ -88,12 +100,14 @@ impl Config {
                 });
             }
         };
+        let mut warnings = Vec::new();
         if let Ok(metadata) = std::fs::metadata(path)
             && let Some(warning) = permissions_warning(metadata.permissions().mode())
         {
-            tracing::warn!("{}: {warning}", path.display());
+            warnings.push(format!("{}: {warning}", path.display()));
         }
-        Config::parse(&contents)
+        let config = Config::parse(&contents)?;
+        Ok(Loaded { config, warnings })
     }
 
     /// Parses the configuration in `contents`.
@@ -357,30 +371,28 @@ drain_timeout = "soon"
     }
 
     #[test]
-    fn a_file_on_disk_is_loaded() {
+    fn a_file_on_disk_is_loaded_without_a_warning() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, MINIMAL).unwrap();
-        let Config {
-            farm_url,
-            token: _,
-            name: _,
-            drain_timeout: _,
-            ralphex_bin: _,
-        } = Config::load(&path).unwrap();
-        assert_eq!(farm_url, "http://farm.example:7077");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let Loaded { config, warnings } = Config::load(&path).unwrap();
+        assert_eq!(config.farm_url, "http://farm.example:7077");
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     #[test]
-    fn a_file_others_can_read_is_warned_about_and_used_anyway() {
+    fn a_file_others_can_read_comes_back_with_a_warning_and_is_used_anyway() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, MINIMAL).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
 
-        let loaded = Config::load(&path);
+        let Loaded { config, warnings } = Config::load(&path).unwrap();
 
-        assert!(permissions_warning(0o644).is_some());
-        assert!(loaded.is_ok(), "{loaded:?}");
+        assert_eq!(config.name, RunnerName("mbp-native".to_string()));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("readable by others"), "{warnings:?}");
+        assert!(warnings[0].contains("config.toml"), "{warnings:?}");
     }
 }

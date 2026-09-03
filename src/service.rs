@@ -16,7 +16,7 @@ use nix::unistd::Uid;
 use tokio::net::UnixStream;
 use tokio::process::Command;
 
-use crate::config::{Config, DEFAULT_DRAIN_TIMEOUT};
+use crate::config::{Config, Loaded};
 use crate::ipc;
 use crate::paths::{self, APP_NAME, PathError};
 use crate::protocol::types::{
@@ -70,6 +70,14 @@ pub enum ServiceError {
     /// The daemon that is running would lose a run.
     #[error("{0}")]
     Busy(String),
+    /// The daemon's configuration could not be read.
+    #[error("{path} could not be used: {message}; the agent's exit timeout is written from it")]
+    Config {
+        /// The path the configuration was looked for at.
+        path: String,
+        /// The reason it could not be used.
+        message: String,
+    },
 }
 
 /// Whether `rxd install` replaces a daemon that is busy.
@@ -321,9 +329,12 @@ pub fn generate_plist(
 /// # Errors
 ///
 /// Returns [`ServiceError::Busy`] when a run is in flight and `force` is
-/// [`Force::No`], [`ServiceError::Exe`] when the running binary cannot be
-/// located, [`ServiceError::DaemonMissing`] when the daemon does not sit next
-/// to it, [`ServiceError::Path`] when a location cannot be resolved,
+/// [`Force::No`], [`ServiceError::Config`] when `config.toml` is missing or
+/// unusable - the exit timeout is written from it, and guessing would leave
+/// launchd killing the daemon mid-drain - [`ServiceError::Exe`] when the
+/// running binary cannot be located, [`ServiceError::DaemonMissing`] when the
+/// daemon does not sit next to it, [`ServiceError::Path`] when a location
+/// cannot be resolved,
 /// [`ServiceError::Write`] when a directory or a file cannot be written and
 /// [`ServiceError::Launchctl`] when the old agent outlasts its exit timeout or
 /// launchd refuses the new one.
@@ -348,9 +359,13 @@ pub async fn install(force: Force) -> Result<Installed, ServiceError> {
 
     place_daemon(&source, &daemon_path)?;
 
+    let (drain_timeout, warnings) = configured_drain_timeout()?;
+    for warning in warnings {
+        eprintln!("rxd: {warning}");
+    }
     let path_env = std::env::var("PATH").unwrap_or_default();
     let label = paths::launchd_label();
-    let exit_timeout = exit_timeout(configured_drain_timeout());
+    let exit_timeout = exit_timeout(drain_timeout);
     let plist = generate_plist(&label, &daemon_path, &path_env, &log_dir, exit_timeout);
     if let Err(error) = std::fs::write(&plist_path, plist) {
         return Err(ServiceError::Write {
@@ -492,14 +507,102 @@ async fn listed(uid: u32, label: &str) -> bool {
     status.success()
 }
 
-fn configured_drain_timeout() -> Duration {
-    let Ok(path) = paths::config_path() else {
-        return DEFAULT_DRAIN_TIMEOUT;
+fn configured_drain_timeout() -> Result<(Duration, Vec<String>), ServiceError> {
+    let path = paths::config_path()?;
+    let loaded = match Config::load(&path) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            return Err(ServiceError::Config {
+                path: path.display().to_string(),
+                message: error.to_string(),
+            });
+        }
     };
-    let Ok(config) = Config::load(&path) else {
-        return DEFAULT_DRAIN_TIMEOUT;
+    let Loaded { config, warnings } = loaded;
+    Ok((config.drain_timeout, warnings))
+}
+
+/// Returns the `ExitTimeOut` the property list in `plist` carries.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// use std::time::Duration;
+///
+/// use ralphex_macos_runner::service;
+///
+/// let plist = service::generate_plist(
+///     "dev.pkarpovich.ralphex-macos-runner",
+///     Path::new("/bin/daemon"),
+///     "/usr/bin",
+///     Path::new("/logs"),
+///     Duration::from_secs(310),
+/// );
+/// assert_eq!(
+///     service::installed_exit_timeout(&plist),
+///     Some(Duration::from_secs(310))
+/// );
+/// assert_eq!(service::installed_exit_timeout("not a plist"), None);
+/// ```
+#[must_use]
+pub fn installed_exit_timeout(plist: &str) -> Option<Duration> {
+    let (_before, after) = plist.split_once("<key>ExitTimeOut</key>")?;
+    let (_before, after) = after.split_once("<integer>")?;
+    let (seconds, _after) = after.split_once("</integer>")?;
+    let Ok(seconds) = seconds.trim().parse::<u64>() else {
+        return None;
     };
-    config.drain_timeout
+    Some(Duration::from_secs(seconds))
+}
+
+/// Returns the warning a property list too impatient for `drain_timeout` earns.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+/// use std::time::Duration;
+///
+/// use ralphex_macos_runner::service;
+///
+/// let plist = service::generate_plist(
+///     "dev.pkarpovich.ralphex-macos-runner",
+///     Path::new("/bin/daemon"),
+///     "/usr/bin",
+///     Path::new("/logs"),
+///     Duration::from_secs(60),
+/// );
+/// let warning = service::exit_timeout_drift(&plist, Duration::from_secs(120)).unwrap();
+/// assert!(warning.contains("rxd install"));
+/// ```
+#[must_use]
+pub fn exit_timeout_drift(plist: &str, drain_timeout: Duration) -> Option<String> {
+    let installed = installed_exit_timeout(plist)?;
+    let wanted = exit_timeout(drain_timeout);
+    if installed >= wanted {
+        return None;
+    }
+    Some(format!(
+        "the installed agent gives the shutdown {} s, which is less than the {} s this configuration now needs; run rxd install",
+        installed.as_secs(),
+        wanted.as_secs()
+    ))
+}
+
+/// Returns the warning the property list on disk earns for `drain_timeout`.
+///
+/// A missing or unreadable property list is no warning: the daemon may well be
+/// running outside launchd.
+#[must_use]
+pub fn installed_drift(drain_timeout: Duration) -> Option<String> {
+    let Ok(path) = paths::launch_agent_path() else {
+        return None;
+    };
+    let Ok(plist) = std::fs::read_to_string(&path) else {
+        return None;
+    };
+    exit_timeout_drift(&plist, drain_timeout)
 }
 
 /// Copies the daemon binary from `source` to `daemon_path`.
@@ -624,6 +727,8 @@ fn escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::config::DEFAULT_DRAIN_TIMEOUT;
+
     use super::*;
 
     fn plist() -> String {
@@ -943,6 +1048,64 @@ mod tests {
             };
             let _sent = ipc::send(&mut stream, &response).await;
         });
+    }
+
+    #[test]
+    fn an_agent_written_for_a_shorter_drain_asks_to_be_reinstalled() {
+        let plist = generate_plist(
+            &paths::launchd_label(),
+            Path::new("/bin/daemon"),
+            "/usr/bin",
+            Path::new("/logs"),
+            exit_timeout(Duration::from_secs(60)),
+        );
+
+        let Some(warning) = exit_timeout_drift(&plist, Duration::from_secs(600)) else {
+            panic!("an agent too impatient for the configuration earns a warning");
+        };
+        assert!(
+            warning.contains(&exit_timeout(Duration::from_secs(60)).as_secs().to_string()),
+            "{warning}"
+        );
+        assert!(
+            warning.contains(&exit_timeout(Duration::from_secs(600)).as_secs().to_string()),
+            "{warning}"
+        );
+        assert!(warning.contains("rxd install"), "{warning}");
+    }
+
+    #[test]
+    fn an_agent_that_waits_long_enough_earns_no_warning() {
+        let plist = generate_plist(
+            &paths::launchd_label(),
+            Path::new("/bin/daemon"),
+            "/usr/bin",
+            Path::new("/logs"),
+            exit_timeout(DEFAULT_DRAIN_TIMEOUT),
+        );
+        assert_eq!(exit_timeout_drift(&plist, DEFAULT_DRAIN_TIMEOUT), None);
+        assert_eq!(exit_timeout_drift(&plist, Duration::from_secs(1)), None);
+        assert_eq!(exit_timeout_drift("", DEFAULT_DRAIN_TIMEOUT), None);
+    }
+
+    #[test]
+    fn an_exit_timeout_is_read_back_out_of_the_plist_that_carries_it() {
+        let plist = generate_plist(
+            &paths::launchd_label(),
+            Path::new("/bin/daemon"),
+            "/usr/bin",
+            Path::new("/logs"),
+            Duration::from_secs(1520),
+        );
+        assert_eq!(
+            installed_exit_timeout(&plist),
+            Some(Duration::from_secs(1520))
+        );
+        assert_eq!(installed_exit_timeout("<key>ExitTimeOut</key>"), None);
+        assert_eq!(
+            installed_exit_timeout("<key>ExitTimeOut</key><integer>x</integer>"),
+            None
+        );
     }
 
     #[test]

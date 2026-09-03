@@ -11,10 +11,11 @@ use std::sync::Arc;
 
 use clap::Parser;
 use ralphex_macos_runner::agent::{Agent, AgentExit, AgentOptions, Shutdown, hasten};
-use ralphex_macos_runner::config::Config;
+use ralphex_macos_runner::config::{Config, Loaded};
 use ralphex_macos_runner::ipc;
 use ralphex_macos_runner::paths;
 use ralphex_macos_runner::protocol::client::{FarmClient, TokioSleeper};
+use ralphex_macos_runner::service;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tracing_subscriber::EnvFilter;
@@ -56,13 +57,20 @@ async fn main() -> ExitCode {
             }
         },
     };
-    let config = match Config::load(&config) {
-        Ok(config) => config,
+    let loaded = match Config::load(&config) {
+        Ok(loaded) => loaded,
         Err(error) => {
             tracing::error!("{error}");
             return ExitCode::FAILURE;
         }
     };
+    let Loaded { config, warnings } = loaded;
+    for warning in warnings {
+        tracing::warn!("{warning}");
+    }
+    if let Some(drift) = service::installed_drift(config.drain_timeout) {
+        tracing::warn!("{drift}");
+    }
 
     let client = FarmClient::new(&config.farm_url, &config.token, Arc::new(TokioSleeper));
     let client = match client {
