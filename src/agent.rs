@@ -2,27 +2,30 @@
 //!
 //! [`Agent::run`] long-polls the farm from the only slot this runner has, hands
 //! a claimed job to [`Agent::run_job`] and starts polling again when the run is
-//! finalized. A run's terminal conditions - a cancel, a lease the farm forgot, a
-//! protocol mismatch, a shutdown that outlasted its drain - all arrive on one
+//! finalized. [`Agent::start_local`] takes the same slot for an `rxd`
+//! invocation, waiting through a poll that is already in flight rather than
+//! aborting it. A run's terminal conditions - a cancel, a lease the farm forgot,
+//! a protocol mismatch, a shutdown that outlasted its drain - all arrive on one
 //! channel, so every one of them is handled in a single place, next to the
 //! process exit it competes with.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, broadcast, mpsc, watch};
 
 use crate::config::Config;
+use crate::ipc::RunRequest;
 use crate::job::{self, JobError, JobSpec, LocalOptions, Review};
 use crate::logstream::{IntervalTicker, LogStream, Ticker};
 use crate::pr::{PrSpec, PrTools, PrUrl, RunOrigin, open_pull_request};
 use crate::protocol::client::{FarmClient, FarmError};
 use crate::protocol::types::{
     ClaimRequest, CompleteRequest, CompleteStatus, CreatePr, HEARTBEAT_INTERVAL, HeartbeatAction,
-    HeartbeatRequest, HeartbeatResponse, Job, RETRY_BASE_DELAY, RUNTIME, RunId, RunnerName,
-    STOP_GRACE,
+    HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest, RETRY_BASE_DELAY, RUNTIME, RunId,
+    RunnerName, STOP_GRACE,
 };
 
 const TERMINAL_CAPACITY: usize = 8;
@@ -34,8 +37,90 @@ pub enum RunSlot {
     Free,
     /// A claim long-poll holds the slot until it returns.
     Polling,
+    /// A local request holds the slot while the farm mints its run.
+    Opening,
     /// A run holds the slot.
     Running(RunId),
+}
+
+/// How far the run in the slot has got.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunState {
+    /// The run is in flight.
+    Running,
+    /// The run finished, with the completion it reported when it reported one.
+    Finished(Option<CompleteRequest>),
+}
+
+/// The run an attached client follows.
+pub struct CurrentRun {
+    run_id: RunId,
+    dashboard_url: String,
+    log: Arc<LogStream>,
+    state: watch::Sender<RunState>,
+}
+
+impl CurrentRun {
+    /// Returns the identifier the farm gave this run.
+    #[must_use]
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    /// Returns the dashboard page of this run.
+    #[must_use]
+    pub fn dashboard_url(&self) -> &str {
+        &self.dashboard_url
+    }
+
+    /// Returns the log stream this run writes to.
+    #[must_use]
+    pub fn log(&self) -> Arc<LogStream> {
+        Arc::clone(&self.log)
+    }
+
+    /// Returns the replay history and a receiver of the lines that follow it.
+    #[must_use]
+    pub fn subscribe(&self) -> (Vec<String>, broadcast::Receiver<String>) {
+        self.log.subscribe()
+    }
+
+    /// Waits for the run to finish and returns the completion it reported.
+    ///
+    /// A run the farm has forgotten is finished without a completion and
+    /// resolves to [`None`].
+    pub async fn ended(&self) -> Option<CompleteRequest> {
+        let mut state = self.state.subscribe();
+        let finished = state
+            .wait_for(|state| match state {
+                RunState::Running => false,
+                RunState::Finished(_) => true,
+            })
+            .await;
+        let Ok(finished) = finished else {
+            return None;
+        };
+        match finished.clone() {
+            RunState::Running => None,
+            RunState::Finished(completion) => completion,
+        }
+    }
+}
+
+/// What a local request got when it asked for the run slot.
+pub enum LocalStart {
+    /// The run is in flight and can be followed.
+    Started(Arc<CurrentRun>),
+    /// Another run holds the slot.
+    Busy {
+        /// The identifier of the run that holds the slot.
+        run_id: RunId,
+    },
+    /// The farm refused to open the run.
+    Refused {
+        /// What the farm answered.
+        message: String,
+    },
 }
 
 /// How the agent's loop ended.
@@ -108,58 +193,82 @@ pub struct Agent {
     config: Config,
     client: Arc<FarmClient>,
     options: AgentOptions,
-    slot: Mutex<RunSlot>,
+    slot: watch::Sender<RunSlot>,
+    permits: Arc<Semaphore>,
+    current: Mutex<Option<Arc<CurrentRun>>>,
 }
 
 impl Agent {
     /// Returns an agent that claims for `config` through `client`.
     #[must_use]
     pub fn new(config: Config, client: Arc<FarmClient>, options: AgentOptions) -> Self {
+        let (slot, _) = watch::channel(RunSlot::Free);
         Agent {
             config,
             client,
             options,
-            slot: Mutex::new(RunSlot::Free),
+            slot,
+            permits: Arc::new(Semaphore::new(1)),
+            current: Mutex::new(None),
         }
     }
 
     /// Returns what the run slot currently holds.
+    #[must_use]
+    pub fn slot(&self) -> RunSlot {
+        let slot = self.slot.borrow();
+        slot.clone()
+    }
+
+    /// Returns the run an attaching client would follow.
     ///
     /// # Panics
     ///
-    /// Panics when another holder of the slot lock panicked.
+    /// Panics when another holder of the run lock panicked.
     #[must_use]
-    pub fn slot(&self) -> RunSlot {
-        let slot = self.slot.lock().unwrap();
-        slot.clone()
+    pub fn current(&self) -> Option<Arc<CurrentRun>> {
+        let current = self.current.lock().unwrap();
+        current.clone()
     }
 
     /// Claims and runs jobs until `shutdown` is raised or the protocol drifts.
     ///
     /// An in-flight claim is never aborted: a job the farm dispatched in the
     /// instant before an abort would be lost on the wire and finalized as a lost
-    /// run three minutes later.
-    ///
-    /// # Panics
-    ///
-    /// Panics when another holder of the slot lock panicked.
+    /// run three minutes later. A claim that comes back empty hands the slot to
+    /// a local request that is already waiting for it, because the queue behind
+    /// the slot serves its waiters in order.
     pub async fn run(&self, shutdown: watch::Receiver<bool>) -> AgentExit {
         let request = ClaimRequest::native(self.config.name.clone());
+        let mut shutdown = shutdown;
         loop {
             if *shutdown.borrow() {
                 self.hold(RunSlot::Free);
                 return AgentExit::Shutdown;
             }
+            let permit = tokio::select! {
+                permit = Arc::clone(&self.permits).acquire_owned() => permit,
+                _raised = raised(&mut shutdown) => {
+                    self.hold(RunSlot::Free);
+                    return AgentExit::Shutdown;
+                }
+            };
+            let Ok(permit) = permit else {
+                self.hold(RunSlot::Free);
+                return AgentExit::Shutdown;
+            };
             self.hold(RunSlot::Polling);
             let claimed = self.client.claim(&request).await;
             let job = match claimed {
                 Ok(Some(job)) => job,
                 Ok(None) => {
                     self.hold(RunSlot::Free);
+                    drop(permit);
                     continue;
                 }
                 Err(error) => {
                     self.hold(RunSlot::Free);
+                    drop(permit);
                     let Some(message) = version_mismatch(&error) else {
                         tracing::warn!("the claim failed: {error}");
                         tokio::time::sleep(self.options.claim_retry_delay).await;
@@ -173,6 +282,7 @@ impl Agent {
                 .run_job(job, LocalOptions::default(), shutdown.clone())
                 .await;
             self.hold(RunSlot::Free);
+            drop(permit);
             match outcome {
                 RunOutcome::Continue => {}
                 RunOutcome::VersionMismatch { message } => {
@@ -180,6 +290,72 @@ impl Agent {
                 }
             }
         }
+    }
+
+    /// Opens a ticketless run for `request` and starts it in the run slot.
+    ///
+    /// A request that arrives while a claim is in flight waits for that claim to
+    /// return; a request that arrives while a run holds the slot is answered
+    /// [`LocalStart::Busy`] at once. The run outlives the client that asked for
+    /// it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called outside a tokio runtime.
+    pub async fn start_local(
+        self: &Arc<Self>,
+        request: RunRequest,
+        shutdown: watch::Receiver<bool>,
+    ) -> LocalStart {
+        let permit = match self.hold_slot().await {
+            Ok(permit) => permit,
+            Err(run_id) => return LocalStart::Busy { run_id },
+        };
+        self.hold(RunSlot::Opening);
+        let RunRequest {
+            ctx,
+            plan,
+            branch,
+            create_pr,
+            worktree,
+            env,
+        } = request;
+        let opened = OpenRunRequest {
+            runner: self.config.name.clone(),
+            runtime: RUNTIME.to_string(),
+            repo: repo_name(Path::new(&ctx)),
+            ctx,
+            plan,
+            branch,
+            create_pr,
+        };
+        let job = match self.client.open_run(&opened).await {
+            Ok(job) => job,
+            Err(error) => {
+                self.hold(RunSlot::Free);
+                drop(permit);
+                return LocalStart::Refused {
+                    message: error.to_string(),
+                };
+            }
+        };
+        self.hold(RunSlot::Running(job.run_id.clone()));
+        let current = self.enter(&job.run_id);
+        let started = Arc::clone(&current);
+        let agent = Arc::clone(self);
+        let local = LocalOptions { worktree, env };
+        tokio::spawn(async move {
+            let outcome = agent.serve_run(job, local, shutdown, &started).await;
+            agent.hold(RunSlot::Free);
+            drop(permit);
+            match outcome {
+                RunOutcome::Continue => {}
+                RunOutcome::VersionMismatch { message } => {
+                    tracing::error!("the farm speaks another protocol version: {message}");
+                }
+            }
+        });
+        LocalStart::Started(current)
     }
 
     /// Runs `job` to its completion and reports it to the farm.
@@ -196,6 +372,33 @@ impl Agent {
         local: LocalOptions,
         shutdown: watch::Receiver<bool>,
     ) -> RunOutcome {
+        let current = self.enter(&job.run_id);
+        self.serve_run(job, local, shutdown, &current).await
+    }
+
+    async fn serve_run(
+        &self,
+        job: Job,
+        local: LocalOptions,
+        shutdown: watch::Receiver<bool>,
+        current: &CurrentRun,
+    ) -> RunOutcome {
+        let run_id = job.run_id.clone();
+        let (completion, outcome) = self.execute(job, local, shutdown, current).await;
+        if let Some(completion) = completion.clone() {
+            self.report(&run_id, completion).await;
+        }
+        self.leave(current, completion);
+        outcome
+    }
+
+    async fn execute(
+        &self,
+        job: Job,
+        local: LocalOptions,
+        shutdown: watch::Receiver<bool>,
+        current: &CurrentRun,
+    ) -> (Option<CompleteRequest>, RunOutcome) {
         let Job {
             run_id,
             issue_id: _,
@@ -213,16 +416,14 @@ impl Agent {
         } = job;
 
         if runtime != RUNTIME {
-            self.report(
-                &run_id,
-                failed(
+            return (
+                Some(failed(
                     "runtime_mismatch",
                     format!("this runner serves {RUNTIME}, the job asks for {runtime}"),
                     String::new(),
-                ),
-            )
-            .await;
-            return RunOutcome::Continue;
+                )),
+                RunOutcome::Continue,
+            );
         }
 
         let spec = JobSpec {
@@ -234,19 +435,17 @@ impl Agent {
             ralphex_bin: self.config.ralphex_bin.clone(),
         };
         if let Err(error) = job::validate(&spec).await {
-            self.report(
-                &run_id,
-                failed(error.fail_reason(), error.to_string(), String::new()),
-            )
-            .await;
-            return RunOutcome::Continue;
+            return (
+                Some(failed(
+                    error.fail_reason(),
+                    error.to_string(),
+                    String::new(),
+                )),
+                RunOutcome::Continue,
+            );
         }
 
-        let log = Arc::new(LogStream::new(
-            Arc::clone(&self.client),
-            run_id.clone(),
-            Arc::clone(&self.options.ticker),
-        ));
+        let log = current.log();
         let (terminals, mut terminal) = mpsc::channel(TERMINAL_CAPACITY);
         let beats = tokio::spawn(beat(
             Arc::clone(&self.client),
@@ -267,12 +466,10 @@ impl Agent {
                 beats.abort();
                 drain.abort();
                 log.close().await;
-                self.report(
-                    &run_id,
-                    failed(error.fail_reason(), error.to_string(), log.tail()),
-                )
-                .await;
-                return RunOutcome::Continue;
+                return (
+                    Some(failed(error.fail_reason(), error.to_string(), log.tail())),
+                    RunOutcome::Continue,
+                );
             }
         };
         tracing::info!("run {run_id} started in {ctx}");
@@ -296,76 +493,102 @@ impl Agent {
         let tail = log.tail();
 
         match ended {
-            Ended::Exited(Err(error)) => {
-                self.report(
-                    &run_id,
-                    failed(error.fail_reason(), error.to_string(), tail),
-                )
-                .await;
-                RunOutcome::Continue
-            }
+            Ended::Exited(Err(error)) => (
+                Some(failed(error.fail_reason(), error.to_string(), tail)),
+                RunOutcome::Continue,
+            ),
             Ended::Exited(Ok(status)) => {
                 if !status.success() {
-                    self.report(&run_id, failed("nonzero_exit", exit_message(status), tail))
-                        .await;
-                    return RunOutcome::Continue;
+                    return (
+                        Some(failed("nonzero_exit", exit_message(status), tail)),
+                        RunOutcome::Continue,
+                    );
                 }
                 match create_pr {
-                    CreatePr::No => {
-                        self.report(&run_id, done(String::new())).await;
-                    }
+                    CreatePr::No => (Some(done(String::new())), RunOutcome::Continue),
                     CreatePr::Yes => {
                         let origin = origin(identifier, issue_url, title);
                         let spec = PrSpec::describe(branch, &origin, &plan_path, &run_id);
-                        match open_pull_request(&PathBuf::from(&ctx), &spec, &self.options.pr_tools)
-                            .await
-                        {
-                            Ok(PrUrl(url)) => self.report(&run_id, done(url)).await,
-                            Err(error) => {
-                                self.report(
-                                    &run_id,
-                                    failed(error.fail_reason(), error.to_string(), tail),
-                                )
+                        let opened =
+                            open_pull_request(&PathBuf::from(&ctx), &spec, &self.options.pr_tools)
                                 .await;
-                            }
+                        match opened {
+                            Ok(PrUrl(url)) => (Some(done(url)), RunOutcome::Continue),
+                            Err(error) => (
+                                Some(failed(error.fail_reason(), error.to_string(), tail)),
+                                RunOutcome::Continue,
+                            ),
                         }
                     }
                 }
-                RunOutcome::Continue
             }
-            Ended::Terminal(Terminal::Cancel) => {
-                self.report(
-                    &run_id,
-                    failed("canceled", "the run was canceled".to_string(), tail),
-                )
-                .await;
-                RunOutcome::Continue
-            }
-            Ended::Terminal(Terminal::Drain) => {
-                self.report(
-                    &run_id,
-                    failed(
-                        "runner_shutdown",
-                        "the runner shut down while the run was in flight".to_string(),
-                        tail,
-                    ),
-                )
-                .await;
-                RunOutcome::Continue
-            }
+            Ended::Terminal(Terminal::Cancel) => (
+                Some(failed("canceled", "the run was canceled".to_string(), tail)),
+                RunOutcome::Continue,
+            ),
+            Ended::Terminal(Terminal::Drain) => (
+                Some(failed(
+                    "runner_shutdown",
+                    "the runner shut down while the run was in flight".to_string(),
+                    tail,
+                )),
+                RunOutcome::Continue,
+            ),
             Ended::Terminal(Terminal::Gone) => {
                 tracing::warn!("run {run_id} is unknown to the farm and was stopped");
-                RunOutcome::Continue
+                (None, RunOutcome::Continue)
             }
             Ended::Terminal(Terminal::VersionMismatch { message }) => {
-                RunOutcome::VersionMismatch { message }
+                (None, RunOutcome::VersionMismatch { message })
             }
         }
     }
 
     fn hold(&self, state: RunSlot) {
-        let mut slot = self.slot.lock().unwrap();
-        *slot = state;
+        self.slot.send_replace(state);
+    }
+
+    async fn hold_slot(&self) -> Result<OwnedSemaphorePermit, RunId> {
+        if let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() {
+            return Ok(permit);
+        }
+        let mut slot = self.slot.subscribe();
+        if let RunSlot::Running(run_id) = self.slot() {
+            return Err(run_id);
+        }
+        tokio::select! {
+            permit = Arc::clone(&self.permits).acquire_owned() => match permit {
+                Ok(permit) => Ok(permit),
+                Err(_closed) => Err(RunId(String::new())),
+            },
+            run_id = running(&mut slot) => Err(run_id),
+        }
+    }
+
+    fn enter(&self, run_id: &RunId) -> Arc<CurrentRun> {
+        let log = Arc::new(LogStream::new(
+            Arc::clone(&self.client),
+            run_id.clone(),
+            Arc::clone(&self.options.ticker),
+        ));
+        let (state, _) = watch::channel(RunState::Running);
+        let current = Arc::new(CurrentRun {
+            run_id: run_id.clone(),
+            dashboard_url: dashboard_url(&self.config.farm_url, run_id),
+            log,
+            state,
+        });
+        let mut held = self.current.lock().unwrap();
+        *held = Some(Arc::clone(&current));
+        drop(held);
+        current
+    }
+
+    fn leave(&self, current: &CurrentRun, completion: Option<CompleteRequest>) {
+        current.state.send_replace(RunState::Finished(completion));
+        let mut held = self.current.lock().unwrap();
+        *held = None;
+        drop(held);
     }
 
     async fn report(&self, run_id: &RunId, request: CompleteRequest) {
@@ -373,6 +596,75 @@ impl Agent {
             Ok(()) => {}
             Err(error) => tracing::warn!("run {run_id} could not be completed: {error}"),
         }
+    }
+}
+
+/// Returns the dashboard page of the run `run_id` at the farm `farm_url`.
+///
+/// # Examples
+///
+/// ```
+/// use ralphex_macos_runner::agent::dashboard_url;
+/// use ralphex_macos_runner::protocol::types::RunId;
+///
+/// assert_eq!(
+///     dashboard_url("http://farm.example:7077/", &RunId("local-1".to_string())),
+///     "http://farm.example:7077/#/run/local-1"
+/// );
+/// ```
+#[must_use]
+pub fn dashboard_url(farm_url: &str, run_id: &RunId) -> String {
+    format!("{}/#/run/{run_id}", farm_url.trim_end_matches('/'))
+}
+
+/// Returns the repository name the dashboard shows for the checkout `ctx`.
+///
+/// # Examples
+///
+/// ```
+/// use std::path::Path;
+///
+/// use ralphex_macos_runner::agent::repo_name;
+///
+/// assert_eq!(repo_name(Path::new("/abs/Projects/ralphex-farm/")), "ralphex-farm");
+/// assert_eq!(repo_name(Path::new("/")), "/");
+/// ```
+#[must_use]
+pub fn repo_name(ctx: &Path) -> String {
+    let Some(name) = ctx.file_name() else {
+        return ctx.display().to_string();
+    };
+    name.to_string_lossy().into_owned()
+}
+
+async fn running(slot: &mut watch::Receiver<RunSlot>) -> RunId {
+    loop {
+        let held = slot.borrow_and_update().clone();
+        match held {
+            RunSlot::Running(run_id) => return run_id,
+            RunSlot::Free => {}
+            RunSlot::Polling => {}
+            RunSlot::Opening => {}
+        }
+        let Ok(()) = slot.changed().await else {
+            return RunId(String::new());
+        };
+    }
+}
+
+enum Raised {
+    Shutdown,
+    Detached,
+}
+
+async fn raised(shutdown: &mut watch::Receiver<bool>) -> Raised {
+    loop {
+        if *shutdown.borrow() {
+            return Raised::Shutdown;
+        }
+        let Ok(()) = shutdown.changed().await else {
+            return Raised::Detached;
+        };
     }
 }
 
@@ -473,13 +765,9 @@ async fn drain_after(
     terminals: mpsc::Sender<Terminal>,
 ) {
     let mut shutdown = shutdown;
-    loop {
-        if *shutdown.borrow() {
-            break;
-        }
-        let Ok(()) = shutdown.changed().await else {
-            return;
-        };
+    match raised(&mut shutdown).await {
+        Raised::Shutdown => {}
+        Raised::Detached => return,
     }
     tokio::time::sleep(timeout).await;
     let _ = terminals.send(Terminal::Drain).await;

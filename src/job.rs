@@ -52,7 +52,7 @@ impl Review {
 }
 
 /// Whether ralphex works in a git worktree of its own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Worktree {
     /// The run passes `--worktree`.
     Yes,

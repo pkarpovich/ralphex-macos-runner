@@ -2,12 +2,23 @@
 //!
 //! `rxd <plan>` opens a ticketless run on the farm and streams its output;
 //! `rxd attach` reconnects to a run in progress; `rxd install` and
-//! `rxd uninstall` register and remove the daemon's launchd agent.
+//! `rxd uninstall` register and remove the daemon's launchd agent. Ctrl-C only
+//! detaches the terminal: the run keeps going in the daemon.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
+use ralphex_macos_runner::ipc::{self, IpcError, Response, RunRequest};
+use ralphex_macos_runner::job::Worktree;
+use ralphex_macos_runner::paths;
+use ralphex_macos_runner::protocol::types::{Branch, CLAIM_WINDOW, CompleteStatus, CreatePr};
+use tokio::net::UnixStream;
+
+const FORWARDED: &str = "CLAUDE_CONFIG_DIR";
+
+const WAIT_NOTICE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -19,6 +30,11 @@ use clap::{Args, Parser, Subcommand};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// Path of the daemon's Unix socket.
+    #[arg(long, value_name = "path", global = true)]
+    socket: Option<PathBuf>,
+
     #[command(flatten)]
     run: RunArgs,
 }
@@ -52,14 +68,16 @@ struct RunArgs {
     worktree: bool,
 }
 
-fn main() -> ExitCode {
-    let Cli { command, run } = Cli::parse();
+#[tokio::main]
+async fn main() -> ExitCode {
+    let Cli {
+        command,
+        socket,
+        run,
+    } = Cli::parse();
 
     match command {
-        Some(Command::Attach) => {
-            println!("rxd would attach to the run in progress");
-            ExitCode::SUCCESS
-        }
+        Some(Command::Attach) => attach(socket).await,
         Some(Command::Install) => {
             println!("rxd would install the launchd agent");
             ExitCode::SUCCESS
@@ -68,36 +86,247 @@ fn main() -> ExitCode {
             println!("rxd would remove the launchd agent");
             ExitCode::SUCCESS
         }
-        None => start_run(run),
+        None => start_run(socket, run).await,
     }
 }
 
-fn start_run(run: RunArgs) -> ExitCode {
+async fn start_run(socket: Option<PathBuf>, run: RunArgs) -> ExitCode {
+    let request = match describe(run) {
+        Ok(request) => request,
+        Err(message) => {
+            eprintln!("rxd: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut stream = match connect(socket).await {
+        Ok(stream) => stream,
+        Err(message) => {
+            eprintln!("rxd: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let sent = ipc::send(&mut stream, &ipc::Command::Run(request)).await;
+    if let Err(error) = sent {
+        eprintln!("rxd: {error}");
+        return ExitCode::FAILURE;
+    }
+
+    let first = {
+        let receiving = ipc::receive::<Response, _>(&mut stream);
+        tokio::pin!(receiving);
+        tokio::select! {
+            received = &mut receiving => received,
+            () = tokio::time::sleep(WAIT_NOTICE) => {
+                println!("waiting for the daemon (up to {} s)", CLAIM_WINDOW.as_secs());
+                receiving.await
+            }
+        }
+    };
+    match answer(first) {
+        Answer::Streaming => follow(&mut stream).await,
+        Answer::Ended(code) => code,
+    }
+}
+
+async fn attach(socket: Option<PathBuf>) -> ExitCode {
+    let mut stream = match connect(socket).await {
+        Ok(stream) => stream,
+        Err(message) => {
+            eprintln!("rxd: {message}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let sent = ipc::send(&mut stream, &ipc::Command::Attach).await;
+    if let Err(error) = sent {
+        eprintln!("rxd: {error}");
+        return ExitCode::FAILURE;
+    }
+    match answer(ipc::receive::<Response, _>(&mut stream).await) {
+        Answer::Streaming => follow(&mut stream).await,
+        Answer::Ended(code) => code,
+    }
+}
+
+enum Answer {
+    Streaming,
+    Ended(ExitCode),
+}
+
+fn answer(received: Result<Response, IpcError>) -> Answer {
+    let response = match received {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("rxd: {error}");
+            return Answer::Ended(ExitCode::FAILURE);
+        }
+    };
+    match response {
+        Response::Started {
+            run_id,
+            dashboard_url,
+        } => {
+            println!("run {run_id}");
+            println!("{dashboard_url}");
+            Answer::Streaming
+        }
+        Response::Busy { run_id } => {
+            eprintln!("rxd: the daemon is running {run_id}");
+            Answer::Ended(ExitCode::FAILURE)
+        }
+        Response::NoRun => {
+            eprintln!("rxd: nothing is running");
+            Answer::Ended(ExitCode::FAILURE)
+        }
+        Response::Error { message } => {
+            eprintln!("rxd: {message}");
+            Answer::Ended(ExitCode::FAILURE)
+        }
+        Response::Line { text } => {
+            println!("{text}");
+            Answer::Streaming
+        }
+        Response::Ended {
+            status,
+            pr_url,
+            fail_reason,
+        } => Answer::Ended(report(status, &pr_url, &fail_reason)),
+    }
+}
+
+async fn follow(stream: &mut UnixStream) -> ExitCode {
+    loop {
+        let received = tokio::select! {
+            received = ipc::receive::<Response, _>(stream) => received,
+            _interrupted = tokio::signal::ctrl_c() => {
+                println!("detached; the run continues");
+                return ExitCode::SUCCESS;
+            }
+        };
+        let response = match received {
+            Ok(response) => response,
+            Err(IpcError::Closed) => {
+                eprintln!("rxd: the daemon closed the connection");
+                return ExitCode::FAILURE;
+            }
+            Err(error) => {
+                eprintln!("rxd: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match response {
+            Response::Line { text } => println!("{text}"),
+            Response::Ended {
+                status,
+                pr_url,
+                fail_reason,
+            } => return report(status, &pr_url, &fail_reason),
+            Response::Error { message } => {
+                eprintln!("rxd: {message}");
+                return ExitCode::FAILURE;
+            }
+            Response::Started {
+                run_id,
+                dashboard_url: _,
+            } => println!("run {run_id}"),
+            Response::Busy { run_id } => {
+                eprintln!("rxd: the daemon is running {run_id}");
+                return ExitCode::FAILURE;
+            }
+            Response::NoRun => {
+                eprintln!("rxd: nothing is running");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+}
+
+fn report(status: CompleteStatus, pr_url: &str, fail_reason: &str) -> ExitCode {
+    if !pr_url.is_empty() {
+        println!("{pr_url}");
+    }
+    match status {
+        CompleteStatus::Done => {
+            println!("done");
+            ExitCode::SUCCESS
+        }
+        CompleteStatus::Error => {
+            eprintln!("rxd: the run failed: {fail_reason}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn connect(socket: Option<PathBuf>) -> Result<UnixStream, String> {
+    let path = match socket {
+        Some(path) => path,
+        None => match paths::socket_path() {
+            Ok(path) => path,
+            Err(error) => return Err(error.to_string()),
+        },
+    };
+    match UnixStream::connect(&path).await {
+        Ok(stream) => Ok(stream),
+        Err(error) => Err(format!(
+            "the daemon is not listening on {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn describe(run: RunArgs) -> Result<RunRequest, String> {
     let RunArgs {
         plan,
         branch,
         no_pr,
         worktree,
     } = run;
-
     let Some(plan) = plan else {
-        eprintln!("rxd: a plan path is required; see rxd --help");
-        return ExitCode::FAILURE;
+        return Err("a plan path is required; see rxd --help".to_string());
     };
-
-    let branch = branch.unwrap_or_else(|| String::from("<plan stem>"));
+    let ctx = match std::env::current_dir() {
+        Ok(ctx) => ctx,
+        Err(error) => return Err(format!("the current directory is unusable: {error}")),
+    };
+    let Ok(ctx) = ctx.canonicalize() else {
+        return Err(format!("{} does not resolve", ctx.display()));
+    };
+    let plan = match plan.is_absolute() {
+        true => plan,
+        false => ctx.join(plan),
+    };
+    let plan = match plan.canonicalize() {
+        Ok(plan) => plan,
+        Err(error) => return Err(format!("{}: {error}", plan.display())),
+    };
+    let branch = match branch {
+        Some(branch) => branch,
+        None => plan_stem(&plan),
+    };
     let create_pr = match no_pr {
-        true => "no",
-        false => "yes",
+        true => CreatePr::No,
+        false => CreatePr::Yes,
     };
     let worktree = match worktree {
-        true => "yes",
-        false => "no",
+        true => Worktree::Yes,
+        false => Worktree::No,
     };
+    let mut env = Vec::new();
+    if let Ok(forwarded) = std::env::var(FORWARDED) {
+        env.push((FORWARDED.to_string(), forwarded));
+    }
+    Ok(RunRequest {
+        ctx: ctx.display().to_string(),
+        plan: plan.display().to_string(),
+        branch: Branch(branch),
+        create_pr,
+        worktree,
+        env,
+    })
+}
 
-    println!(
-        "rxd would run {} on branch {branch} (pull request: {create_pr}, worktree: {worktree})",
-        plan.display()
-    );
-    ExitCode::SUCCESS
+fn plan_stem(plan: &Path) -> String {
+    let Some(stem) = plan.file_stem() else {
+        return "ralphex".to_string();
+    };
+    stem.to_string_lossy().into_owned()
 }

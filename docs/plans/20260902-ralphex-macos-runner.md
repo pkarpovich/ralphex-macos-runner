@@ -532,11 +532,20 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Modify: `src/lib.rs`, `src/agent.rs`, `src/bin/ralphex-macos-runner.rs`, `src/bin/rxd.rs`
 - Create: `tests/rxd_e2e.rs`
 
-- [ ] `ipc.rs`: `Command` and `Response` from Technical Details, `send`/`receive` with the length-prefixed framing and the 10 MiB cap
-- [ ] daemon listener: bind the socket at `paths::socket_path()` with mode `0600`, remove a stale file first, remove on exit; per connection, `Run` -> `agent.start_local(request)` (which applies the slot rule, waiting through a poll) -> `client.open_run` -> `Started` -> subscribe -> stream `Line`s -> `Ended`; `Attach` -> `NoRun` or replay plus live
-- [ ] `rxd <plan>` and `rxd attach` per Technical Details, including the `CLAUDE_CONFIG_DIR` forward, the waiting message, the `run <id>` and URL header lines, Ctrl-C handling and the exit status
-- [ ] write `tests/rxd_e2e.rs`: framing round-trip including the cap; `rxd <plan>` against a running daemon prints the run id and URL first, streams the fake's lines, exits 0 on `done` and 1 on `error`; `rxd --worktree` puts `--worktree` in the fake's recorded argv; a `CLAUDE_CONFIG_DIR` in `rxd`'s environment reaches the fake's recorded environment; `rxd` during a held claim poll starts once the fake releases the poll with `204`; `rxd` during a held poll that the fake releases with a job gets `Busy` and the job runs; `Busy` while a job runs; `attach` replays history then streams; two attached clients both receive lines; the socket file has mode `0600`
-- [ ] run the gate - must pass before task 9
+- [x] `ipc.rs`: `Command` and `Response` from Technical Details, `send`/`receive` with the length-prefixed framing and the 10 MiB cap
+- [x] daemon listener: bind the socket at `paths::socket_path()` with mode `0600`, remove a stale file first, remove on exit; per connection, `Run` -> `agent.start_local(request)` (which applies the slot rule, waiting through a poll) -> `client.open_run` -> `Started` -> subscribe -> stream `Line`s -> `Ended`; `Attach` -> `NoRun` or replay plus live
+- [x] `rxd <plan>` and `rxd attach` per Technical Details, including the `CLAUDE_CONFIG_DIR` forward, the waiting message, the `run <id>` and URL header lines, Ctrl-C handling and the exit status
+- [x] write `tests/rxd_e2e.rs`: framing round-trip including the cap; `rxd <plan>` against a running daemon prints the run id and URL first, streams the fake's lines, exits 0 on `done` and 1 on `error`; `rxd --worktree` puts `--worktree` in the fake's recorded argv; a `CLAUDE_CONFIG_DIR` in `rxd`'s environment reaches the fake's recorded environment; `rxd` during a held claim poll starts once the fake releases the poll with `204`; `rxd` during a held poll that the fake releases with a job gets `Busy` and the job runs; `Busy` while a job runs; `attach` replays history then streams; two attached clients both receive lines; the socket file has mode `0600`
+- [x] run the gate - must pass before task 9
+
+➕ The slot is a `tokio::sync::Semaphore` with one permit next to the `RunSlot` state, because the handoff the Key decisions ask for needs a fair queue: on a `204` the claim loop drops the permit and asks for it again, and a waiting `rxd` is served first because tokio's semaphore serves its waiters in order. The state alone could not do it - a compare-and-set on a `watch` would let the claim loop re-take the slot before the waiter woke.
+➕ `RunSlot` grew an `Opening` variant for the moment between taking the slot and the farm minting the run id. A second local request treats it as `Polling` and waits, so a `Busy` answer always carries a real run id.
+➕ `Agent::run_job`'s body became `execute`, which returns the `CompleteRequest` instead of posting it, plus `CurrentRun` - the run id, the dashboard URL, the log stream and a `watch` of `RunState` - which both entry points register in `Agent::current`. That is what `Attach` follows, so `rxd attach` works for a ticket run as well as a local one, and the log stream is now created by the agent rather than inside the job path.
+➕ `follow` answers an `Attach` with `Started` before the replay, so an attaching operator sees which run they joined.
+➕ Both binaries take `--socket <path>`, which is how the suite runs a real `rxd` against an in-process daemon on a temporary socket instead of the installed one.
+➕ A local run that ends in `VersionMismatch` logs it and lets the claim loop meet the same `409` on its next poll; only the claim loop exits the process with status 2.
+⚠️ `rxd --socket <path> attach` parses `attach` as the plan, because clap gives an optional positional precedence over a subcommand; `rxd attach --socket <path>` is the order that works, and `--socket` is global for that reason. Production usage (`rxd attach`) is unaffected.
+⚠️ The listener's readiness cannot be waited on with `Path::exists`: a stale regular file at the socket path already exists, so the suite waits for a path whose file type is a socket.
 
 ### Task 9: launchd install and uninstall
 

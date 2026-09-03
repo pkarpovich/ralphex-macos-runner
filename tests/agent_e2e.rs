@@ -246,6 +246,7 @@ async fn a_claimed_job_runs_to_done_and_its_output_reaches_the_farm() {
         RunSlot::Running(_) => None,
         RunSlot::Free => Some(()),
         RunSlot::Polling => Some(()),
+        RunSlot::Opening => None,
     })
     .await;
     assert!(freed.is_some(), "the run slot was never released");
