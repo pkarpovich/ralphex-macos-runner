@@ -1,0 +1,12 @@
+[tools]
+rust = { version = "1.98.0", components = "rustfmt,clippy" }
+actionlint = "1.7.12"
+
+[tasks.check]
+description = "Format, lint, test and workflow checks"
+run = [
+  "cargo fmt --check",
+  "cargo clippy --all-targets -- -D warnings",
+  "cargo test",
+  "actionlint",
+]

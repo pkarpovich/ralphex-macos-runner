@@ -68,7 +68,7 @@ Load each skill below with the Skill tool and follow its conventions before impl
 
 **Host facts that shape defaults:** `ralphex` is `/opt/homebrew/bin/ralphex` (v1.6.1); `gh` is `/opt/homebrew/bin/gh` (2.98); `ruby` is the system 2.6 (enough for `ruby -c`); `actionlint` is not installed but is in mise's registry; the personal ralphex config is `~/.config/ralphex` with `finalize_enabled` at its default `false`; the farm URL and runner token live in the operator's environment repository, not in this one.
 
-**Dependencies (add with `cargo add`, versions resolved at that moment and pinned by `Cargo.lock`; none are stated here from memory):** `tokio` (`rt-multi-thread`, `macros`, `process`, `signal`, `sync`, `time`, `net`, `io-util`), `reqwest` (`json`, `rustls-tls`, default features off), `serde` (`derive`), `serde_json`, `toml`, `clap` (`derive`), `thiserror`, `tracing`, `tracing-subscriber` (`env-filter`), `dirs`, `nix` (`signal`, `process`). Dev: `axum` (the fake farm), `tempfile`.
+**Dependencies (add with `cargo add`, versions resolved at that moment and pinned by `Cargo.lock`; none are stated here from memory):** `tokio` (`rt-multi-thread`, `macros`, `process`, `signal`, `sync`, `time`, `net`, `io-util`), `reqwest` (`json`, `rustls`, default features off), `serde` (`derive`), `serde_json`, `toml`, `clap` (`derive`), `thiserror`, `tracing`, `tracing-subscriber` (`env-filter`), `dirs`, `nix` (`signal`, `process`). Dev: `axum` (the fake farm), `tempfile`.
 
 ## Development Approach
 
@@ -400,14 +400,17 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Modify: `.gitignore` (keep the existing `.revmux/` and `target/` lines)
 - Create: `tests/smoke.rs`
 
-- [ ] `cargo init --lib` in the repository root; declare the two `[[bin]]` targets; add the dependencies listed in Context with `cargo add` (runtime and dev separately)
-- [ ] `mise.toml`: `[tools]` pinning `rust` to the current stable (`mise use rust@latest`) and `actionlint`; a `check` task running `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `actionlint`
-- [ ] `src/paths.rs` with the profile-dependent paths from Technical Details; `lib.rs` declares it
-- [ ] `clap` skeletons: the daemon takes `--config <path>` defaulting to `paths::config_path()`; `rxd` has the four subcommands as no-ops that print what they would do
-- [ ] `ci.yml`: checkout, `jdx/mise-action`, `Swatinem/rust-cache`, `mise run check`
-- [ ] write unit tests for `paths`: release and debug profiles give different application directories, every path is under the expected root
-- [ ] write `tests/smoke.rs`: both binaries answer `--help` with exit 0 and mention their own name
-- [ ] run the gate - must pass before task 2
+- [x] `cargo init --lib` in the repository root; declare the two `[[bin]]` targets; add the dependencies listed in Context with `cargo add` (runtime and dev separately)
+- [x] `mise.toml`: `[tools]` pinning `rust` to the current stable (`mise use rust@latest`) and `actionlint`; a `check` task running `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `actionlint`
+- [x] `src/paths.rs` with the profile-dependent paths from Technical Details; `lib.rs` declares it
+- [x] `clap` skeletons: the daemon takes `--config <path>` defaulting to `paths::config_path()`; `rxd` has the four subcommands as no-ops that print what they would do
+- [x] `ci.yml`: checkout, `jdx/mise-action`, `Swatinem/rust-cache`, `mise run check`
+- [x] write unit tests for `paths`: release and debug profiles give different application directories, every path is under the expected root
+- [x] write `tests/smoke.rs`: both binaries answer `--help` with exit 0 and mention their own name
+- [x] run the gate - must pass before task 2
+
+➕ `rust` is pinned to `1.98.0` with the `rustfmt` and `clippy` components, `actionlint` to `1.7.12`.
+⚠️ `reqwest` 0.13 renamed its TLS feature: the crate uses `features = ["json", "rustls"]` with default features off, not the `rustls-tls` named in Context. The Context line below is corrected to match.
 
 ### Task 2: Protocol types and conformance vectors
 
