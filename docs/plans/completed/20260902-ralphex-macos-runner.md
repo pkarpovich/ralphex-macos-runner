@@ -604,9 +604,12 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Create: `README.md`, `CLAUDE.md`
 - Modify: `docs/plans/20260902-ralphex-macos-runner.md`
 
-- [ ] `README.md`: what it is, `brew install pkarpovich/apps/ralphex-macos-runner`, `rxd install`, the config file, `rxd` usage including the waiting message, the ticket block for native runs, the update procedure (`brew upgrade` then `rxd install`), the exit-2 meaning
-- [ ] `CLAUDE.md`: build and test commands, the module map from Solution Overview, the key patterns (one execution path with `LocalOptions`, the run slot, fatal `409`, the `410` rule, the cancel sequence), in the same shape as the operator's other daemon repositories
-- [ ] move this plan to `docs/plans/completed/`
+- [x] `README.md`: what it is, `brew install pkarpovich/apps/ralphex-macos-runner`, `rxd install`, the config file, `rxd` usage including the waiting message, the ticket block for native runs, the update procedure (`brew upgrade` then `rxd install`), the exit-2 meaning
+- [x] `CLAUDE.md`: build and test commands, the module map from Solution Overview, the key patterns (one execution path with `LocalOptions`, the run slot, fatal `409`, the `410` rule, the cancel sequence), in the same shape as the operator's other daemon repositories
+- [x] move this plan to `docs/plans/completed/`
+
+➕ The native ticket block in the README is transcribed from the farm's own `README.md` at the commit that merged plan 1 (`runtime`, `ctx`, absolute `plan`, `pr: false`), not from this plan's prose, so the two repositories describe one block.
+➕ `CLAUDE.md` carries a Non-goals section and the Code Style rules (no comments, `///` everywhere, no `unsafe`) as well as the module map, because those are what a fresh session would otherwise violate first.
 
 ## Post-Completion
 
