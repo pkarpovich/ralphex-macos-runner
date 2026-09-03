@@ -137,7 +137,7 @@ impl fmt::Display for RunnerName {
 }
 
 /// The git branch a run works on.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Branch(pub String);
 
@@ -211,12 +211,13 @@ impl fmt::Display for Seq {
 }
 
 /// Whether a run ends with a pull request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(from = "bool", into = "bool")]
 pub enum CreatePr {
     /// The runner pushes the branch and opens a pull request.
     Yes,
     /// The runner leaves the branch alone.
+    #[default]
     No,
 }
 
@@ -382,33 +383,50 @@ pub struct OpenRunRequest {
 }
 
 /// A run the farm handed to this runner.
+///
+/// Every field but `run_id` decodes to its zero value when the farm leaves it
+/// out: a job whose lease is already ticking must not be orphaned because a
+/// farm build dropped a field this runner does not even need. A job without a
+/// run id is refused, because there is nothing to heartbeat or complete.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Job {
     /// The identifier of the run.
     pub run_id: RunId,
     /// The Linear issue's identifier, empty for a local run.
+    #[serde(default)]
     pub issue_id: String,
     /// The Linear issue's human identifier, empty for a local run.
+    #[serde(default)]
     pub identifier: String,
     /// The Linear issue's URL, empty for a local run.
+    #[serde(default)]
     pub issue_url: String,
     /// The title of the run.
+    #[serde(default)]
     pub title: String,
     /// The `owner/name` slug of the repository.
+    #[serde(default)]
     pub repo_slug: String,
     /// The absolute path of the plan file.
+    #[serde(default)]
     pub plan_path: String,
     /// The branch ralphex works on.
+    #[serde(default)]
     pub branch: Branch,
     /// The ralphex mode, `review` for a review run.
+    #[serde(default)]
     pub mode: String,
     /// The lease the farm granted, in seconds.
+    #[serde(default)]
     pub lease_ttl_seconds: u64,
     /// The runtime class the run needs.
+    #[serde(default)]
     pub runtime: String,
     /// The checkout the run executes in.
+    #[serde(default)]
     pub ctx: String,
     /// Whether the run ends with a pull request.
+    #[serde(default)]
     pub create_pr: CreatePr,
 }
 
@@ -530,6 +548,53 @@ mod tests {
             slots: _,
         } = request;
         assert_eq!(repos, Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_job_missing_a_field_decodes_to_its_zero_value() {
+        let job: Job = serde_json::from_value(json!({
+            "run_id": "FARM-12-1753180800000",
+            "issue_id": "issue-uuid",
+            "identifier": "FARM-12",
+            "title": "split farm and runner",
+            "repo_slug": "owner/repo",
+            "plan_path": "/abs/checkout/docs/plans/x.md",
+            "branch": "x",
+            "lease_ttl_seconds": 180,
+            "runtime": "native",
+            "ctx": "/abs/checkout",
+        }))
+        .unwrap();
+        let Job {
+            run_id,
+            issue_id: _,
+            identifier: _,
+            issue_url,
+            title: _,
+            repo_slug: _,
+            plan_path: _,
+            branch,
+            mode,
+            lease_ttl_seconds: _,
+            runtime: _,
+            ctx: _,
+            create_pr,
+        } = job;
+        assert_eq!(run_id, RunId("FARM-12-1753180800000".to_string()));
+        assert_eq!(branch, Branch("x".to_string()));
+        assert!(issue_url.is_empty());
+        assert!(mode.is_empty());
+        assert_eq!(create_pr, CreatePr::No);
+    }
+
+    #[test]
+    fn a_job_without_a_run_id_is_refused() {
+        let refused = serde_json::from_value::<Job>(json!({
+            "issue_id": "issue-uuid",
+            "runtime": "native",
+            "ctx": "/abs/checkout",
+        }));
+        assert!(refused.is_err(), "{refused:?}");
     }
 
     #[test]
