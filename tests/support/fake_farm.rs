@@ -206,6 +206,14 @@ impl FakeFarm {
         self.shared.release.notify_one();
     }
 
+    /// Releases a held run opening, which then answers `reply`.
+    pub fn release_runs(&self, reply: Reply) {
+        let mut routes = self.shared.routes.lock().unwrap();
+        routes.runs.queue.push_front(reply);
+        drop(routes);
+        self.shared.release.notify_one();
+    }
+
     /// Returns every request this farm received, in order.
     #[must_use]
     pub fn requests(&self) -> Vec<Recorded> {
@@ -334,7 +342,15 @@ async fn runs(
         RouteName::Runs,
         Reply::Status(400, "no run scripted".to_string()),
     );
-    respond(reply)
+    let Reply::Hold = reply else {
+        return respond(reply);
+    };
+    shared.release.notified().await;
+    respond(take(
+        &shared,
+        RouteName::Runs,
+        Reply::Status(400, "no run scripted".to_string()),
+    ))
 }
 
 async fn log(

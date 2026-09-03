@@ -633,6 +633,62 @@ async fn a_local_run_asked_for_during_a_shutdown_is_refused_without_opening_one(
 }
 
 #[tokio::test]
+async fn a_shutdown_that_lands_while_the_farm_mints_a_local_run_completes_it_unstarted() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_SLEEP", "120")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Hold);
+    let agent = Arc::new(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(&checkout.tools),
+    ));
+    let (raise, shutdown) = watch::channel(false);
+    let opening = Arc::clone(&agent);
+    let request = RunRequest {
+        ctx: checkout.path().display().to_string(),
+        plan: checkout.plan.display().to_string(),
+        branch: Branch("x".to_string()),
+        create_pr: CreatePr::No,
+        worktree: Worktree::No,
+        env: Vec::new(),
+    };
+    let started = tokio::spawn(async move { opening.start_local(request, shutdown).await });
+
+    let opened = wait_for(|| match farm.requests_ending("/runs").is_empty() {
+        true => None,
+        false => Some(()),
+    })
+    .await;
+    assert!(opened.is_some(), "the opening never reached the farm");
+    raise.send_replace(true);
+    farm.release_runs(Reply::Job(Box::new(job(
+        checkout.path(),
+        &checkout.plan,
+        CreatePr::No,
+    ))));
+
+    let LocalStart::Refused { message } = started.await.unwrap() else {
+        panic!("the run was not refused");
+    };
+    assert!(message.contains("shutting down"), "{message}");
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+    assert_eq!(status, CompleteStatus::Error);
+    assert_eq!(fail_reason, "runner_shutdown");
+    assert!(
+        !checkout.record.exists(),
+        "ralphex was started for a run the farm minted during a shutdown"
+    );
+    drop(raise);
+}
+
+#[tokio::test]
 async fn a_finished_run_opens_a_pull_request() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);

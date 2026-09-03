@@ -193,11 +193,18 @@ fn rxd(
     args: &[&str],
     env: &[(&str, &str)],
 ) -> tokio::process::Child {
+    let mut argv = args.to_vec();
+    let socket = socket.display().to_string();
+    argv.push("--socket");
+    argv.push(&socket);
+    rxd_argv(checkout, &argv, env)
+}
+
+fn rxd_argv(checkout: &Checkout, args: &[&str], env: &[(&str, &str)]) -> tokio::process::Child {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_rxd"));
     for argument in args {
         command.arg(argument);
     }
-    command.arg("--socket").arg(socket);
     command.current_dir(checkout.dir.path());
     command.env_remove("CLAUDE_CONFIG_DIR");
     for (key, value) in env {
@@ -631,6 +638,85 @@ async fn a_local_run_the_farm_forgets_is_reported_to_the_client() {
 }
 
 #[tokio::test]
+async fn a_completion_the_farm_refuses_is_reported_to_the_client() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(job(&checkout, "local-12"))));
+    farm.always_complete(Reply::Status(400, "the lease expired".to_string()));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let output = client.wait_with_output().await.unwrap();
+
+    let printed = text(&output);
+    assert!(!output.status.success(), "{printed}");
+    assert!(!printed.contains("\ndone"), "{printed}");
+    assert!(printed.contains("the run ended done"), "{printed}");
+    assert!(printed.contains("the farm did not record it"), "{printed}");
+    assert!(printed.contains("the lease expired"), "{printed}");
+    assert_eq!(farm.requests_ending("/complete").len(), 1);
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_completion_the_farm_already_holds_is_reported_as_the_run_ended() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(job(&checkout, "local-13"))));
+    farm.always_complete(Reply::Status(410, String::new()));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let output = client.wait_with_output().await.unwrap();
+
+    let printed = text(&output);
+    assert!(output.status.success(), "{printed}");
+    assert!(printed.contains("done"), "{printed}");
+    assert!(!printed.contains("did not record it"), "{printed}");
+    assert_eq!(farm.requests_ending("/complete").len(), 1);
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_socket_named_before_the_subcommand_still_reaches_the_daemon() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let socket = daemon.socket.display().to_string();
+    let client = rxd_argv(&checkout, &["--socket", &socket, "attach"], &[]);
+    let output = client.wait_with_output().await.unwrap();
+
+    let printed = text(&output);
+    assert!(!output.status.success(), "{printed}");
+    assert!(printed.contains("nothing is running"), "{printed}");
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_plan_named_beside_a_subcommand_is_refused() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md", "attach"], &[]);
+    let output = client.wait_with_output().await.unwrap();
+
+    let printed = text(&output);
+    assert!(!output.status.success(), "{printed}");
+    assert!(
+        printed.contains("run arguments do not belong with a subcommand"),
+        "{printed}"
+    );
+    assert!(!printed.contains("nothing is running"), "{printed}");
+    drop(daemon.raise);
+}
+
+#[tokio::test]
 async fn an_interrupted_client_detaches_and_leaves_the_run_going() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1"), ("FAKE_RALPHEX_SLEEP", "120")]);
@@ -720,6 +806,15 @@ async fn a_socket_directory_the_daemon_creates_is_its_own() {
     assert!(bound.is_some(), "the socket was never bound");
     let mode = std::fs::metadata(&state).unwrap().permissions().mode();
     assert_eq!(mode & 0o777, DIRECTORY_MODE);
+    let mut left = Vec::new();
+    for entry in std::fs::read_dir(&state).unwrap() {
+        left.push(entry.unwrap().file_name());
+    }
+    assert_eq!(
+        left,
+        vec![std::ffi::OsString::from("daemon.sock")],
+        "the daemon left more than its socket behind"
+    );
     drop(raise);
 }
 

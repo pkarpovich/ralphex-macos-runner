@@ -544,7 +544,7 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 ➕ `follow` answers an `Attach` with `Started` before the replay, so an attaching operator sees which run they joined.
 ➕ Both binaries take `--socket <path>`, which is how the suite runs a real `rxd` against an in-process daemon on a temporary socket instead of the installed one.
 ➕ A local run that ends in `VersionMismatch` logs it and lets the claim loop meet the same `409` on its next poll; only the claim loop exits the process with status 2.
-⚠️ `rxd --socket <path> attach` parses `attach` as the plan, because clap gives an optional positional precedence over a subcommand; `rxd attach --socket <path>` is the order that works, and `--socket` is global for that reason. Production usage (`rxd attach`) is unaffected.
+⚠️ `args_conflicts_with_subcommands` made clap parse `rxd --socket <path> attach` as a plan named `attach`, because once an argument has been seen the setting stops clap from considering a subcommand at all. The setting is not used; `--socket` stays global, and both orders reach the subcommand. Clap would then let `rxd <plan> attach` parse and silently drop the plan, so a post-parse check refuses any run argument given beside a subcommand.
 ⚠️ The listener's readiness cannot be waited on with `Path::exists`: a stale regular file at the socket path already exists, so the suite waits for a path whose file type is a socket.
 
 ### Task 9: launchd install and uninstall

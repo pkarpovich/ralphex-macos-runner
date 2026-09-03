@@ -49,8 +49,22 @@ pub enum RunSlot {
 pub enum RunState {
     /// The run is in flight.
     Running,
-    /// The run finished, with the completion it reported when it reported one.
-    Finished(Option<CompleteRequest>),
+    /// The run finished, and this is what the farm's records hold.
+    Finished(RunEnd),
+}
+
+/// What the farm's records hold about a run that ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunEnd {
+    /// The farm holds a completion for the run, which is this one.
+    Reported(CompleteRequest),
+    /// The farm never accepted the completion the run produced.
+    Unreported {
+        /// How the run ended and why the farm did not record it.
+        message: String,
+    },
+    /// The run ended without a completion being sent.
+    Dropped,
 }
 
 /// The run an attached client follows.
@@ -80,11 +94,11 @@ impl CurrentRun {
         Arc::clone(&self.log)
     }
 
-    /// Waits for the run to finish and returns the completion it reported.
+    /// Waits for the run to finish and returns what the farm's records hold.
     ///
-    /// A run the farm has forgotten is finished without a completion and
-    /// resolves to [`None`].
-    pub async fn ended(&self) -> Option<CompleteRequest> {
+    /// A run the farm has forgotten, and a run whose agent is gone, resolve to
+    /// [`RunEnd::Dropped`].
+    pub async fn ended(&self) -> RunEnd {
         let mut state = self.state.subscribe();
         let finished = state
             .wait_for(|state| match state {
@@ -93,11 +107,11 @@ impl CurrentRun {
             })
             .await;
         let Ok(finished) = finished else {
-            return None;
+            return RunEnd::Dropped;
         };
         match finished.clone() {
-            RunState::Running => None,
-            RunState::Finished(completion) => completion,
+            RunState::Running => RunEnd::Dropped,
+            RunState::Finished(ended) => ended,
         }
     }
 }
@@ -181,6 +195,12 @@ enum Terminal {
 enum Ended {
     Exited(Result<ExitStatus, JobError>),
     Terminal(Terminal),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Record {
+    Held,
+    Missing,
 }
 
 struct Finished {
@@ -281,15 +301,7 @@ impl Agent {
             };
             if *shutdown.borrow() {
                 tracing::info!("run {} was claimed during a shutdown", job.run_id);
-                self.report(
-                    &job.run_id,
-                    failed(
-                        "runner_shutdown",
-                        "the runner shut down before the run started".to_string(),
-                        String::new(),
-                    ),
-                )
-                .await;
+                self.report(&job.run_id, shut_down()).await;
                 self.hold(RunSlot::Free);
                 drop(permit);
                 return self.drained().await;
@@ -316,7 +328,10 @@ impl Agent {
     /// [`LocalStart::Busy`] at once. A request that reaches the slot after a
     /// shutdown was raised is answered [`LocalStart::Refused`] without a run
     /// being opened at the farm, for the reason the claim path refuses a job it
-    /// claimed during a shutdown. The run outlives the client that asked for it.
+    /// claimed during a shutdown; a shutdown that arrives while the farm is
+    /// minting the run is answered the same way, and the run it minted is
+    /// completed as `runner_shutdown` without ralphex ever being spawned. The
+    /// run outlives the client that asked for it.
     ///
     /// # Panics
     ///
@@ -364,6 +379,15 @@ impl Agent {
                 };
             }
         };
+        if *shutdown.borrow() {
+            tracing::info!("run {} was opened during a shutdown", job.run_id);
+            self.report(&job.run_id, shut_down()).await;
+            self.hold(RunSlot::Free);
+            drop(permit);
+            return LocalStart::Refused {
+                message: "the runner is shutting down".to_string(),
+            };
+        }
         self.hold(RunSlot::Running(job.run_id.clone()));
         let current = self.enter(&job.run_id);
         let started = Arc::clone(&current);
@@ -414,13 +438,14 @@ impl Agent {
             outcome,
             beats,
         } = self.execute(job, local, shutdown, current).await;
-        if let Some(completion) = completion.clone() {
-            self.report(&run_id, completion).await;
-        }
+        let ended = match completion {
+            Some(completion) => self.report(&run_id, completion).await,
+            None => RunEnd::Dropped,
+        };
         if let Some(beats) = beats {
             beats.abort();
         }
-        self.leave(current, completion);
+        self.leave(current, ended);
         outcome
     }
 
@@ -627,17 +652,28 @@ impl Agent {
         current
     }
 
-    fn leave(&self, current: &CurrentRun, completion: Option<CompleteRequest>) {
-        current.state.send_replace(RunState::Finished(completion));
+    fn leave(&self, current: &CurrentRun, ended: RunEnd) {
+        current.state.send_replace(RunState::Finished(ended));
         let mut held = self.current.lock().unwrap();
         *held = None;
         drop(held);
     }
 
-    async fn report(&self, run_id: &RunId, request: CompleteRequest) {
-        match self.client.complete(run_id, &request).await {
-            Ok(()) => {}
-            Err(error) => tracing::warn!("run {run_id} could not be completed: {error}"),
+    async fn report(&self, run_id: &RunId, completion: CompleteRequest) -> RunEnd {
+        let Err(error) = self.client.complete(run_id, &completion).await else {
+            return RunEnd::Reported(completion);
+        };
+        match record(&error) {
+            Record::Held => {
+                tracing::warn!("run {run_id} was already completed at the farm");
+                RunEnd::Reported(completion)
+            }
+            Record::Missing => {
+                tracing::warn!("run {run_id} could not be completed: {error}");
+                RunEnd::Unreported {
+                    message: unreported(&completion, &error),
+                }
+            }
         }
     }
 }
@@ -739,6 +775,32 @@ fn done(pr_url: String) -> CompleteRequest {
     }
 }
 
+fn shut_down() -> CompleteRequest {
+    failed(
+        "runner_shutdown",
+        "the runner shut down before the run started".to_string(),
+        String::new(),
+    )
+}
+
+fn unreported(completion: &CompleteRequest, error: &FarmError) -> String {
+    let CompleteRequest {
+        status,
+        pr_url,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion;
+    let ended = match status {
+        CompleteStatus::Done => match pr_url.is_empty() {
+            true => "done".to_string(),
+            false => format!("done, {pr_url}"),
+        },
+        CompleteStatus::Error => format!("error, {fail_reason}"),
+    };
+    format!("the run ended {ended}, but the farm did not record it: {error}")
+}
+
 fn failed(fail_reason: &str, message: String, log_tail: String) -> CompleteRequest {
     CompleteRequest {
         status: CompleteStatus::Error,
@@ -746,6 +808,17 @@ fn failed(fail_reason: &str, message: String, log_tail: String) -> CompleteReque
         fail_reason: fail_reason.to_string(),
         message,
         log_tail,
+    }
+}
+
+fn record(error: &FarmError) -> Record {
+    match error {
+        FarmError::Gone => Record::Held,
+        FarmError::VersionMismatch { message: _ } => Record::Missing,
+        FarmError::BadRequest(_) => Record::Missing,
+        FarmError::Rejected(_, _) => Record::Missing,
+        FarmError::Transport(_) => Record::Missing,
+        FarmError::Decode(_) => Record::Missing,
     }
 }
 
@@ -860,6 +933,57 @@ mod tests {
         assert_eq!(fail_reason, "canceled");
         assert_eq!(message, "stopped");
         assert_eq!(log_tail, "line");
+    }
+
+    #[test]
+    fn a_shutdown_completion_names_the_reason_the_farm_knows() {
+        let CompleteRequest {
+            status,
+            pr_url,
+            fail_reason,
+            message,
+            log_tail,
+        } = shut_down();
+        assert_eq!(status, CompleteStatus::Error);
+        assert!(pr_url.is_empty());
+        assert_eq!(fail_reason, "runner_shutdown");
+        assert!(message.contains("before the run started"), "{message}");
+        assert!(log_tail.is_empty());
+    }
+
+    #[test]
+    fn an_unrecorded_completion_keeps_what_the_run_produced() {
+        let opened = unreported(
+            &done("https://github.com/owner/repo/pull/7".to_string()),
+            &FarmError::Transport("reset".to_string()),
+        );
+        assert!(opened.contains("the run ended done"), "{opened}");
+        assert!(opened.contains("owner/repo/pull/7"), "{opened}");
+        assert!(opened.contains("did not record it"), "{opened}");
+        assert!(opened.contains("reset"), "{opened}");
+
+        let broken = unreported(
+            &failed("nonzero_exit", "code 3".to_string(), "line".to_string()),
+            &FarmError::Rejected(500, "the farm is down".to_string()),
+        );
+        assert!(
+            broken.contains("the run ended error, nonzero_exit"),
+            "{broken}"
+        );
+        assert!(broken.contains("the farm is down"), "{broken}");
+    }
+
+    #[test]
+    fn a_completion_the_farm_already_holds_is_not_a_missing_record() {
+        assert_eq!(record(&FarmError::Gone), Record::Held);
+        assert_eq!(
+            record(&FarmError::Transport("reset".to_string())),
+            Record::Missing
+        );
+        assert_eq!(
+            record(&FarmError::Rejected(500, "down".to_string())),
+            Record::Missing
+        );
     }
 
     #[test]

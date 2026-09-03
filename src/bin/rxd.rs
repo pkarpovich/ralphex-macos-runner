@@ -25,8 +25,7 @@ const WAIT_NOTICE: Duration = Duration::from_millis(250);
 #[command(
     name = "rxd",
     about = "Runs a plan through the ralphex-macos-runner daemon",
-    version,
-    args_conflicts_with_subcommands = true
+    version
 )]
 struct Cli {
     #[command(subcommand)]
@@ -69,6 +68,12 @@ struct RunArgs {
     worktree: bool,
 }
 
+#[derive(Debug)]
+enum RunArgsGiven {
+    Yes,
+    No,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let Cli {
@@ -78,10 +83,35 @@ async fn main() -> ExitCode {
     } = Cli::parse();
 
     match command {
-        Some(Command::Attach) => attach(socket).await,
-        Some(Command::Install) => install().await,
-        Some(Command::Uninstall) => uninstall().await,
+        Some(command) => match given(&run) {
+            RunArgsGiven::Yes => {
+                eprintln!("rxd: run arguments do not belong with a subcommand; see rxd --help");
+                ExitCode::FAILURE
+            }
+            RunArgsGiven::No => dispatch(command, socket).await,
+        },
         None => start_run(socket, run).await,
+    }
+}
+
+async fn dispatch(command: Command, socket: Option<PathBuf>) -> ExitCode {
+    match command {
+        Command::Attach => attach(socket).await,
+        Command::Install => install().await,
+        Command::Uninstall => uninstall().await,
+    }
+}
+
+fn given(run: &RunArgs) -> RunArgsGiven {
+    let RunArgs {
+        plan,
+        branch,
+        no_pr,
+        worktree,
+    } = run;
+    match (plan, branch, no_pr, worktree) {
+        (None, None, false, false) => RunArgsGiven::No,
+        (_, _, _, _) => RunArgsGiven::Yes,
     }
 }
 

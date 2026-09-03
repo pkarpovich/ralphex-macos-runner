@@ -6,6 +6,7 @@
 //! command to the agent's run slot and streams the run's output back as
 //! [`Response::Line`] messages until the run ends.
 
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch};
 
-use crate::agent::{Agent, CurrentRun, LocalStart, raised};
+use crate::agent::{Agent, CurrentRun, LocalStart, RunEnd, raised};
 use crate::job::Worktree;
 use crate::protocol::types::{Branch, CompleteRequest, CompleteStatus, CreatePr, RunId};
 
@@ -32,6 +33,15 @@ pub const SOCKET_MODE: u32 = 0o600;
 /// given on the command line, and a shared directory is not the daemon's to
 /// close down.
 pub const DIRECTORY_MODE: u32 = 0o700;
+
+/// The bytes `sun_path` holds on Darwin, which a socket path stays under.
+pub const SOCKET_PATH_MAX: usize = 104;
+
+/// The name the socket carries while it is bound in its staging directory.
+///
+/// One byte, so a path the socket itself fits in stages three bytes longer
+/// rather than the length of the socket's own name again.
+pub const STAGED_NAME: &str = "s";
 
 /// What `rxd` asks the daemon to run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -222,13 +232,17 @@ where
 
 /// Serves clients on the socket at `path` until `shutdown` is raised.
 ///
-/// A stale socket file is removed first, the new one is given
-/// [`SOCKET_MODE`], and it is removed again when the listener stops.
+/// The socket is bound under [`STAGED_NAME`] inside a directory of mode
+/// [`DIRECTORY_MODE`] no other user can enter, given [`SOCKET_MODE`] there and
+/// only then renamed onto `path`, over a stale file if one is in the way, so it
+/// is never reachable while it still carries the permissions the umask gave it.
+/// It is removed when the listener stops.
 ///
 /// # Errors
 ///
 /// Returns [`IpcError::Io`] when the socket's directory cannot be created, the
-/// socket cannot be bound or its permissions cannot be set.
+/// staged path needs more than [`SOCKET_PATH_MAX`] bytes, the socket cannot be
+/// bound, its permissions cannot be set or it cannot be moved to `path`.
 pub async fn serve(
     path: PathBuf,
     agent: Arc<Agent>,
@@ -262,24 +276,52 @@ pub async fn serve(
 }
 
 fn bind(path: &Path) -> Result<UnixListener, IpcError> {
-    if let Some(parent) = path.parent()
-        && let Err(error) = std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(DIRECTORY_MODE)
-            .create(parent)
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(IpcError::Io(format!(
+            "{} is not a path a socket can be bound at",
+            path.display()
+        )));
+    };
+    if let Err(error) = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(DIRECTORY_MODE)
+        .create(parent)
     {
         return Err(IpcError::Io(error.to_string()));
     }
-    let _ = std::fs::remove_file(path);
-    let listener = match UnixListener::bind(path) {
-        Ok(listener) => listener,
-        Err(error) => return Err(IpcError::Io(error.to_string())),
-    };
-    let permissions = std::fs::Permissions::from_mode(SOCKET_MODE);
-    if let Err(error) = std::fs::set_permissions(path, permissions) {
+    let staging = parent.join(format!(".{}", name.to_string_lossy()));
+    let staged = staging.join(STAGED_NAME);
+    if staged.as_os_str().as_bytes().len() >= SOCKET_PATH_MAX {
+        return Err(IpcError::Io(format!(
+            "{} needs {SOCKET_PATH_MAX} bytes or fewer to be bound",
+            staged.display()
+        )));
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    if let Err(error) = std::fs::DirBuilder::new()
+        .mode(DIRECTORY_MODE)
+        .create(&staging)
+    {
         return Err(IpcError::Io(error.to_string()));
     }
+    let listener = match UnixListener::bind(&staged) {
+        Ok(listener) => listener,
+        Err(error) => return abandon(&staging, &error.to_string()),
+    };
+    let permissions = std::fs::Permissions::from_mode(SOCKET_MODE);
+    if let Err(error) = std::fs::set_permissions(&staged, permissions) {
+        return abandon(&staging, &error.to_string());
+    }
+    if let Err(error) = std::fs::rename(&staged, path) {
+        return abandon(&staging, &error.to_string());
+    }
+    let _ = std::fs::remove_dir(&staging);
     Ok(listener)
+}
+
+fn abandon(staging: &Path, error: &str) -> Result<UnixListener, IpcError> {
+    let _ = std::fs::remove_dir_all(staging);
+    Err(IpcError::Io(error.to_string()))
 }
 
 async fn handle(stream: UnixStream, agent: Arc<Agent>, shutdown: watch::Receiver<bool>) {
@@ -347,36 +389,72 @@ async fn follow(stream: &mut UnixStream, current: &CurrentRun) -> Result<(), Ipc
     while let Ok(text) = lines.try_recv() {
         send(stream, &Response::Line { text }).await?;
     }
-    let Some(completion) = ended else {
-        return send(
-            stream,
-            &Response::Error {
-                message: "the farm no longer knows this run".to_string(),
-            },
-        )
-        .await;
-    };
-    let CompleteRequest {
-        status,
-        pr_url,
-        fail_reason,
-        message: _,
-        log_tail: _,
-    } = completion;
-    send(
-        stream,
-        &Response::Ended {
-            status,
-            pr_url,
-            fail_reason,
-        },
-    )
-    .await
+    match ended {
+        RunEnd::Reported(completion) => {
+            let CompleteRequest {
+                status,
+                pr_url,
+                fail_reason,
+                message: _,
+                log_tail: _,
+            } = completion;
+            send(
+                stream,
+                &Response::Ended {
+                    status,
+                    pr_url,
+                    fail_reason,
+                },
+            )
+            .await
+        }
+        RunEnd::Unreported { message } => send(stream, &Response::Error { message }).await,
+        RunEnd::Dropped => {
+            send(
+                stream,
+                &Response::Error {
+                    message: "the farm no longer knows this run".to_string(),
+                },
+            )
+            .await
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn socket_of_length(root: &Path, length: usize) -> PathBuf {
+        let name = "daemon.sock";
+        let room = length - root.as_os_str().as_bytes().len() - name.len() - 2;
+        assert!(room > 0, "the temporary directory leaves no room to pad");
+        root.join("d".repeat(room)).join(name)
+    }
+
+    #[tokio::test]
+    async fn a_socket_the_kernel_accepts_binds_through_its_staging_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let path = socket_of_length(root.path(), SOCKET_PATH_MAX - 4);
+        let listener = bind(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, SOCKET_MODE);
+        assert!(!path.parent().unwrap().join(".daemon.sock").exists());
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn a_socket_no_staged_path_fits_is_refused_before_it_is_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let path = socket_of_length(root.path(), SOCKET_PATH_MAX - 1);
+        let refused = bind(&path).unwrap_err();
+        let IpcError::Io(message) = refused else {
+            panic!("a path that cannot be staged is an io failure");
+        };
+        assert!(message.contains("bound"), "{message}");
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().join(".daemon.sock").exists());
+    }
 
     #[tokio::test]
     async fn a_command_survives_the_wire() {
