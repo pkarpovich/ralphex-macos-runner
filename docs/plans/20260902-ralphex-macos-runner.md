@@ -452,11 +452,14 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Modify: `src/lib.rs`
 - Create: `tests/logstream.rs`
 
-- [ ] `LogStream::new(client, run_id, ticker)` with `write(&[u8])`, `push_line(String)`, `subscribe() -> (Vec<String>, broadcast::Receiver<String>)`, `tail() -> String`, `gone()`, `close().await`
-- [ ] flusher task per Technical Details: `seq` starting at 1 and incremented per attempt, `MAX_LOG_CHUNK` pieces, drop on `4xx`, retry per the client, latch `gone` on `410`
-- [ ] the outgoing ring with oldest-drop, the history ring bounded by `HISTORY_LINES` and `HISTORY_BYTES`, the tail bounded by `LOG_TAIL_LINES` and `LOG_TAIL_BYTES`
-- [ ] write tests against the fake farm: 200 KiB written arrives as four chunks with `seq` 1..4; a chunk the fake answers `400` is dropped and the next carries `seq` 3 not 2; the fake rejects a chunk sent with `seq` 0; `410` stops further posts and `gone()` resolves; tail keeps the last 100 lines; 50 lines pushed, **three flush ticks driven**, then `subscribe()` returns all 50 as replay followed by lines pushed afterwards; the history ring drops the oldest line past `HISTORY_LINES`; `close` flushes the remainder
-- [ ] run the gate - must pass before task 5
+- [x] `LogStream::new(client, run_id, ticker)` with `write(&[u8])`, `push_line(String)`, `subscribe() -> (Vec<String>, broadcast::Receiver<String>)`, `tail() -> String`, `gone()`, `close().await`
+- [x] flusher task per Technical Details: `seq` starting at 1 and incremented per attempt, `MAX_LOG_CHUNK` pieces, drop on `4xx`, retry per the client, latch `gone` on `410`
+- [x] the outgoing ring with oldest-drop, the history ring bounded by `HISTORY_LINES` and `HISTORY_BYTES`, the tail bounded by `LOG_TAIL_LINES` and `LOG_TAIL_BYTES`
+- [x] write tests against the fake farm: 200 KiB written arrives as four chunks with `seq` 1..4; a chunk the fake answers `400` is dropped and the next carries `seq` 3 not 2; the fake rejects a chunk sent with `seq` 0; `410` stops further posts and `gone()` resolves; tail keeps the last 100 lines; 50 lines pushed, **three flush ticks driven**, then `subscribe()` returns all 50 as replay followed by lines pushed afterwards; the history ring drops the oldest line past `HISTORY_LINES`; `close` flushes the remainder
+- [x] run the gate - must pass before task 5
+
+➕ The flush cadence is injected through a `Ticker` trait (`IntervalTicker` in production, a `ManualTicker` in `tests/support` whose `TickHandle::drive()` releases one tick and returns only once the flush it triggered is finished), so the tests drive flushes without waiting on a clock.
+⚠️ The `gone` and `close` latches use `watch::Sender::send_replace`, not `send`: `send` fails and leaves the value unchanged when no receiver is alive, which silently lost the `410` latch.
 
 ### Task 5: Spawning and stopping ralphex
 

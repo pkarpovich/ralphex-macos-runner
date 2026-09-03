@@ -5,5 +5,6 @@
 //! local client that opens a ticketless run and streams its output to a
 //! terminal.
 
+pub mod logstream;
 pub mod paths;
 pub mod protocol;
