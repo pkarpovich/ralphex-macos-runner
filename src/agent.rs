@@ -33,7 +33,7 @@ use crate::ipc::RunRequest;
 use crate::job::{self, JobError, JobSpec, LocalOptions, Review, RunningJob};
 use crate::logstream::{IntervalTicker, LogStream, Ticker};
 use crate::pr::{PrSpec, PrTools, PrUrl, RunOrigin, open_pull_request};
-use crate::protocol::client::{FarmClient, FarmError};
+use crate::protocol::client::{FarmClient, FarmError, next_delay};
 use crate::protocol::types::{
     ClaimRequest, CompleteRequest, CompleteStatus, CreatePr, HEARTBEAT_INTERVAL, HeartbeatAction,
     HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest, RETRY_BASE_DELAY, RUNTIME, RunId,
@@ -343,8 +343,12 @@ impl Agent {
     /// a local request that is already waiting for it, because the queue behind
     /// the slot serves its waiters in order, and is then paced like a failed one,
     /// so a farm that answers without holding the poll open cannot turn the loop
-    /// into a spin against it. That pause ends on a shutdown rather than being
-    /// waited out. A job that comes back from a claim
+    /// into a spin against it. A claim that fails is paced the same way, on a
+    /// delay that doubles to the retry ceiling and resets the moment a claim
+    /// succeeds, so a farm that is down or refuses the token is not hammered
+    /// once per retry delay for as long as it stays that way. Either pause ends
+    /// on a shutdown rather than being waited out. A job that comes back from a
+    /// claim
     /// the shutdown overtook is completed as `runner_shutdown` without being
     /// started, because spawning it would burn the whole drain timeout on work
     /// that is killed at its end and would push the exit past the time launchd
@@ -354,6 +358,7 @@ impl Agent {
     pub async fn run(&self, shutdown: watch::Receiver<Shutdown>) -> AgentExit {
         let request = ClaimRequest::native(self.config.name.clone());
         let mut shutdown = shutdown;
+        let mut delay = self.options.claim_retry_delay;
         loop {
             if shutdown.borrow().raised() {
                 return self.drained().await;
@@ -368,13 +373,17 @@ impl Agent {
             self.hold(RunSlot::Polling);
             let claimed = self.client.claim(&request).await;
             let job = match claimed {
-                Ok(Some(job)) => job,
+                Ok(Some(job)) => {
+                    delay = self.options.claim_retry_delay;
+                    job
+                }
                 Ok(None) => {
+                    delay = self.options.claim_retry_delay;
                     self.hold(RunSlot::Free);
                     drop(permit);
-                    tokio::select! {
-                        () = tokio::time::sleep(self.options.claim_retry_delay) => continue,
-                        _raised = raised(&mut shutdown) => return self.drained().await,
+                    match pace(&mut shutdown, self.options.claim_retry_delay).await {
+                        Paced::Continue => continue,
+                        Paced::Shutdown => return self.drained().await,
                     }
                 }
                 Err(error) => {
@@ -386,8 +395,12 @@ impl Agent {
                     drop(permit);
                     let Some(message) = mismatch else {
                         tracing::warn!("the claim failed: {error}");
-                        tokio::time::sleep(self.options.claim_retry_delay).await;
-                        continue;
+                        let paced = pace(&mut shutdown, delay).await;
+                        delay = next_delay(delay);
+                        match paced {
+                            Paced::Continue => continue,
+                            Paced::Shutdown => return self.drained().await,
+                        }
                     };
                     return AgentExit::VersionMismatch { message };
                 }
@@ -834,6 +847,18 @@ async fn running(slot: &mut watch::Receiver<RunSlot>) -> RunId {
         let Ok(()) = slot.changed().await else {
             return RunId(String::new());
         };
+    }
+}
+
+enum Paced {
+    Continue,
+    Shutdown,
+}
+
+async fn pace(shutdown: &mut watch::Receiver<Shutdown>, delay: Duration) -> Paced {
+    tokio::select! {
+        () = tokio::time::sleep(delay) => Paced::Continue,
+        _raised = raised(shutdown) => Paced::Shutdown,
     }
 }
 

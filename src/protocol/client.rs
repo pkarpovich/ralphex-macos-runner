@@ -324,7 +324,20 @@ impl FarmClient {
     }
 }
 
-fn next_delay(delay: Duration) -> Duration {
+/// Returns the delay that follows `delay`, doubling up to [`RETRY_MAX_DELAY`].
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use ralphex_macos_runner::protocol::client::next_delay;
+///
+/// assert_eq!(next_delay(Duration::from_secs(1)), Duration::from_secs(2));
+/// assert_eq!(next_delay(Duration::from_secs(30)), Duration::from_secs(30));
+/// ```
+#[must_use]
+pub fn next_delay(delay: Duration) -> Duration {
     let delay = delay * 2;
     if delay > RETRY_MAX_DELAY {
         return RETRY_MAX_DELAY;

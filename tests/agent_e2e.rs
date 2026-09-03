@@ -4,7 +4,7 @@ mod support;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
@@ -706,6 +706,59 @@ async fn an_empty_claim_paces_the_loop_and_the_pause_ends_on_a_shutdown() {
         1,
         "an empty claim was not paced"
     );
+
+    running.raise.send_replace(Shutdown::Draining);
+    let exit = tokio::time::timeout(Duration::from_secs(5), running.handle).await;
+
+    let Ok(exit) = exit else {
+        panic!("the shutdown waited the pause out");
+    };
+    assert_eq!(exit.unwrap(), AgentExit::Shutdown);
+}
+
+#[tokio::test]
+async fn a_claim_the_farm_refuses_is_paced_on_a_growing_delay() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    farm.always_claim(Reply::Status(401, "bad token".to_string()));
+    let mut options = options(&checkout.tools);
+    options.claim_retry_delay = Duration::from_millis(50);
+    let running = start(agent(&farm, config(&farm, &ralphex), options));
+
+    let started = Instant::now();
+    let polled = wait_for(|| match farm.requests_ending("/claim").len() >= 4 {
+        true => Some(()),
+        false => None,
+    })
+    .await;
+    let elapsed = started.elapsed();
+
+    assert!(polled.is_some(), "the loop stopped polling");
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "a refused claim was retried on a flat delay: four polls in {elapsed:?}"
+    );
+    running.raise.send_replace(Shutdown::Draining);
+    assert_eq!(running.handle.await.unwrap(), AgentExit::Shutdown);
+}
+
+#[tokio::test]
+async fn a_shutdown_ends_the_pause_after_a_refused_claim() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    farm.always_claim(Reply::Status(401, "bad token".to_string()));
+    let mut options = options(&checkout.tools);
+    options.claim_retry_delay = Duration::from_secs(120);
+    let running = start(agent(&farm, config(&farm, &ralphex), options));
+
+    let polled = wait_for(|| match farm.requests_ending("/claim").is_empty() {
+        true => None,
+        false => Some(()),
+    })
+    .await;
+    assert!(polled.is_some(), "the loop never polled");
 
     running.raise.send_replace(Shutdown::Draining);
     let exit = tokio::time::timeout(Duration::from_secs(5), running.handle).await;
