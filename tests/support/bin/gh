@@ -1,0 +1,43 @@
+#!/bin/sh
+set -u
+
+record="${FAKE_RECORD:-}"
+if [ -n "$record" ]; then
+  {
+    echo "cmd: gh"
+    echo "cwd: $(pwd -P)"
+    for arg in "$@"; do
+      printf 'arg: %s\n' "$(printf '%s' "$arg" | tr '\n' ' ')"
+    done
+  } >>"$record"
+fi
+
+key=""
+case "${1:-} ${2:-}" in
+  "pr list") key="list" ;;
+  "pr create") key="create" ;;
+  "repo view") key="repo-view" ;;
+esac
+
+for want in ${FAKE_FAIL:-}; do
+  if [ "$want" = "$key" ]; then
+    echo "fake gh $key failed" >&2
+    exit 1
+  fi
+done
+
+case "$key" in
+  list)
+    if [ -n "${FAKE_EXISTING_PR:-}" ]; then
+      echo "$FAKE_EXISTING_PR"
+    fi
+    ;;
+  create)
+    echo "Creating pull request for the branch"
+    echo ""
+    echo "https://github.com/owner/repo/pull/7"
+    ;;
+  repo-view) echo "main" ;;
+esac
+
+exit 0

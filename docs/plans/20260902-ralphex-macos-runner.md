@@ -492,11 +492,17 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Modify: `tests/support/mod.rs`
 - Create: `tests/pr.rs`
 
-- [ ] `open_pull_request(ctx, PrSpec { branch, title, body }) -> Result<PrUrl, PrError>` running the four-step sequence from Technical Details with `tokio::process::Command`, `PrError::{Push(String), Base(String), Create(String), List(String)}`
-- [ ] title and body builders for a ticket job and for a local run, exactly as specified
-- [ ] the two shims: record `$0 $@` and cwd to the file named by `FAKE_RECORD`; `gh pr list` prints nothing unless `FAKE_EXISTING_PR` is set, in which case it prints that value; `git symbolic-ref` prints `origin/main`; `gh pr create` prints a canned URL; `gh repo view` prints `main`; each fails when `FAKE_FAIL` names its command
-- [ ] write tests: order list -> push -> symbolic-ref -> pr create with the expected flags when no pull request exists; with `FAKE_EXISTING_PR` set the result is that URL, `git push` ran without `-u`, and `gh pr create` did not run; base fallback to `gh repo view` when symbolic-ref fails; each failure maps to its variant; the URL is parsed from the last stdout line; title and body for both run kinds
-- [ ] run the gate - must pass before task 7
+- [x] `open_pull_request(ctx, PrSpec { branch, title, body }) -> Result<PrUrl, PrError>` running the four-step sequence from Technical Details with `tokio::process::Command`, `PrError::{Push(String), Base(String), Create(String), List(String)}`
+- [x] title and body builders for a ticket job and for a local run, exactly as specified
+- [x] the two shims: record `$0 $@` and cwd to the file named by `FAKE_RECORD`; `gh pr list` prints nothing unless `FAKE_EXISTING_PR` is set, in which case it prints that value; `git symbolic-ref` prints `origin/main`; `gh pr create` prints a canned URL; `gh repo view` prints `main`; each fails when `FAKE_FAIL` names its command
+- [x] write tests: order list -> push -> symbolic-ref -> pr create with the expected flags when no pull request exists; with `FAKE_EXISTING_PR` set the result is that URL, `git push` ran without `-u`, and `gh pr create` did not run; base fallback to `gh repo view` when symbolic-ref fails; each failure maps to its variant; the URL is parsed from the last stdout line; title and body for both run kinds
+- [x] run the gate - must pass before task 7
+
+➕ `open_pull_request` takes a third argument, `PrTools { git, gh, env }`, whose `Default` is the `git` and `gh` on the daemon's `PATH` and no extra environment. The shims are addressed by path and configured through `env`, so no test mutates the test process's own environment (`std::env::set_var` is `unsafe` in edition 2024 and the crate carries no `unsafe`).
+➕ `PrError::fail_reason()` maps `Push` to `git_push` and `List`, `Base` and `Create` to `pr_create`, the two names the lifecycle table gives task 7.
+➕ `PrSpec::describe(branch, &RunOrigin, plan, run_id)` is the one builder for both run kinds; `RunOrigin::{Ticket { identifier, issue_url, title }, Local}` decides the title and whether a `Resolves` paragraph appears. A ticket without an issue URL resolves the bare identifier.
+⚠️ `gh pr list --jq '.[0].url'` prints `null` for a branch with no open pull request, so `null` counts as absent alongside an empty answer; treating it as a URL would report `null` as the pull request of every first run.
+⚠️ The shims append one block per invocation (`cmd:`, `cwd:`, one `arg:` per argument, newlines inside an argument turned into spaces) rather than a single `$0 $@` line, because the pull request body is multi-line; `support::invocations` parses the blocks back.
 
 ### Task 7: Agent - the slot, claim, heartbeat, drain, complete
 

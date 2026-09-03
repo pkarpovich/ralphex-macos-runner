@@ -117,6 +117,88 @@ pub fn fake_ralphex() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-ralphex.sh")
 }
 
+/// Returns the path of the stand-in for git.
+#[must_use]
+pub fn fake_git() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/bin/git")
+}
+
+/// Returns the path of the stand-in for the GitHub CLI.
+#[must_use]
+pub fn fake_gh() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/support/bin/gh")
+}
+
+/// One run of a git or GitHub CLI stand-in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invocation {
+    /// The name the stand-in records itself under.
+    pub program: String,
+    /// The working directory the run had, with every symlink resolved.
+    pub cwd: String,
+    /// The arguments the run was given, without the program name.
+    pub args: Vec<String>,
+}
+
+impl Invocation {
+    /// Returns whether the run started with `args`.
+    #[must_use]
+    pub fn starts_with(&self, args: &[&str]) -> bool {
+        if self.args.len() < args.len() {
+            return false;
+        }
+        for (index, expected) in args.iter().enumerate() {
+            if self.args[index] != *expected {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Returns every run the stand-ins recorded in `path`, in order.
+///
+/// # Panics
+///
+/// Panics when the file carries a key no stand-in writes.
+#[must_use]
+pub fn invocations(path: &Path) -> Vec<Invocation> {
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut runs: Vec<Invocation> = Vec::new();
+    for line in contents.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = match value.strip_prefix(' ') {
+            Some(value) => value,
+            None => value,
+        };
+        match key {
+            "cmd" => runs.push(Invocation {
+                program: value.to_string(),
+                cwd: String::new(),
+                args: Vec::new(),
+            }),
+            "cwd" => {
+                let Some(run) = runs.last_mut() else {
+                    continue;
+                };
+                run.cwd = value.to_string();
+            }
+            "arg" => {
+                let Some(run) = runs.last_mut() else {
+                    continue;
+                };
+                run.args.push(value.to_string());
+            }
+            other => panic!("unexpected record key {other}"),
+        }
+    }
+    runs
+}
+
 /// What one run of the fake ralphex saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {

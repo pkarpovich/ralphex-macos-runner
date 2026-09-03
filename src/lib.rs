@@ -8,4 +8,5 @@
 pub mod job;
 pub mod logstream;
 pub mod paths;
+pub mod pr;
 pub mod protocol;
