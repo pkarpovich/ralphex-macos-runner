@@ -712,7 +712,7 @@ async fn a_finished_run_opens_a_pull_request() {
     assert_eq!(pr_url, "https://github.com/owner/repo/pull/7");
     let runs = invocations(&checkout.tools);
     assert!(runs[0].starts_with(&["pr", "list", "--head", "x"]));
-    assert!(runs[1].starts_with(&["push", "-u", "origin", "x"]));
+    assert!(runs[1].starts_with(&["push", "-u", "--", "origin", "x"]));
     assert!(runs[2].starts_with(&["symbolic-ref"]));
     assert!(runs[3].starts_with(&["pr", "create", "--head", "x", "--base", "main"]));
     assert!(

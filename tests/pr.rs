@@ -105,6 +105,7 @@ async fn a_branch_without_a_pull_request_is_pushed_and_opened() {
         vec![
             "push".to_string(),
             "-u".to_string(),
+            "--".to_string(),
             "origin".to_string(),
             "farm-runner".to_string(),
         ]
@@ -123,6 +124,33 @@ async fn a_branch_without_a_pull_request_is_pushed_and_opened() {
     ]));
     assert!(created.args[9].contains("Plan: /abs/checkout/docs/plans/farm-runner.md"));
     assert!(created.args[9].contains("Run: local-1"));
+}
+
+#[tokio::test]
+async fn a_branch_that_looks_like_an_option_stays_an_argument_of_the_push() {
+    let (dir, record) = checkout();
+    let tools = tools(&record);
+    let spec = PrSpec::describe(
+        Branch("--receive-pack=/usr/bin/touch /tmp/pwned".to_string()),
+        &RunOrigin::Local,
+        "/abs/checkout/docs/plans/farm-runner.md",
+        &RunId("local-1".to_string()),
+    );
+
+    open_pull_request(dir.path(), &spec, &tools).await.unwrap();
+
+    let runs = invocations(&record);
+    let pushed = &runs[1];
+    assert_eq!(
+        pushed.args,
+        vec![
+            "push".to_string(),
+            "-u".to_string(),
+            "--".to_string(),
+            "origin".to_string(),
+            "--receive-pack=/usr/bin/touch /tmp/pwned".to_string(),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -146,13 +174,14 @@ async fn an_existing_pull_request_is_updated_and_reported() {
     let runs = invocations(&record);
     assert_eq!(
         programs(&runs),
-        vec!["gh pr list".to_string(), "git push origin".to_string()]
+        vec!["gh pr list".to_string(), "git push --".to_string()]
     );
     let pushed = &runs[1];
     assert_eq!(
         pushed.args,
         vec![
             "push".to_string(),
+            "--".to_string(),
             "origin".to_string(),
             "farm-runner".to_string(),
         ]

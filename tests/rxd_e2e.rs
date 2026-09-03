@@ -573,7 +573,7 @@ async fn a_local_run_that_asks_for_one_opens_a_pull_request() {
     assert!(opened[0].text().contains(r#""create_pr":true"#));
     let runs = invocations(&checkout.tools);
     assert!(runs[0].starts_with(&["pr", "list", "--head", "plan"]));
-    assert!(runs[1].starts_with(&["push", "-u", "origin", "plan"]));
+    assert!(runs[1].starts_with(&["push", "-u", "--", "origin", "plan"]));
     assert!(runs[3].starts_with(&["pr", "create", "--head", "plan", "--base", "main"]));
     assert!(runs[3].args.contains(&"plan".to_string()));
     let CompleteRequest {

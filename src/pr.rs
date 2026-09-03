@@ -218,7 +218,10 @@ impl PrError {
 ///
 /// A branch that already has an open pull request is pushed to update it and
 /// that URL is reported; otherwise the branch is pushed with an upstream, the
-/// base branch is resolved and `gh pr create` opens the pull request.
+/// base branch is resolved and `gh pr create` opens the pull request. Both
+/// pushes place the remote and the branch after `--`, because git parses an
+/// option anywhere in its argument list and a branch named `--receive-pack=…`
+/// would otherwise run a command of the ticket author's choosing on the remote.
 ///
 /// # Errors
 ///
@@ -267,7 +270,15 @@ pub async fn open_pull_request(
     };
 
     if let Some(existing) = existing {
-        match step(ctx, git, &["push", "origin", branch], env, step_timeout).await {
+        match step(
+            ctx,
+            git,
+            &["push", "--", "origin", branch],
+            env,
+            step_timeout,
+        )
+        .await
+        {
             Ok(_pushed) => {}
             Err(message) => return Err(PrError::Push(message)),
         }
@@ -277,7 +288,7 @@ pub async fn open_pull_request(
     match step(
         ctx,
         git,
-        &["push", "-u", "origin", branch],
+        &["push", "-u", "--", "origin", branch],
         env,
         step_timeout,
     )
