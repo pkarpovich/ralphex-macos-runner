@@ -761,6 +761,55 @@ async fn an_interrupted_client_detaches_and_leaves_the_run_going() {
 }
 
 #[tokio::test]
+async fn a_client_interrupted_before_the_run_id_arrives_leaves_with_a_note() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    farm.always_claim(Reply::Hold);
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::Yes).await;
+    let polling = wait_for(|| match farm.requests_ending("/claim").is_empty() {
+        true => None,
+        false => Some(()),
+    })
+    .await;
+    assert!(polling.is_some(), "the claim loop never polled");
+
+    let mut client = rxd(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let mut printed = lines_of(&mut client);
+    let notice = printed.next_line().await.unwrap().unwrap();
+    assert!(notice.contains("waiting for the daemon"), "{notice}");
+    assert!(notice.contains("85 s"), "{notice}");
+    let Some(client_pid) = client.id() else {
+        panic!("the client reported no process id");
+    };
+    kill(
+        Pid::from_raw(i32::try_from(client_pid).unwrap()),
+        Signal::SIGINT,
+    )
+    .unwrap();
+
+    let left = tokio::time::timeout(Duration::from_secs(10), client.wait()).await;
+    let Ok(status) = left else {
+        panic!("the client never left");
+    };
+    let status = status.unwrap();
+
+    assert!(status.success(), "{status}");
+    let mut rest = String::new();
+    while let Ok(Some(line)) = printed.next_line().await {
+        rest.push_str(&line);
+        rest.push('\n');
+    }
+    assert!(
+        rest.contains("detached before the run id arrived"),
+        "{rest}"
+    );
+    assert!(rest.contains("rxd attach"), "{rest}");
+    assert!(farm.requests_ending("/runs").is_empty());
+    daemon.raise.send_replace(Shutdown::Draining);
+}
+
+#[tokio::test]
 async fn a_client_without_a_plan_says_what_it_needs() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[]);

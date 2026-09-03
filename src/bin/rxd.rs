@@ -3,9 +3,14 @@
 //! `rxd <plan>` opens a ticketless run on the farm and streams its output;
 //! `rxd attach` reconnects to a run in progress; `rxd install` and
 //! `rxd uninstall` register and remove the daemon's launchd agent. Ctrl-C only
-//! detaches the terminal: the run keeps going in the daemon.
+//! detaches the terminal: the run keeps going in the daemon. The handler is
+//! installed before the first answer is waited for, because the daemon can hold
+//! that answer for the length of a farm poll and the run it is about to open
+//! must not die with the terminal that asked for it.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -13,13 +18,23 @@ use clap::{Args, Parser, Subcommand};
 use ralphex_macos_runner::ipc::{self, IpcError, Response, RunRequest};
 use ralphex_macos_runner::job::Worktree;
 use ralphex_macos_runner::paths;
-use ralphex_macos_runner::protocol::types::{Branch, CLAIM_WINDOW, CompleteStatus, CreatePr};
+use ralphex_macos_runner::protocol::client::CLAIM_TIMEOUT;
+use ralphex_macos_runner::protocol::types::{Branch, CompleteStatus, CreatePr, REQUEST_TIMEOUT};
 use ralphex_macos_runner::service;
 use tokio::net::UnixStream;
 
 const FORWARDED: &str = "CLAUDE_CONFIG_DIR";
 
 const WAIT_NOTICE: Duration = Duration::from_millis(250);
+
+const HELD: Duration = Duration::from_secs(CLAIM_TIMEOUT.as_secs() + REQUEST_TIMEOUT.as_secs());
+
+type Interrupt = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+enum Notice {
+    Poll,
+    Quiet,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -90,13 +105,13 @@ async fn main() -> ExitCode {
             }
             RunArgsGiven::No => dispatch(command, socket).await,
         },
-        None => start_run(socket, run).await,
+        None => run_plan(socket, run).await,
     }
 }
 
 async fn dispatch(command: Command, socket: Option<PathBuf>) -> ExitCode {
     match command {
-        Command::Attach => attach(socket).await,
+        Command::Attach => session(socket, ipc::Command::Attach, Notice::Quiet).await,
         Command::Install => install().await,
         Command::Uninstall => uninstall().await,
     }
@@ -141,7 +156,7 @@ async fn uninstall() -> ExitCode {
     }
 }
 
-async fn start_run(socket: Option<PathBuf>, run: RunArgs) -> ExitCode {
+async fn run_plan(socket: Option<PathBuf>, run: RunArgs) -> ExitCode {
     let request = match describe(run) {
         Ok(request) => request,
         Err(message) => {
@@ -149,6 +164,10 @@ async fn start_run(socket: Option<PathBuf>, run: RunArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    session(socket, ipc::Command::Run(request), Notice::Poll).await
+}
+
+async fn session(socket: Option<PathBuf>, command: ipc::Command, notice: Notice) -> ExitCode {
     let mut stream = match connect(socket).await {
         Ok(stream) => stream,
         Err(message) => {
@@ -156,20 +175,33 @@ async fn start_run(socket: Option<PathBuf>, run: RunArgs) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let sent = ipc::send(&mut stream, &ipc::Command::Run(request)).await;
+    let sent = ipc::send(&mut stream, &command).await;
     if let Err(error) = sent {
         eprintln!("rxd: {error}");
         return ExitCode::FAILURE;
     }
 
+    let mut interrupted: Interrupt = Box::pin(async {
+        let _signaled = tokio::signal::ctrl_c().await;
+    });
+
     let first = {
         let receiving = ipc::receive::<Response, _>(&mut stream);
         tokio::pin!(receiving);
-        tokio::select! {
-            received = &mut receiving => received,
-            () = tokio::time::sleep(WAIT_NOTICE) => {
-                println!("waiting for the daemon (up to {} s)", CLAIM_WINDOW.as_secs());
-                receiving.await
+        let mut announced = false;
+        loop {
+            tokio::select! {
+                received = &mut receiving => break received,
+                () = &mut interrupted => {
+                    println!(
+                        "detached before the run id arrived; the daemon may still start it - use `rxd attach`"
+                    );
+                    return ExitCode::SUCCESS;
+                }
+                () = tokio::time::sleep(WAIT_NOTICE), if !announced => {
+                    announce(&notice);
+                    announced = true;
+                }
             }
         }
     };
@@ -182,33 +214,17 @@ async fn start_run(socket: Option<PathBuf>, run: RunArgs) -> ExitCode {
     };
     match show(first) {
         Some(code) => code,
-        None => follow(&mut stream).await,
+        None => follow(&mut stream, &mut interrupted).await,
     }
 }
 
-async fn attach(socket: Option<PathBuf>) -> ExitCode {
-    let mut stream = match connect(socket).await {
-        Ok(stream) => stream,
-        Err(message) => {
-            eprintln!("rxd: {message}");
-            return ExitCode::FAILURE;
-        }
-    };
-    let sent = ipc::send(&mut stream, &ipc::Command::Attach).await;
-    if let Err(error) = sent {
-        eprintln!("rxd: {error}");
-        return ExitCode::FAILURE;
-    }
-    let first = match ipc::receive::<Response, _>(&mut stream).await {
-        Ok(response) => response,
-        Err(error) => {
-            eprintln!("rxd: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    match show(first) {
-        Some(code) => code,
-        None => follow(&mut stream).await,
+fn announce(notice: &Notice) {
+    match notice {
+        Notice::Poll => println!(
+            "waiting for the daemon to finish its farm poll (this can take up to {} s)",
+            HELD.as_secs()
+        ),
+        Notice::Quiet => {}
     }
 }
 
@@ -246,11 +262,11 @@ fn show(response: Response) -> Option<ExitCode> {
     }
 }
 
-async fn follow(stream: &mut UnixStream) -> ExitCode {
+async fn follow(stream: &mut UnixStream, interrupted: &mut Interrupt) -> ExitCode {
     loop {
         let received = tokio::select! {
             received = ipc::receive::<Response, _>(stream) => received,
-            _interrupted = tokio::signal::ctrl_c() => {
+            () = &mut *interrupted => {
                 println!("detached; the run continues");
                 return ExitCode::SUCCESS;
             }

@@ -57,11 +57,11 @@ rxd uninstall
 - The checkout is the current directory, the plan is made absolute against it, and the branch defaults to the plan file's stem. A pull request is opened unless `--no-pr`.
 - `--worktree` is passed straight to ralphex, which then works in a git worktree of the checkout instead of the checkout itself. A claimed job never gets it.
 - `rxd` prints `run <run_id>` and the dashboard URL before the first output line, so you can leave immediately.
-- Ctrl-C prints `detached; the run continues` and exits 0. `rxd attach` reconnects, replays what has already been printed and then follows live; several terminals may attach at once.
+- Ctrl-C prints `detached; the run continues` and exits 0. Before the run id has arrived it says so instead and still exits 0 - the daemon may go on to start the run, which `rxd attach` then reaches. `rxd attach` reconnects, replays what has already been printed and then follows live; several terminals may attach at once.
 - Staying attached to the end exits 0 for `done` and 1 for `error`.
 - `CLAUDE_CONFIG_DIR` is forwarded from your environment when set, so a run started from a work shell uses the work Claude profile.
 
-When the daemon is inside a claim long-poll, `rxd` prints `waiting for the daemon (up to 25 s)` and waits for the poll to return; nothing is aborted, so no job the farm dispatched can be lost. If the poll returns a job - or a run is already going - `rxd` reports the running run id and exits 1.
+When the daemon is inside a claim long-poll, `rxd` prints `waiting for the daemon to finish its farm poll (this can take up to 85 s)` and waits for the poll to return; nothing is aborted, so no job the farm dispatched can be lost. If the poll returns a job - or a run is already going - `rxd` reports the running run id and exits 1.
 
 The daemon runs ralphex in the checkout **as it is**: nothing is cloned, fetched, reset or cleaned, and the checkout is left on the feature branch afterwards, exactly like a run by hand.
 

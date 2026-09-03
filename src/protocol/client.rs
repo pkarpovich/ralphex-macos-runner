@@ -18,7 +18,8 @@ use crate::protocol::types::{
     RETRY_MAX_DELAY, RunId, Seq,
 };
 
-const CLAIM_TIMEOUT: Duration = Duration::from_secs(CLAIM_WINDOW.as_secs() + 30);
+/// The time a claim long-poll may take, the farm's window plus a margin.
+pub const CLAIM_TIMEOUT: Duration = Duration::from_secs(CLAIM_WINDOW.as_secs() + 30);
 
 const MAX_BODY_BYTES: usize = 65536;
 
