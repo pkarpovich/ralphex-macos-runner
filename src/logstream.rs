@@ -53,6 +53,17 @@ enum Phase {
     Closing,
 }
 
+fn clamp(line: &str, max_bytes: usize) -> &str {
+    if line.len() <= max_bytes {
+        return line;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
+}
+
 struct Ring {
     lines: VecDeque<String>,
     bytes: usize,
@@ -71,6 +82,7 @@ impl Ring {
     }
 
     fn push(&mut self, line: &str) {
+        let line = clamp(line, self.max_bytes);
         self.lines.push_back(line.to_string());
         self.bytes += line.len();
         loop {
@@ -351,6 +363,22 @@ mod tests {
             ring.snapshot(),
             vec!["bbbbb".to_string(), "ccccc".to_string()]
         );
+    }
+
+    #[test]
+    fn a_line_over_the_byte_bound_is_kept_truncated_instead_of_emptying_the_ring() {
+        let mut ring = Ring::new(100, 10);
+        ring.push("aaaaa");
+        ring.push(&"b".repeat(64));
+        assert_eq!(ring.snapshot(), vec!["b".repeat(10)]);
+        assert_eq!(ring.joined(), "b".repeat(10));
+    }
+
+    #[test]
+    fn a_truncated_line_ends_on_a_character_boundary() {
+        let mut ring = Ring::new(100, 4);
+        ring.push("aé\u{fffd}");
+        assert_eq!(ring.snapshot(), vec!["aé".to_string()]);
     }
 
     #[test]

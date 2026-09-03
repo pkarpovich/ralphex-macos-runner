@@ -8,8 +8,10 @@ use std::time::Duration;
 
 use nix::sys::signal::kill;
 use nix::unistd::Pid;
-use ralphex_macos_runner::agent::{Agent, AgentExit, AgentOptions, RunSlot};
+use ralphex_macos_runner::agent::{Agent, AgentExit, AgentOptions, LocalStart, RunSlot};
 use ralphex_macos_runner::config::Config;
+use ralphex_macos_runner::ipc::RunRequest;
+use ralphex_macos_runner::job::Worktree;
 use ralphex_macos_runner::pr::PrTools;
 use ralphex_macos_runner::protocol::client::FarmClient;
 use ralphex_macos_runner::protocol::types::{
@@ -592,6 +594,42 @@ async fn a_job_claimed_during_a_shutdown_is_completed_without_being_started() {
         !checkout.record.exists(),
         "ralphex was started for a job claimed during a shutdown"
     );
+}
+
+#[tokio::test]
+async fn a_local_run_asked_for_during_a_shutdown_is_refused_without_opening_one() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    farm.always_claim(Reply::Hold);
+    let agent = Arc::new(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(&checkout.tools),
+    ));
+    let (raise, shutdown) = watch::channel(true);
+
+    let started = agent
+        .start_local(
+            RunRequest {
+                ctx: checkout.path().display().to_string(),
+                plan: checkout.plan.display().to_string(),
+                branch: Branch("x".to_string()),
+                create_pr: CreatePr::No,
+                worktree: Worktree::No,
+                env: Vec::new(),
+            },
+            shutdown,
+        )
+        .await;
+
+    let LocalStart::Refused { message } = started else {
+        panic!("the run was not refused");
+    };
+    assert!(message.contains("shutting down"), "{message}");
+    assert!(farm.requests_ending("/runs").is_empty());
+    assert!(!checkout.record.exists(), "ralphex was started anyway");
+    drop(raise);
 }
 
 #[tokio::test]

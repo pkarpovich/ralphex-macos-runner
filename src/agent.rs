@@ -313,8 +313,10 @@ impl Agent {
     ///
     /// A request that arrives while a claim is in flight waits for that claim to
     /// return; a request that arrives while a run holds the slot is answered
-    /// [`LocalStart::Busy`] at once. The run outlives the client that asked for
-    /// it.
+    /// [`LocalStart::Busy`] at once. A request that reaches the slot after a
+    /// shutdown was raised is answered [`LocalStart::Refused`] without a run
+    /// being opened at the farm, for the reason the claim path refuses a job it
+    /// claimed during a shutdown. The run outlives the client that asked for it.
     ///
     /// # Panics
     ///
@@ -328,6 +330,12 @@ impl Agent {
             Ok(permit) => permit,
             Err(run_id) => return LocalStart::Busy { run_id },
         };
+        if *shutdown.borrow() {
+            drop(permit);
+            return LocalStart::Refused {
+                message: "the runner is shutting down".to_string(),
+            };
+        }
         self.hold(RunSlot::Opening);
         let RunRequest {
             ctx,

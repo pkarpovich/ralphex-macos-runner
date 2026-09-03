@@ -70,6 +70,9 @@ pub const LOG_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The grace between the `SIGTERM` and the `SIGKILL` of a stopped process group.
 pub const STOP_GRACE: Duration = Duration::from_secs(10);
 
+/// The time the git that inspects a checkout may take before it is killed.
+pub const VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The time one step of the pull-request sequence may take before it is killed.
 pub const PR_STEP_TIMEOUT: Duration = Duration::from_secs(120);
 

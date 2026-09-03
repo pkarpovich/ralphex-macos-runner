@@ -19,7 +19,7 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
 use crate::logstream::LogStream;
-use crate::protocol::types::{Branch, MAX_LOG_CHUNK};
+use crate::protocol::types::{Branch, MAX_LOG_CHUNK, VALIDATE_TIMEOUT};
 
 /// Whether ralphex runs in review mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,10 +138,14 @@ impl JobError {
 
 /// Checks that the checkout is a git checkout and the plan lies inside it.
 ///
+/// The git it runs is killed at [`VALIDATE_TIMEOUT`], because it holds the run
+/// slot before the terminal channel exists and a checkout on an unresponsive
+/// mount would otherwise wedge the slot and the shutdown behind it.
+///
 /// # Errors
 ///
 /// Returns [`JobError::CtxInvalid`] when `ctx` does not resolve to a directory
-/// in which `git rev-parse --git-dir` succeeds, and
+/// in which `git rev-parse --git-dir` succeeds within [`VALIDATE_TIMEOUT`], and
 /// [`JobError::PlanNotFound`] when the plan does not resolve to a path under
 /// `ctx`.
 pub async fn validate(spec: &JobSpec) -> Result<(), JobError> {
@@ -165,15 +169,22 @@ pub async fn validate(spec: &JobSpec) -> Result<(), JobError> {
             ctx.display()
         )));
     }
-    let inspected = Command::new("git")
-        .arg("rev-parse")
-        .arg("--git-dir")
-        .current_dir(&ctx)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+    let mut command = Command::new("git");
+    command.arg("rev-parse");
+    command.arg("--git-dir");
+    command.current_dir(&ctx);
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+    command.kill_on_drop(true);
+    let inspected = tokio::time::timeout(VALIDATE_TIMEOUT, command.status()).await;
+    let Ok(inspected) = inspected else {
+        return Err(JobError::CtxInvalid(format!(
+            "git was killed after {} seconds in {}",
+            VALIDATE_TIMEOUT.as_secs(),
+            ctx.display()
+        )));
+    };
     let Ok(inspected) = inspected else {
         return Err(JobError::CtxInvalid(format!(
             "git could not be run in {}",
