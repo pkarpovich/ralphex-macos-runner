@@ -68,7 +68,7 @@ Load each skill below with the Skill tool and follow its conventions before impl
 
 **Host facts that shape defaults:** `ralphex` is `/opt/homebrew/bin/ralphex` (v1.6.1); `gh` is `/opt/homebrew/bin/gh` (2.98); `ruby` is the system 2.6 (enough for `ruby -c`); `actionlint` is not installed but is in mise's registry; the personal ralphex config is `~/.config/ralphex` with `finalize_enabled` at its default `false`; the farm URL and runner token live in the operator's environment repository, not in this one.
 
-**Dependencies (add with `cargo add`, versions resolved at that moment and pinned by `Cargo.lock`; none are stated here from memory):** `tokio` (`rt-multi-thread`, `macros`, `process`, `signal`, `sync`, `time`, `net`, `io-util`), `reqwest` (`json`, `rustls-tls`, default features off), `serde` (`derive`), `serde_json`, `toml`, `clap` (`derive`), `thiserror`, `tracing`, `tracing-subscriber` (`env-filter`), `dirs`, `nix` (`signal`, `process`). Dev: `axum` (the fake farm), `tempfile`.
+**Dependencies (add with `cargo add`, versions resolved at that moment and pinned by `Cargo.lock`; none are stated here from memory):** `tokio` (`rt-multi-thread`, `macros`, `process`, `signal`, `sync`, `time`, `net`, `io-util`), `reqwest` (`json`, `rustls`, default features off), `serde` (`derive`), `serde_json`, `toml`, `clap` (`derive`), `thiserror`, `tracing`, `tracing-subscriber` (`env-filter`), `dirs`, `nix` (`signal`, `process`). Dev: `axum` (the fake farm), `tempfile`.
 
 ## Development Approach
 
@@ -400,14 +400,17 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Modify: `.gitignore` (keep the existing `.revmux/` and `target/` lines)
 - Create: `tests/smoke.rs`
 
-- [ ] `cargo init --lib` in the repository root; declare the two `[[bin]]` targets; add the dependencies listed in Context with `cargo add` (runtime and dev separately)
-- [ ] `mise.toml`: `[tools]` pinning `rust` to the current stable (`mise use rust@latest`) and `actionlint`; a `check` task running `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `actionlint`
-- [ ] `src/paths.rs` with the profile-dependent paths from Technical Details; `lib.rs` declares it
-- [ ] `clap` skeletons: the daemon takes `--config <path>` defaulting to `paths::config_path()`; `rxd` has the four subcommands as no-ops that print what they would do
-- [ ] `ci.yml`: checkout, `jdx/mise-action`, `Swatinem/rust-cache`, `mise run check`
-- [ ] write unit tests for `paths`: release and debug profiles give different application directories, every path is under the expected root
-- [ ] write `tests/smoke.rs`: both binaries answer `--help` with exit 0 and mention their own name
-- [ ] run the gate - must pass before task 2
+- [x] `cargo init --lib` in the repository root; declare the two `[[bin]]` targets; add the dependencies listed in Context with `cargo add` (runtime and dev separately)
+- [x] `mise.toml`: `[tools]` pinning `rust` to the current stable (`mise use rust@latest`) and `actionlint`; a `check` task running `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `actionlint`
+- [x] `src/paths.rs` with the profile-dependent paths from Technical Details; `lib.rs` declares it
+- [x] `clap` skeletons: the daemon takes `--config <path>` defaulting to `paths::config_path()`; `rxd` has the four subcommands as no-ops that print what they would do
+- [x] `ci.yml`: checkout, `jdx/mise-action`, `Swatinem/rust-cache`, `mise run check`
+- [x] write unit tests for `paths`: release and debug profiles give different application directories, every path is under the expected root
+- [x] write `tests/smoke.rs`: both binaries answer `--help` with exit 0 and mention their own name
+- [x] run the gate - must pass before task 2
+
+➕ `rust` is pinned to `1.98.0` with the `rustfmt` and `clippy` components, `actionlint` to `1.7.12`.
+⚠️ `reqwest` 0.13 renamed its TLS feature: the crate uses `features = ["json", "rustls"]` with default features off, not the `rustls-tls` named in Context. The Context line below is corrected to match.
 
 ### Task 2: Protocol types and conformance vectors
 
@@ -416,11 +419,13 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Modify: `src/lib.rs`
 - Create: `tests/protocol_vectors.rs`
 
-- [ ] define every type and constant from Technical Details with `serde` derives; `repos`/`ready` as `Option<Vec<_>>` with `#[serde(default)]`; newtypes `RunId`, `Seq`, `RunnerName`, `Branch` with transparent serde
-- [ ] `ClaimRequest::native(name)` and `HeartbeatRequest::native(name)` constructors producing `Some(vec![])` for the slices, `image: ""`, `slots: SLOTS`, `runtime: RUNTIME`, `version: VERSION`
-- [ ] transcribe every vector from "Conformance vectors" into `tests/protocol_vectors.rs`; each test deserialises the vector, re-serialises, and asserts equality of the two `serde_json::Value`s
-- [ ] write unit tests: the native constructors serialise `repos` and `ready` as `[]`; a `null` in either deserialises to `None`; a missing key deserialises to `None`
-- [ ] run the gate - must pass before task 3
+- [x] define every type and constant from Technical Details with `serde` derives; `repos`/`ready` as `Option<Vec<_>>` with `#[serde(default)]`; newtypes `RunId`, `Seq`, `RunnerName`, `Branch` with transparent serde
+- [x] `ClaimRequest::native(name)` and `HeartbeatRequest::native(name)` constructors producing `Some(vec![])` for the slices, `image: ""`, `slots: SLOTS`, `runtime: RUNTIME`, `version: VERSION`
+- [x] transcribe every vector from "Conformance vectors" into `tests/protocol_vectors.rs`; each test deserialises the vector, re-serialises, and asserts equality of the two `serde_json::Value`s
+- [x] write unit tests: the native constructors serialise `repos` and `ready` as `[]`; a `null` in either deserialises to `None`; a missing key deserialises to `None`
+- [x] run the gate - must pass before task 3
+
+➕ `create_pr` is the `CreatePr::{Yes, No}` enum from the Code-Quality Rules, encoded as a JSON boolean through `#[serde(from = "bool", into = "bool")]`; `action` and `status` are the enums `HeartbeatAction` and `CompleteStatus` with lowercase serde renaming. Every other wire field stays a `String`, an integer or one of the four newtypes.
 
 ### Task 3: Farm client with per-call retry and status mapping
 
@@ -430,12 +435,15 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Create: `tests/support/mod.rs`, `tests/support/fake_farm.rs`
 - Create: `tests/client.rs`
 
-- [ ] `FarmClient::new(farm_url, token, sleeper)`; methods `claim`, `open_run`, `append_log(run_id, seq, bytes)`, `heartbeat`, `complete`, each returning `Result<_, FarmError>` where `FarmError` is `{ Gone, VersionMismatch { message: String }, BadRequest(String), Rejected(u16, String), Transport(String), Decode(String) }`
-- [ ] the per-operation retry table from Behavioural rule 1, with the sleeper injected (`Sleeper` trait, tokio-backed in production, instant-and-recording in tests) and a clock for `COMPLETE_BUDGET`
-- [ ] `claim` returns `Ok(None)` on `204`; `409` decodes the `error` field into `VersionMismatch` (raw body when the field is absent); `410` to `Gone`; other `4xx` to `Rejected` or `BadRequest` for `400`; `5xx` and transport errors follow the table
-- [ ] `tests/support/fake_farm.rs`: an `axum` server on an ephemeral port with a scripted response queue per route, a hold-until-released claim, the farm's `seq` rule on the log route, and a recorder of `(path, headers, body)`; a helper to start it and get its URL
-- [ ] write tests: bearer header on every call; `204` claim; job decode; `409` on claim and on heartbeat carries the fake's message verbatim; `410`; `append_log` on `500,500,200` succeeds on the third attempt with two recorded sleeps; `append_log` gives up after 6 attempts of `500`; `complete` is still retrying at attempt 10 and stops when the clock passes `COMPLETE_BUDGET`; `complete` stops on `410`; `open_run` on `500` fails at once with exactly one recorded request; a non-`410` `4xx` on log does not retry
-- [ ] run the gate - must pass before task 4
+- [x] `FarmClient::new(farm_url, token, sleeper)`; methods `claim`, `open_run`, `append_log(run_id, seq, bytes)`, `heartbeat`, `complete`, each returning `Result<_, FarmError>` where `FarmError` is `{ Gone, VersionMismatch { message: String }, BadRequest(String), Rejected(u16, String), Transport(String), Decode(String) }`
+- [x] the per-operation retry table from Behavioural rule 1, with the sleeper injected (`Sleeper` trait, tokio-backed in production, instant-and-recording in tests) and a clock for `COMPLETE_BUDGET`
+- [x] `claim` returns `Ok(None)` on `204`; `409` decodes the `error` field into `VersionMismatch` (raw body when the field is absent); `410` to `Gone`; other `4xx` to `Rejected` or `BadRequest` for `400`; `5xx` and transport errors follow the table
+- [x] `tests/support/fake_farm.rs`: an `axum` server on an ephemeral port with a scripted response queue per route, a hold-until-released claim, the farm's `seq` rule on the log route, and a recorder of `(path, headers, body)`; a helper to start it and get its URL
+- [x] write tests: bearer header on every call; `204` claim; job decode; `409` on claim and on heartbeat carries the fake's message verbatim; `410`; `append_log` on `500,500,200` succeeds on the third attempt with two recorded sleeps; `append_log` gives up after 6 attempts of `500`; `complete` is still retrying at attempt 10 and stops when the clock passes `COMPLETE_BUDGET`; `complete` stops on `410`; `open_run` on `500` fails at once with exactly one recorded request; a non-`410` `4xx` on log does not retry
+- [x] run the gate - must pass before task 4
+
+➕ The `Sleeper` trait carries both `sleep` and `now`, so one injected object serves the backoff and the `COMPLETE_BUDGET` clock; the test double advances its own clock by every delay it is asked for.
+➕ The fake farm's per-route script is a queue plus an optional sticky reply the route falls back to once the queue is empty, which is how a test asks for "answer `500` until I stop asking".
 
 ### Task 4: Log pipeline
 
@@ -444,11 +452,14 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Modify: `src/lib.rs`
 - Create: `tests/logstream.rs`
 
-- [ ] `LogStream::new(client, run_id, ticker)` with `write(&[u8])`, `push_line(String)`, `subscribe() -> (Vec<String>, broadcast::Receiver<String>)`, `tail() -> String`, `gone()`, `close().await`
-- [ ] flusher task per Technical Details: `seq` starting at 1 and incremented per attempt, `MAX_LOG_CHUNK` pieces, drop on `4xx`, retry per the client, latch `gone` on `410`
-- [ ] the outgoing ring with oldest-drop, the history ring bounded by `HISTORY_LINES` and `HISTORY_BYTES`, the tail bounded by `LOG_TAIL_LINES` and `LOG_TAIL_BYTES`
-- [ ] write tests against the fake farm: 200 KiB written arrives as four chunks with `seq` 1..4; a chunk the fake answers `400` is dropped and the next carries `seq` 3 not 2; the fake rejects a chunk sent with `seq` 0; `410` stops further posts and `gone()` resolves; tail keeps the last 100 lines; 50 lines pushed, **three flush ticks driven**, then `subscribe()` returns all 50 as replay followed by lines pushed afterwards; the history ring drops the oldest line past `HISTORY_LINES`; `close` flushes the remainder
-- [ ] run the gate - must pass before task 5
+- [x] `LogStream::new(client, run_id, ticker)` with `write(&[u8])`, `push_line(String)`, `subscribe() -> (Vec<String>, broadcast::Receiver<String>)`, `tail() -> String`, `gone()`, `close().await`
+- [x] flusher task per Technical Details: `seq` starting at 1 and incremented per attempt, `MAX_LOG_CHUNK` pieces, drop on `4xx`, retry per the client, latch `gone` on `410`
+- [x] the outgoing ring with oldest-drop, the history ring bounded by `HISTORY_LINES` and `HISTORY_BYTES`, the tail bounded by `LOG_TAIL_LINES` and `LOG_TAIL_BYTES`
+- [x] write tests against the fake farm: 200 KiB written arrives as four chunks with `seq` 1..4; a chunk the fake answers `400` is dropped and the next carries `seq` 3 not 2; the fake rejects a chunk sent with `seq` 0; `410` stops further posts and `gone()` resolves; tail keeps the last 100 lines; 50 lines pushed, **three flush ticks driven**, then `subscribe()` returns all 50 as replay followed by lines pushed afterwards; the history ring drops the oldest line past `HISTORY_LINES`; `close` flushes the remainder
+- [x] run the gate - must pass before task 5
+
+➕ The flush cadence is injected through a `Ticker` trait (`IntervalTicker` in production, a `ManualTicker` in `tests/support` whose `TickHandle::drive()` releases one tick and returns only once the flush it triggered is finished), so the tests drive flushes without waiting on a clock.
+⚠️ The `gone` and `close` latches use `watch::Sender::send_replace`, not `send`: `send` fails and leaves the value unchanged when no receiver is alive, which silently lost the `410` latch.
 
 ### Task 5: Spawning and stopping ralphex
 
@@ -459,12 +470,18 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Modify: `tests/support/mod.rs`
 - Create: `tests/job.rs`
 
-- [ ] `JobSpec { ctx, plan, branch, review: Review, local: LocalOptions, ralphex_bin }` with `LocalOptions { worktree: Worktree, env: Vec<(String, String)> }` and `validate(&JobSpec) -> Result<(), JobError>` implementing the ctx and plan checks from the lifecycle table
-- [ ] `spawn(spec, log: &LogStream) -> Result<RunningJob, JobError>` building the argv and environment from Technical Details, `stdin` null, `process_group(0)`, one task per pipe reading 64 KiB chunks into `write` and a capped line assembler into `push_line`
-- [ ] `RunningJob::wait() -> ExitStatus` and `RunningJob::stop(grace).await` doing `SIGTERM` group, the grace, `SIGKILL` group
-- [ ] `fake-ralphex.sh`: prints `FAKE_RALPHEX_LINES` lines alternating stdout/stderr, prints one unbroken line of `FAKE_RALPHEX_LONG_LINE` bytes when set, records its argv, cwd and full environment to `FAKE_RALPHEX_RECORD`, spawns a sleeping child when `FAKE_RALPHEX_CHILD` is set, sleeps `FAKE_RALPHEX_SLEEP` seconds, exits `FAKE_RALPHEX_EXIT`
-- [ ] write tests: argv contains `--branch x` and the plan path and, when asked, `--worktree` and `--review`; cwd is `ctx`; an entry in `LocalOptions.env` reaches the recorded environment; stdout and stderr both reach the log stream; exit code propagates; a 1 MiB unbroken line reaches the farm buffer in chunks and the subscribers as lines no longer than 64 KiB; a sleeping fake with a child is stopped with both processes gone within the grace; a missing ctx and a plan outside ctx fail validation with the named error
-- [ ] run the gate - must pass before task 6
+- [x] `JobSpec { ctx, plan, branch, review: Review, local: LocalOptions, ralphex_bin }` with `LocalOptions { worktree: Worktree, env: Vec<(String, String)> }` and `validate(&JobSpec) -> Result<(), JobError>` implementing the ctx and plan checks from the lifecycle table
+- [x] `spawn(spec, log: &LogStream) -> Result<RunningJob, JobError>` building the argv and environment from Technical Details, `stdin` null, `process_group(0)`, one task per pipe reading 64 KiB chunks into `write` and a capped line assembler into `push_line`
+- [x] `RunningJob::wait() -> ExitStatus` and `RunningJob::stop(grace).await` doing `SIGTERM` group, the grace, `SIGKILL` group
+- [x] `fake-ralphex.sh`: prints `FAKE_RALPHEX_LINES` lines alternating stdout/stderr, prints one unbroken line of `FAKE_RALPHEX_LONG_LINE` bytes when set, records its argv, cwd and full environment to `FAKE_RALPHEX_RECORD`, spawns a sleeping child when `FAKE_RALPHEX_CHILD` is set, sleeps `FAKE_RALPHEX_SLEEP` seconds, exits `FAKE_RALPHEX_EXIT`
+- [x] write tests: argv contains `--branch x` and the plan path and, when asked, `--worktree` and `--review`; cwd is `ctx`; an entry in `LocalOptions.env` reaches the recorded environment; stdout and stderr both reach the log stream; exit code propagates; a 1 MiB unbroken line reaches the farm buffer in chunks and the subscribers as lines no longer than 64 KiB; a sleeping fake with a child is stopped with both processes gone within the grace; a missing ctx and a plan outside ctx fail validation with the named error
+- [x] run the gate - must pass before task 6
+
+➕ `spawn` takes `Arc<LogStream>`, not `&LogStream`: the two pipe readers are `tokio::spawn`ed tasks and need an owned `'static` handle on the stream.
+➕ `validate` is `async` because the ctx check runs `git rev-parse --git-dir` through `tokio::process`.
+➕ `wait` and `stop` return `Result<ExitStatus, JobError>` with a `JobError::Wait` variant rather than a bare `ExitStatus`, so an unwaitable child is reported instead of panicking; `Wait` reuses the `spawn_failed` fail reason. Both drain the pipe readers before returning, so no output is lost between the exit and the completion.
+➕ The line assembler emits a line whenever the pending bytes reach `MAX_LOG_CHUNK`, so an unbroken 1 MiB line becomes 16 capped lines plus the empty remainder its newline closes.
+⚠️ The fake records `pwd -P`, not `pwd`: a child inherits the daemon's `PWD`, so only the physical path can be compared against a canonicalised `ctx`. Its background child redirects both pipes to `/dev/null`, otherwise a reparented grandchild would hold the pipe open and the reader drain would never see EOF.
 
 ### Task 6: Pull request
 
@@ -475,11 +492,17 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Modify: `tests/support/mod.rs`
 - Create: `tests/pr.rs`
 
-- [ ] `open_pull_request(ctx, PrSpec { branch, title, body }) -> Result<PrUrl, PrError>` running the four-step sequence from Technical Details with `tokio::process::Command`, `PrError::{Push(String), Base(String), Create(String), List(String)}`
-- [ ] title and body builders for a ticket job and for a local run, exactly as specified
-- [ ] the two shims: record `$0 $@` and cwd to the file named by `FAKE_RECORD`; `gh pr list` prints nothing unless `FAKE_EXISTING_PR` is set, in which case it prints that value; `git symbolic-ref` prints `origin/main`; `gh pr create` prints a canned URL; `gh repo view` prints `main`; each fails when `FAKE_FAIL` names its command
-- [ ] write tests: order list -> push -> symbolic-ref -> pr create with the expected flags when no pull request exists; with `FAKE_EXISTING_PR` set the result is that URL, `git push` ran without `-u`, and `gh pr create` did not run; base fallback to `gh repo view` when symbolic-ref fails; each failure maps to its variant; the URL is parsed from the last stdout line; title and body for both run kinds
-- [ ] run the gate - must pass before task 7
+- [x] `open_pull_request(ctx, PrSpec { branch, title, body }) -> Result<PrUrl, PrError>` running the four-step sequence from Technical Details with `tokio::process::Command`, `PrError::{Push(String), Base(String), Create(String), List(String)}`
+- [x] title and body builders for a ticket job and for a local run, exactly as specified
+- [x] the two shims: record `$0 $@` and cwd to the file named by `FAKE_RECORD`; `gh pr list` prints nothing unless `FAKE_EXISTING_PR` is set, in which case it prints that value; `git symbolic-ref` prints `origin/main`; `gh pr create` prints a canned URL; `gh repo view` prints `main`; each fails when `FAKE_FAIL` names its command
+- [x] write tests: order list -> push -> symbolic-ref -> pr create with the expected flags when no pull request exists; with `FAKE_EXISTING_PR` set the result is that URL, `git push` ran without `-u`, and `gh pr create` did not run; base fallback to `gh repo view` when symbolic-ref fails; each failure maps to its variant; the URL is parsed from the last stdout line; title and body for both run kinds
+- [x] run the gate - must pass before task 7
+
+➕ `open_pull_request` takes a third argument, `PrTools { git, gh, env }`, whose `Default` is the `git` and `gh` on the daemon's `PATH` and no extra environment. The shims are addressed by path and configured through `env`, so no test mutates the test process's own environment (`std::env::set_var` is `unsafe` in edition 2024 and the crate carries no `unsafe`).
+➕ `PrError::fail_reason()` maps `Push` to `git_push` and `List`, `Base` and `Create` to `pr_create`, the two names the lifecycle table gives task 7.
+➕ `PrSpec::describe(branch, &RunOrigin, plan, run_id)` is the one builder for both run kinds; `RunOrigin::{Ticket { identifier, issue_url, title }, Local}` decides the title and whether a `Resolves` paragraph appears. A ticket without an issue URL resolves the bare identifier.
+⚠️ `gh pr list --jq '.[0].url'` prints `null` for a branch with no open pull request, so `null` counts as absent alongside an empty answer; treating it as a URL would report `null` as the pull request of every first run.
+⚠️ The shims append one block per invocation (`cmd:`, `cwd:`, one `arg:` per argument, newlines inside an argument turned into spaces) rather than a single `$0 $@` line, because the pull request body is multi-line; `support::invocations` parses the blocks back.
 
 ### Task 7: Agent - the slot, claim, heartbeat, drain, complete
 
@@ -488,12 +511,19 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Modify: `src/lib.rs`, `src/paths.rs`, `src/bin/ralphex-macos-runner.rs`
 - Create: `tests/agent_e2e.rs`
 
-- [ ] `config.rs`: the schema from Technical Details, defaults, the three required fields, the permission warning
-- [ ] `Agent::new(config, client, AgentOptions { heartbeat_interval, drain_timeout, stop_grace, ticker })` so every interval is injectable; `run(shutdown: watch::Receiver<bool>) -> AgentExit`
-- [ ] the `RunSlot` state machine from Key decisions and `run_job(job, local)` selecting on process exit and the `Terminal` channel, with every row of the lifecycle table; the heartbeat task beating once immediately then every interval, translating `cancel`, `410` and `409` into `Terminal` events; `runtime_mismatch` refusal before spawn; drain on shutdown
-- [ ] the daemon `main`: load config, build the client, spawn the signal task flipping the `watch`, run the agent, exit 2 on `AgentExit::VersionMismatch`
-- [ ] write `tests/agent_e2e.rs` against the fake farm and fake ralphex, with millisecond intervals: a claimed job runs to `done` with the fake's output on the farm and a `complete` recorded; the very first heartbeat arrives before the first flush; exit 3 completes as `nonzero_exit` with a tail; `cancel` on heartbeat stops the process and completes `canceled`; a job with `runtime: container` completes `runtime_mismatch` without spawning; `409` on claim ends the agent with `VersionMismatch`; `409` on heartbeat with a running fake stops its process group and ends the agent with `VersionMismatch`; `410` on heartbeat kills the job and posts no `complete`; `410` on a log chunk leaves the job running and it still completes `done`; a second job is not claimed while one runs; shutdown during a run completes `runner_shutdown` after the drain timeout
-- [ ] run the gate - must pass before task 8
+- [x] `config.rs`: the schema from Technical Details, defaults, the three required fields, the permission warning
+- [x] `Agent::new(config, client, AgentOptions { heartbeat_interval, drain_timeout, stop_grace, ticker })` so every interval is injectable; `run(shutdown: watch::Receiver<bool>) -> AgentExit`
+- [x] the `RunSlot` state machine from Key decisions and `run_job(job, local)` selecting on process exit and the `Terminal` channel, with every row of the lifecycle table; the heartbeat task beating once immediately then every interval, translating `cancel`, `410` and `409` into `Terminal` events; `runtime_mismatch` refusal before spawn; drain on shutdown
+- [x] the daemon `main`: load config, build the client, spawn the signal task flipping the `watch`, run the agent, exit 2 on `AgentExit::VersionMismatch`
+- [x] write `tests/agent_e2e.rs` against the fake farm and fake ralphex, with millisecond intervals: a claimed job runs to `done` with the fake's output on the farm and a `complete` recorded; the very first heartbeat arrives before the first flush; exit 3 completes as `nonzero_exit` with a tail; `cancel` on heartbeat stops the process and completes `canceled`; a job with `runtime: container` completes `runtime_mismatch` without spawning; `409` on claim ends the agent with `VersionMismatch`; `409` on heartbeat with a running fake stops its process group and ends the agent with `VersionMismatch`; `410` on heartbeat kills the job and posts no `complete`; `410` on a log chunk leaves the job running and it still completes `done`; a second job is not claimed while one runs; shutdown during a run completes `runner_shutdown` after the drain timeout
+- [x] run the gate - must pass before task 8
+
+➕ `AgentOptions` carries two injectables the plan did not name: `claim_retry_delay`, so no test waits out the second the claim loop sleeps after a failed poll, and `pr_tools`, so the two pull-request rows of the lifecycle table run against the shims from task 6. The remaining rows (spawn failure, `ctx_invalid`, `plan_not_found`) have tests of their own, so `tests/agent_e2e.rs` covers the whole table and task 11's second checkbox is already satisfied.
+➕ The process exit stays a `select!` branch of its own instead of travelling on the `Terminal` channel: waiting needs `&mut RunningJob`, which the stop path needs back the instant a terminal event wins the select. Cancel, drain, `410` and `409` do share the one channel, so every terminal condition still has exactly one handling site.
+➕ `RunSlot` moves `Free -> Polling -> Running(run_id) -> Free` along the claim path and is readable through `Agent::slot()`; the local request's wait-through-a-poll belongs to task 8's `start_local`.
+➕ `config.toml` is parsed with `deny_unknown_fields`, so the absent `slots` key is refused loudly rather than ignored silently.
+➕ `tests/support` grew three doubles: `always_claim` on the fake farm (a sticky `Hold` parks the claim loop once the scripted jobs are gone), `fake_ralphex_with` (a wrapper script that sets the fake's environment, because a claimed job is spawned with no environment of its own) and `fixed_ticker` (a millisecond flush cadence).
+⚠️ A `done` completion carries no `log_tail`: the conformance vector pins it empty and only a failure carries the tail. `src/paths.rs` needed no change after all.
 
 ### Task 8: Socket IPC and the `rxd` run and attach commands
 
@@ -502,11 +532,20 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Modify: `src/lib.rs`, `src/agent.rs`, `src/bin/ralphex-macos-runner.rs`, `src/bin/rxd.rs`
 - Create: `tests/rxd_e2e.rs`
 
-- [ ] `ipc.rs`: `Command` and `Response` from Technical Details, `send`/`receive` with the length-prefixed framing and the 10 MiB cap
-- [ ] daemon listener: bind the socket at `paths::socket_path()` with mode `0600`, remove a stale file first, remove on exit; per connection, `Run` -> `agent.start_local(request)` (which applies the slot rule, waiting through a poll) -> `client.open_run` -> `Started` -> subscribe -> stream `Line`s -> `Ended`; `Attach` -> `NoRun` or replay plus live
-- [ ] `rxd <plan>` and `rxd attach` per Technical Details, including the `CLAUDE_CONFIG_DIR` forward, the waiting message, the `run <id>` and URL header lines, Ctrl-C handling and the exit status
-- [ ] write `tests/rxd_e2e.rs`: framing round-trip including the cap; `rxd <plan>` against a running daemon prints the run id and URL first, streams the fake's lines, exits 0 on `done` and 1 on `error`; `rxd --worktree` puts `--worktree` in the fake's recorded argv; a `CLAUDE_CONFIG_DIR` in `rxd`'s environment reaches the fake's recorded environment; `rxd` during a held claim poll starts once the fake releases the poll with `204`; `rxd` during a held poll that the fake releases with a job gets `Busy` and the job runs; `Busy` while a job runs; `attach` replays history then streams; two attached clients both receive lines; the socket file has mode `0600`
-- [ ] run the gate - must pass before task 9
+- [x] `ipc.rs`: `Command` and `Response` from Technical Details, `send`/`receive` with the length-prefixed framing and the 10 MiB cap
+- [x] daemon listener: bind the socket at `paths::socket_path()` with mode `0600`, remove a stale file first, remove on exit; per connection, `Run` -> `agent.start_local(request)` (which applies the slot rule, waiting through a poll) -> `client.open_run` -> `Started` -> subscribe -> stream `Line`s -> `Ended`; `Attach` -> `NoRun` or replay plus live
+- [x] `rxd <plan>` and `rxd attach` per Technical Details, including the `CLAUDE_CONFIG_DIR` forward, the waiting message, the `run <id>` and URL header lines, Ctrl-C handling and the exit status
+- [x] write `tests/rxd_e2e.rs`: framing round-trip including the cap; `rxd <plan>` against a running daemon prints the run id and URL first, streams the fake's lines, exits 0 on `done` and 1 on `error`; `rxd --worktree` puts `--worktree` in the fake's recorded argv; a `CLAUDE_CONFIG_DIR` in `rxd`'s environment reaches the fake's recorded environment; `rxd` during a held claim poll starts once the fake releases the poll with `204`; `rxd` during a held poll that the fake releases with a job gets `Busy` and the job runs; `Busy` while a job runs; `attach` replays history then streams; two attached clients both receive lines; the socket file has mode `0600`
+- [x] run the gate - must pass before task 9
+
+➕ The slot is a `tokio::sync::Semaphore` with one permit next to the `RunSlot` state, because the handoff the Key decisions ask for needs a fair queue: on a `204` the claim loop drops the permit and asks for it again, and a waiting `rxd` is served first because tokio's semaphore serves its waiters in order. The state alone could not do it - a compare-and-set on a `watch` would let the claim loop re-take the slot before the waiter woke.
+➕ `RunSlot` grew an `Opening` variant for the moment between taking the slot and the farm minting the run id. A second local request treats it as `Polling` and waits, so a `Busy` answer always carries a real run id.
+➕ `Agent::run_job`'s body became `execute`, which returns the `CompleteRequest` instead of posting it, plus `CurrentRun` - the run id, the dashboard URL, the log stream and a `watch` of `RunState` - which both entry points register in `Agent::current`. That is what `Attach` follows, so `rxd attach` works for a ticket run as well as a local one, and the log stream is now created by the agent rather than inside the job path.
+➕ `follow` answers an `Attach` with `Started` before the replay, so an attaching operator sees which run they joined.
+➕ Both binaries take `--socket <path>`, which is how the suite runs a real `rxd` against an in-process daemon on a temporary socket instead of the installed one.
+➕ A local run that ends in `VersionMismatch` logs it and lets the claim loop meet the same `409` on its next poll; only the claim loop exits the process with status 2.
+⚠️ `args_conflicts_with_subcommands` made clap parse `rxd --socket <path> attach` as a plan named `attach`, because once an argument has been seen the setting stops clap from considering a subcommand at all. The setting is not used; `--socket` stays global, and both orders reach the subcommand. Clap would then let `rxd <plan> attach` parse and silently drop the plan, so a post-parse check refuses any run argument given beside a subcommand.
+⚠️ The listener's readiness cannot be waited on with `Path::exists`: a stale regular file at the socket path already exists, so the suite waits for a path whose file type is a socket.
 
 ### Task 9: launchd install and uninstall
 
@@ -514,11 +553,16 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Create: `src/service.rs`
 - Modify: `src/lib.rs`, `src/bin/rxd.rs`
 
-- [ ] `generate_plist(daemon_path, path_env, log_dir) -> String` producing the fields from Technical Details
-- [ ] `install()`: copy the daemon binary from `current_exe()`'s directory to the stable path, write the plist, `bootout` (ignored), `bootstrap` (fatal); `uninstall()`: `bootout`, remove the plist; both print the paths they touched and the `launchctl` commands to stop and start by hand
-- [ ] wire `rxd install` and `rxd uninstall`
-- [ ] write unit tests for `generate_plist`: label, program path, `RunAtLoad`, `KeepAlive`, both log paths, and `PATH` equal to the value passed in; `install` itself needs launchd and is exercised only by the Post-Completion smoke
-- [ ] run the gate - must pass before task 10
+- [x] `generate_plist(daemon_path, path_env, log_dir) -> String` producing the fields from Technical Details
+- [x] `install()`: copy the daemon binary from `current_exe()`'s directory to the stable path, write the plist, `bootout` (ignored), `bootstrap` (fatal); `uninstall()`: `bootout`, remove the plist; both print the paths they touched and the `launchctl` commands to stop and start by hand
+- [x] wire `rxd install` and `rxd uninstall`
+- [x] write unit tests for `generate_plist`: label, program path, `RunAtLoad`, `KeepAlive`, both log paths, and `PATH` equal to the value passed in; `install` itself needs launchd and is exercised only by the Post-Completion smoke
+- [x] run the gate - must pass before task 10
+
+➕ `nix` gained the `user` feature, for `Uid::current()` in the `gui/<uid>` domain target; the alternative was reading the uid off the home directory's metadata, which is indirect for no gain.
+➕ `install` and `uninstall` return `Installed` and `Uninstalled` rather than printing themselves; each one's `Display` is the block `rxd` prints (the paths touched, then the `launchctl bootout` and `bootstrap` lines from `by_hand`), so the printed text is unit-tested instead of being a side effect of the library.
+➕ Paths and the `PATH` value are XML-escaped into the plist, and `generate_plist` builds the two log paths from the log directory with the `STDOUT_FILE` and `STDERR_FILE` constants; a test pins them equal to `paths::daemon_stdout_path()` and `paths::daemon_stderr_path()`.
+⚠️ `current_exe()` is canonicalized before its directory is taken: `/opt/homebrew/bin/rxd` is a symlink into the Cellar keg, and only the resolved directory holds the daemon binary to copy. The existing binary at the stable path is removed before the copy, because writing over a running executable fails with `ETXTBSY`.
 
 ### Task 10: Release workflow and formula
 
@@ -527,22 +571,32 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Create: `docs/formula-template.rb`
 - Modify: `mise.toml`
 
-- [ ] `release.yml` with the eight steps from Technical Details, the certificate-import sequence written out, and the formula-rewrite job
-- [ ] `docs/formula-template.rb` as specified, kept in the repository so a change to it is reviewed here
-- [ ] extend `mise run check` with `ruby -c docs/formula-template.rb` and a structural check on `release.yml`: it must contain `security import`, `set-key-partition-list`, two `codesign --sign` invocations and two `codesign --verify` invocations, checked with `grep -c`
-- [ ] run the gate (`actionlint` now covers both workflows) - must pass before task 11
+- [x] `release.yml` with the eight steps from Technical Details, the certificate-import sequence written out, and the formula-rewrite job
+- [x] `docs/formula-template.rb` as specified, kept in the repository so a change to it is reviewed here
+- [x] extend `mise run check` with `ruby -c docs/formula-template.rb` and a structural check on `release.yml`: it must contain `security import`, `set-key-partition-list`, two `codesign --sign` invocations and two `codesign --verify` invocations, checked with `grep -c`
+- [x] run the gate (`actionlint` now covers both workflows) - must pass before task 11
+
+➕ The release job publishes `version` and `sha256` as job outputs, so the formula job substitutes them into the template with `sed` instead of downloading the tarball again to hash it. The template's placeholders are `@VERSION@` and `@SHA256@`, both inside string literals so `ruby -c` parses the template as it stands in the repository.
+➕ The release itself is `softprops/action-gh-release@v2`, which is what carries the `generate_release_notes` input the plan names. The formula job pushes nothing when the rendered formula is byte-identical to the one already in the tap.
+➕ The structural check is its own `check-release` task that `check` calls, because the shell it needs does not fit an entry of `check`'s run array.
+⚠️ BSD `grep` treats `$` as an end-of-line anchor in the middle of a basic regular expression too, so `grep -c -- '--sign "$SIGN_IDENTITY"'` counted zero matches against lines that plainly contain it. The check uses `grep -cF` for every pattern, and a `|| true` so a zero count reaches the comparison instead of tripping `set -e`.
+⚠️ `security list-keychains -d user -s` replaces the whole search list, so the existing entries are read into a bash array and passed back alongside the new keychain; splitting the command substitution unquoted would have been the shorter way and is what shellcheck rejects.
 
 ### Task 11: Verify acceptance criteria
 
 **Files:**
 - Modify: `docs/plans/20260902-ralphex-macos-runner.md`
 
-- [ ] `mise run check` is green
-- [ ] every row of the lifecycle table has a passing test in `tests/agent_e2e.rs`
-- [ ] `mise exec -- cargo test --test protocol_vectors` passes and the file contains every vector from Technical Details
-- [ ] the crate has no `//` line comments and no `unsafe`
-- [ ] every non-goal still holds: no git clone/fetch/reset/clean anywhere in `src/`, no progress endpoint call, no `RALPHEX_CONFIG_DIR`, no `slots` in config
-- [ ] **stop here.** Everything after this line needs the deployed farm and launchd and is the operator's to run; record any blocker with ⚠️ and continue to task 12
+- [x] `mise run check` is green
+- [x] every row of the lifecycle table has a passing test in `tests/agent_e2e.rs`
+- [x] `mise exec -- cargo test --test protocol_vectors` passes and the file contains every vector from Technical Details
+- [x] the crate has no `//` line comments and no `unsafe`
+- [x] every non-goal still holds: no git clone/fetch/reset/clean anywhere in `src/`, no progress endpoint call, no `RALPHEX_CONFIG_DIR`, no `slots` in config
+- [x] **stop here.** Everything after this line needs the deployed farm and launchd and is the operator's to run; record any blocker with ⚠️ and continue to task 12
+
+➕ Lifecycle rows to their tests in `tests/agent_e2e.rs`: exit 0 with a pull request - `a_finished_run_opens_a_pull_request`; exit 0 without one - `a_claimed_job_runs_to_done_and_its_output_reaches_the_farm`; nonzero exit - `a_nonzero_exit_completes_as_a_failure_with_its_tail`; `Cancel` - `a_cancel_on_the_heartbeat_stops_the_run_and_completes_it_as_canceled`; `Drain` - `a_run_that_outlasts_its_drain_completes_as_a_shutdown`; `Gone` - `a_forgotten_run_is_killed_and_never_completed`; `VersionMismatch` - `a_version_mismatch_on_the_claim_ends_the_agent` and `a_version_mismatch_on_the_heartbeat_stops_the_run_and_ends_the_agent`; spawn failure - `a_ralphex_that_cannot_be_started_completes_as_a_spawn_failure`; push failure - `a_push_that_fails_completes_as_a_push_failure`; pull request failure - `a_pull_request_that_fails_completes_as_a_creation_failure`; `ctx_invalid` - `a_checkout_that_is_not_a_repository_completes_as_an_invalid_context`; `plan_not_found` - `a_plan_outside_the_checkout_completes_as_a_missing_plan`; `runtime_mismatch` - `a_container_job_is_refused_without_spawning_anything`.
+➕ All 13 conformance vectors are transcribed in `tests/protocol_vectors.rs` and its 13 tests pass.
+➕ The non-goal greps find only test literals: `"reset"` appears twice as a `FarmError::Transport` message, `RALPHEX_CONFIG_DIR` only in the `tests/job.rs` assertion that it is unset, and `slots` only in the `config.rs` test that `deny_unknown_fields` refuses it. `src/pr.rs` runs `push`, `symbolic-ref`, `gh pr list/create` and `gh repo view` and nothing else; `src/job.rs` runs `git rev-parse --git-dir`.
 
 ### Task 12: Update documentation
 
@@ -550,9 +604,12 @@ Secrets: `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `HOMEBREW_TAP_TOKEN`; v
 - Create: `README.md`, `CLAUDE.md`
 - Modify: `docs/plans/20260902-ralphex-macos-runner.md`
 
-- [ ] `README.md`: what it is, `brew install pkarpovich/apps/ralphex-macos-runner`, `rxd install`, the config file, `rxd` usage including the waiting message, the ticket block for native runs, the update procedure (`brew upgrade` then `rxd install`), the exit-2 meaning
-- [ ] `CLAUDE.md`: build and test commands, the module map from Solution Overview, the key patterns (one execution path with `LocalOptions`, the run slot, fatal `409`, the `410` rule, the cancel sequence), in the same shape as the operator's other daemon repositories
-- [ ] move this plan to `docs/plans/completed/`
+- [x] `README.md`: what it is, `brew install pkarpovich/apps/ralphex-macos-runner`, `rxd install`, the config file, `rxd` usage including the waiting message, the ticket block for native runs, the update procedure (`brew upgrade` then `rxd install`), the exit-2 meaning
+- [x] `CLAUDE.md`: build and test commands, the module map from Solution Overview, the key patterns (one execution path with `LocalOptions`, the run slot, fatal `409`, the `410` rule, the cancel sequence), in the same shape as the operator's other daemon repositories
+- [x] move this plan to `docs/plans/completed/`
+
+➕ The native ticket block in the README is transcribed from the farm's own `README.md` at the commit that merged plan 1 (`runtime`, `ctx`, absolute `plan`, `pr: false`), not from this plan's prose, so the two repositories describe one block.
+➕ `CLAUDE.md` carries a Non-goals section and the Code Style rules (no comments, `///` everywhere, no `unsafe`) as well as the module map, because those are what a fresh session would otherwise violate first.
 
 ## Post-Completion
 

@@ -1,0 +1,33 @@
+[package]
+name = "ralphex-macos-runner"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "ralphex_macos_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ralphex-macos-runner"
+path = "src/bin/ralphex-macos-runner.rs"
+
+[[bin]]
+name = "rxd"
+path = "src/bin/rxd.rs"
+
+[dependencies]
+clap = { version = "4.6.6", features = ["derive"] }
+dirs = "6.0.0"
+nix = { version = "0.31.3", features = ["signal", "process", "user"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "process", "signal", "sync", "time", "net", "io-util"] }
+toml = "1.1.5"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+axum = "0.8.9"
+tempfile = "3.27.0"

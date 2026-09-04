@@ -1,0 +1,738 @@
+//! The Unix socket the daemon and the `rxd` client speak over.
+//!
+//! A message is a 4-byte little-endian length followed by that many bytes of
+//! JSON, and nothing over [`MAX_MESSAGE_BYTES`] is written or read. [`serve`]
+//! owns the daemon's end: it binds the socket with mode `0600`, hands a `Run`
+//! command to the agent's run slot and streams the run's output back as
+//! [`Response::Line`] messages until the run ends. A client the run outran is
+//! sent a line naming how many it missed rather than being left with a silent
+//! hole, and the drain that follows the run reads on past a lag instead of
+//! stopping at it, so the last lines a run printed are never lost to one.
+
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{broadcast, watch};
+
+use crate::agent::{Agent, CurrentRun, LocalStart, RunEnd, Shutdown, raised};
+use crate::job::Worktree;
+use crate::protocol::types::{Branch, CompleteRequest, CompleteStatus, CreatePr, RunId};
+
+/// The largest message either end sends or accepts.
+pub const MAX_MESSAGE_BYTES: usize = 10 * 1024 * 1024;
+
+/// The permissions the daemon's socket carries.
+pub const SOCKET_MODE: u32 = 0o600;
+
+/// The permissions a directory the daemon creates for its socket carries.
+///
+/// An existing directory keeps the permissions it has: the socket path can be
+/// given on the command line, and a shared directory is not the daemon's to
+/// close down.
+pub const DIRECTORY_MODE: u32 = 0o700;
+
+/// The bytes `sun_path` holds on Darwin, which a socket path stays under.
+pub const SOCKET_PATH_MAX: usize = 104;
+
+/// The time a fresh connection has to name what it wants.
+pub const FIRST_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The pause after an accept that failed, before the next one is tried.
+pub const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
+
+/// The shortest interval between two complaints about a failing accept.
+pub const ACCEPT_COMPLAINT: Duration = Duration::from_secs(60);
+
+/// The name the socket carries while it is bound in its staging directory.
+///
+/// One byte, so a path the socket itself fits in stages three bytes longer
+/// rather than the length of the socket's own name again.
+pub const STAGED_NAME: &str = "s";
+
+/// What `rxd` asks the daemon to run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct RunRequest {
+    /// The checkout the run executes in.
+    pub ctx: String,
+    /// The absolute path of the plan file.
+    pub plan: String,
+    /// The branch ralphex works on.
+    pub branch: Branch,
+    /// Whether the run ends with a pull request.
+    pub create_pr: CreatePr,
+    /// Whether ralphex works in a worktree.
+    pub worktree: Worktree,
+    /// Environment entries added to the daemon's own.
+    pub env: Vec<(String, String)>,
+}
+
+/// What a client asks the daemon for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub enum Command {
+    /// Opens a ticketless run and streams it.
+    Run(RunRequest),
+    /// Follows the run in progress.
+    Attach,
+}
+
+/// What the daemon answers a client with.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub enum Response {
+    /// The run is in flight and its output follows.
+    Started {
+        /// The identifier the farm gave the run.
+        run_id: RunId,
+        /// The dashboard page of the run.
+        dashboard_url: String,
+    },
+    /// One line of the run's output.
+    Line {
+        /// The line, without its newline.
+        text: String,
+    },
+    /// The run reached the farm's records as finished.
+    Ended {
+        /// How the run ended.
+        status: CompleteStatus,
+        /// The pull request the run opened, empty when it opened none.
+        pr_url: String,
+        /// The machine-readable reason a failed run failed.
+        fail_reason: String,
+    },
+    /// Another run holds the daemon's only slot.
+    Busy {
+        /// The identifier of the run that holds the slot.
+        run_id: RunId,
+    },
+    /// Nothing is running.
+    NoRun,
+    /// The request could not be served.
+    Error {
+        /// What went wrong.
+        message: String,
+    },
+}
+
+/// Why a message could not be exchanged.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum IpcError {
+    /// The other end closed the connection.
+    #[error("the connection was closed")]
+    Closed,
+    /// A message was larger than the cap.
+    #[error("the message is {0} bytes, over the 10 MiB cap")]
+    TooLarge(usize),
+    /// The socket could not be read or written.
+    #[error("the connection failed: {0}")]
+    Io(String),
+    /// The message could not be turned into JSON.
+    #[error("the message could not be encoded: {0}")]
+    Encode(String),
+    /// The bytes on the wire were not the expected JSON.
+    #[error("the message could not be decoded: {0}")]
+    Decode(String),
+}
+
+/// Writes `message` to `writer` with its length in front.
+///
+/// # Errors
+///
+/// Returns [`IpcError::Encode`] when the message is not encodable,
+/// [`IpcError::TooLarge`] when it exceeds [`MAX_MESSAGE_BYTES`] and
+/// [`IpcError::Io`] when the socket refuses the bytes.
+///
+/// # Examples
+///
+/// ```
+/// use ralphex_macos_runner::ipc::{self, Command};
+///
+/// let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// runtime.block_on(async {
+///     let mut wire = Vec::new();
+///     ipc::send(&mut wire, &Command::Attach).await.unwrap();
+///     let header = u32::from_le_bytes(wire[..4].try_into().unwrap());
+///     assert_eq!(header as usize, wire.len() - 4);
+///     let mut read = wire.as_slice();
+///     let command: Command = ipc::receive(&mut read).await.unwrap();
+///     assert_eq!(command, Command::Attach);
+/// });
+/// ```
+pub async fn send<M, W>(writer: &mut W, message: &M) -> Result<(), IpcError>
+where
+    M: Serialize + ?Sized,
+    W: AsyncWrite + Unpin,
+{
+    let bytes = match serde_json::to_vec(message) {
+        Ok(bytes) => bytes,
+        Err(error) => return Err(IpcError::Encode(error.to_string())),
+    };
+    if bytes.len() > MAX_MESSAGE_BYTES {
+        return Err(IpcError::TooLarge(bytes.len()));
+    }
+    let Ok(length) = u32::try_from(bytes.len()) else {
+        return Err(IpcError::TooLarge(bytes.len()));
+    };
+    if let Err(error) = writer.write_all(&length.to_le_bytes()).await {
+        return Err(IpcError::Io(error.to_string()));
+    }
+    if let Err(error) = writer.write_all(&bytes).await {
+        return Err(IpcError::Io(error.to_string()));
+    }
+    if let Err(error) = writer.flush().await {
+        return Err(IpcError::Io(error.to_string()));
+    }
+    Ok(())
+}
+
+/// Reads one length-prefixed message from `reader`.
+///
+/// # Errors
+///
+/// Returns [`IpcError::Closed`] when the other end closed the connection,
+/// [`IpcError::TooLarge`] when the announced length exceeds
+/// [`MAX_MESSAGE_BYTES`], [`IpcError::Io`] when the socket fails and
+/// [`IpcError::Decode`] when the bytes are not the expected JSON.
+///
+/// # Examples
+///
+/// ```
+/// use ralphex_macos_runner::ipc::{self, IpcError, Response};
+///
+/// let runtime = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// runtime.block_on(async {
+///     let mut empty: &[u8] = &[];
+///     let closed = ipc::receive::<Response, _>(&mut empty).await.unwrap_err();
+///     assert_eq!(closed, IpcError::Closed);
+/// });
+/// ```
+pub async fn receive<M, R>(reader: &mut R) -> Result<M, IpcError>
+where
+    M: DeserializeOwned,
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0u8; 4];
+    if let Err(error) = reader.read_exact(&mut header).await {
+        return Err(match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => IpcError::Closed,
+            std::io::ErrorKind::ConnectionReset => IpcError::Closed,
+            _other => IpcError::Io(error.to_string()),
+        });
+    }
+    let length = u32::from_le_bytes(header) as usize;
+    if length > MAX_MESSAGE_BYTES {
+        return Err(IpcError::TooLarge(length));
+    }
+    let mut body = vec![0u8; length];
+    if let Err(error) = reader.read_exact(&mut body).await {
+        return Err(match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => IpcError::Closed,
+            std::io::ErrorKind::ConnectionReset => IpcError::Closed,
+            _other => IpcError::Io(error.to_string()),
+        });
+    }
+    match serde_json::from_slice(&body) {
+        Ok(message) => Ok(message),
+        Err(error) => Err(IpcError::Decode(error.to_string())),
+    }
+}
+
+/// Serves clients on the socket at `path` until `shutdown` is raised.
+///
+/// The socket is bound under [`STAGED_NAME`] inside a directory of mode
+/// [`DIRECTORY_MODE`] no other user can enter, given [`SOCKET_MODE`] there and
+/// only then renamed onto `path`, over a stale file if one is in the way, so it
+/// is never reachable while it still carries the permissions the umask gave it.
+/// It is removed when the listener stops.
+///
+/// # Errors
+///
+/// Returns [`IpcError::Io`] when another daemon is already listening at `path`,
+/// the socket's directory cannot be created, the staged path needs more than
+/// [`SOCKET_PATH_MAX`] bytes, the socket cannot be bound, its permissions
+/// cannot be set or it cannot be moved to `path`.
+pub async fn serve(
+    path: PathBuf,
+    agent: Arc<Agent>,
+    shutdown: watch::Receiver<Shutdown>,
+) -> Result<(), IpcError> {
+    let listener = match bind(&path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(
+                "the client socket {} could not be bound: {error}; rxd cannot reach this daemon",
+                path.display()
+            );
+            return Err(error);
+        }
+    };
+    tracing::info!("the client socket is {}", path.display());
+    let mut shutdown = shutdown;
+    let mut complained: Option<tokio::time::Instant> = None;
+    loop {
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted,
+            _raised = raised(&mut shutdown) => break,
+        };
+        let (stream, _address) = match accepted {
+            Ok(accepted) => accepted,
+            Err(error) => {
+                let now = tokio::time::Instant::now();
+                if due(complained, now) {
+                    tracing::warn!("the client socket could not be accepted: {error}");
+                    complained = Some(now);
+                }
+                tokio::time::sleep(ACCEPT_PAUSE).await;
+                continue;
+            }
+        };
+        tokio::spawn(handle(stream, Arc::clone(&agent), shutdown.clone()));
+    }
+    drop(listener);
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}
+
+/// Returns an error when a daemon is already listening at `path`.
+///
+/// A socket file left behind by a daemon that is gone refuses the connection
+/// and is replaced; one a live daemon still answers on is not this process's to
+/// take, and two daemons claiming jobs from the same checkout would write over
+/// each other.
+///
+/// # Errors
+///
+/// Returns [`IpcError::Io`] naming `path` when a connection to it is accepted.
+pub fn unoccupied(path: &Path) -> Result<(), IpcError> {
+    let Ok(_stream) = std::os::unix::net::UnixStream::connect(path) else {
+        return Ok(());
+    };
+    Err(IpcError::Io(format!(
+        "another daemon is listening at {}",
+        path.display()
+    )))
+}
+
+fn due(complained: Option<tokio::time::Instant>, now: tokio::time::Instant) -> bool {
+    let Some(last) = complained else {
+        return true;
+    };
+    now.duration_since(last) >= ACCEPT_COMPLAINT
+}
+
+fn bind(path: &Path) -> Result<UnixListener, IpcError> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(IpcError::Io(format!(
+            "{} is not a path a socket can be bound at",
+            path.display()
+        )));
+    };
+    unoccupied(path)?;
+    if let Err(error) = std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(DIRECTORY_MODE)
+        .create(parent)
+    {
+        return Err(IpcError::Io(error.to_string()));
+    }
+    let staging = parent.join(format!(".{}", name.to_string_lossy()));
+    let staged = staging.join(STAGED_NAME);
+    if staged.as_os_str().as_bytes().len() >= SOCKET_PATH_MAX {
+        return Err(IpcError::Io(format!(
+            "{} needs {SOCKET_PATH_MAX} bytes or fewer to be bound",
+            staged.display()
+        )));
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    if let Err(error) = std::fs::DirBuilder::new()
+        .mode(DIRECTORY_MODE)
+        .create(&staging)
+    {
+        return Err(IpcError::Io(error.to_string()));
+    }
+    let listener = match UnixListener::bind(&staged) {
+        Ok(listener) => listener,
+        Err(error) => return abandon(&staging, &error.to_string()),
+    };
+    let permissions = std::fs::Permissions::from_mode(SOCKET_MODE);
+    if let Err(error) = std::fs::set_permissions(&staged, permissions) {
+        return abandon(&staging, &error.to_string());
+    }
+    if let Err(error) = std::fs::rename(&staged, path) {
+        return abandon(&staging, &error.to_string());
+    }
+    let _ = std::fs::remove_dir(&staging);
+    Ok(listener)
+}
+
+fn abandon(staging: &Path, error: &str) -> Result<UnixListener, IpcError> {
+    let _ = std::fs::remove_dir_all(staging);
+    Err(IpcError::Io(error.to_string()))
+}
+
+async fn first_command(stream: &mut UnixStream, deadline: Duration) -> Result<Command, IpcError> {
+    let received = tokio::time::timeout(deadline, receive::<Command, _>(stream)).await;
+    let Ok(received) = received else {
+        return Err(IpcError::Io(format!("no command within {deadline:?}")));
+    };
+    received
+}
+
+async fn handle(stream: UnixStream, agent: Arc<Agent>, shutdown: watch::Receiver<Shutdown>) {
+    let mut stream = stream;
+    let command = match first_command(&mut stream, FIRST_COMMAND_TIMEOUT).await {
+        Ok(command) => command,
+        Err(error) => {
+            tracing::warn!("a client sent no usable command: {error}");
+            return;
+        }
+    };
+    let served = match command {
+        Command::Run(request) => start(&mut stream, agent, request, shutdown).await,
+        Command::Attach => attach(&mut stream, &agent).await,
+    };
+    if let Err(error) = served {
+        tracing::info!("a client left: {error}");
+    }
+}
+
+async fn start(
+    stream: &mut UnixStream,
+    agent: Arc<Agent>,
+    request: RunRequest,
+    shutdown: watch::Receiver<Shutdown>,
+) -> Result<(), IpcError> {
+    match agent.start_local(request, shutdown).await {
+        LocalStart::Busy { run_id } => send(stream, &Response::Busy { run_id }).await,
+        LocalStart::Refused { message } => send(stream, &Response::Error { message }).await,
+        LocalStart::Started(current) => follow(stream, &current).await,
+    }
+}
+
+async fn attach(stream: &mut UnixStream, agent: &Agent) -> Result<(), IpcError> {
+    let Some(current) = agent.current() else {
+        return send(stream, &Response::NoRun).await;
+    };
+    follow(stream, &current).await
+}
+
+async fn follow(stream: &mut UnixStream, current: &CurrentRun) -> Result<(), IpcError> {
+    send(
+        stream,
+        &Response::Started {
+            run_id: current.run_id().clone(),
+            dashboard_url: current.dashboard_url().to_string(),
+        },
+    )
+    .await?;
+    let (replay, mut lines) = current.log().subscribe();
+    for text in replay {
+        send(stream, &Response::Line { text }).await?;
+    }
+    let ended = loop {
+        let received = tokio::select! {
+            received = lines.recv() => received,
+            ended = current.ended() => break ended,
+        };
+        match received {
+            Ok(text) => send(stream, &Response::Line { text }).await?,
+            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                send(
+                    stream,
+                    &Response::Line {
+                        text: skipped(missed),
+                    },
+                )
+                .await?;
+            }
+            Err(broadcast::error::RecvError::Closed) => break current.ended().await,
+        }
+    };
+    loop {
+        match lines.try_recv() {
+            Ok(text) => send(stream, &Response::Line { text }).await?,
+            Err(broadcast::error::TryRecvError::Lagged(missed)) => {
+                send(
+                    stream,
+                    &Response::Line {
+                        text: skipped(missed),
+                    },
+                )
+                .await?;
+            }
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    match ended {
+        RunEnd::Reported(completion) => {
+            let CompleteRequest {
+                status,
+                pr_url,
+                fail_reason,
+                message: _,
+                log_tail: _,
+            } = completion;
+            send(
+                stream,
+                &Response::Ended {
+                    status,
+                    pr_url,
+                    fail_reason,
+                },
+            )
+            .await
+        }
+        RunEnd::Unreported { message } => send(stream, &Response::Error { message }).await,
+        RunEnd::Forgotten => {
+            send(
+                stream,
+                &Response::Error {
+                    message: "the farm no longer knows this run".to_string(),
+                },
+            )
+            .await
+        }
+        RunEnd::VersionMismatch { message } => {
+            send(
+                stream,
+                &Response::Error {
+                    message: format!("the farm speaks another protocol version: {message}"),
+                },
+            )
+            .await
+        }
+        RunEnd::Dropped => {
+            send(
+                stream,
+                &Response::Error {
+                    message: "the farm no longer knows this run".to_string(),
+                },
+            )
+            .await
+        }
+    }
+}
+
+fn skipped(missed: u64) -> String {
+    format!("... {missed} lines skipped")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn socket_of_length(root: &Path, length: usize) -> PathBuf {
+        let name = "daemon.sock";
+        let taken = root.as_os_str().as_bytes().len() + name.len() + 2;
+        let Some(room) = length.checked_sub(taken) else {
+            panic!("the temporary directory leaves no room to pad");
+        };
+        assert!(room > 0, "the temporary directory leaves no room to pad");
+        root.join("d".repeat(room)).join(name)
+    }
+
+    #[tokio::test]
+    async fn a_socket_the_kernel_accepts_binds_through_its_staging_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let path = socket_of_length(root.path(), SOCKET_PATH_MAX - 4);
+        let listener = bind(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, SOCKET_MODE);
+        assert!(!path.parent().unwrap().join(".daemon.sock").exists());
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn a_socket_no_staged_path_fits_is_refused_before_it_is_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let path = socket_of_length(root.path(), SOCKET_PATH_MAX - 1);
+        let refused = bind(&path).unwrap_err();
+        let IpcError::Io(message) = refused else {
+            panic!("a path that cannot be staged is an io failure");
+        };
+        assert!(message.contains("bound"), "{message}");
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().join(".daemon.sock").exists());
+    }
+
+    #[tokio::test]
+    async fn a_socket_a_daemon_still_answers_on_is_not_taken_over() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("daemon.sock");
+
+        assert!(unoccupied(&path).is_ok(), "an absent socket is free");
+
+        let listener = bind(&path).unwrap();
+        let refused = unoccupied(&path).unwrap_err();
+        let IpcError::Io(message) = refused.clone() else {
+            panic!("a live socket is an io failure");
+        };
+        assert!(message.contains("another daemon is listening"), "{message}");
+        assert_eq!(bind(&path).unwrap_err(), refused);
+
+        drop(listener);
+        assert!(
+            unoccupied(&path).is_ok(),
+            "a socket file nothing answers on is stale"
+        );
+    }
+
+    #[test]
+    fn a_failing_accept_is_complained_about_once_a_minute() {
+        let now = tokio::time::Instant::now();
+        assert!(due(None, now));
+        assert!(!due(Some(now), now));
+        assert!(!due(
+            Some(now),
+            now + ACCEPT_COMPLAINT - Duration::from_secs(1)
+        ));
+        assert!(due(Some(now), now + ACCEPT_COMPLAINT));
+    }
+
+    #[tokio::test]
+    async fn a_client_that_sends_nothing_is_dropped_at_the_deadline() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let deadline = Duration::from_millis(50);
+
+        let refused = first_command(&mut server, deadline).await.unwrap_err();
+        drop(server);
+
+        let IpcError::Io(message) = refused else {
+            panic!("a client that sends nothing times out");
+        };
+        assert!(message.contains("50ms"), "{message}");
+        let mut byte = [0u8; 1];
+        let read = client.read(&mut byte).await.unwrap();
+        assert_eq!(read, 0, "the connection outlived the deadline");
+    }
+
+    #[tokio::test]
+    async fn a_client_that_names_what_it_wants_is_served() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        send(&mut client, &Command::Attach).await.unwrap();
+
+        let command = first_command(&mut server, Duration::from_millis(50))
+            .await
+            .unwrap();
+
+        assert_eq!(command, Command::Attach);
+    }
+
+    #[tokio::test]
+    async fn a_command_survives_the_wire() {
+        let request = RunRequest {
+            ctx: "/abs/checkout".to_string(),
+            plan: "/abs/checkout/docs/plans/x.md".to_string(),
+            branch: Branch("x".to_string()),
+            create_pr: CreatePr::Yes,
+            worktree: Worktree::No,
+            env: vec![("CLAUDE_CONFIG_DIR".to_string(), "/work".to_string())],
+        };
+        let mut wire = Vec::new();
+        send(&mut wire, &Command::Run(request.clone()))
+            .await
+            .unwrap();
+        let mut read = wire.as_slice();
+        let received: Command = receive(&mut read).await.unwrap();
+        assert_eq!(received, Command::Run(request));
+    }
+
+    #[tokio::test]
+    async fn a_length_over_the_cap_is_refused_before_it_is_read() {
+        let mut wire = Vec::new();
+        let length = u32::try_from(MAX_MESSAGE_BYTES + 1).unwrap();
+        wire.extend_from_slice(&length.to_le_bytes());
+        let mut read = wire.as_slice();
+        let refused = receive::<Response, _>(&mut read).await.unwrap_err();
+        assert_eq!(refused, IpcError::TooLarge(MAX_MESSAGE_BYTES + 1));
+    }
+
+    #[tokio::test]
+    async fn a_message_over_the_cap_is_never_written() {
+        let text = "x".repeat(MAX_MESSAGE_BYTES + 1);
+        let mut wire = Vec::new();
+        let refused = send(&mut wire, &Response::Line { text }).await.unwrap_err();
+        let IpcError::TooLarge(size) = refused else {
+            panic!("an oversized message is refused for its size");
+        };
+        assert!(size > MAX_MESSAGE_BYTES);
+        assert!(wire.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_empty_wire_reads_as_a_closed_connection() {
+        let empty: Vec<u8> = Vec::new();
+        let mut read = empty.as_slice();
+        let closed = receive::<Response, _>(&mut read).await.unwrap_err();
+        assert_eq!(closed, IpcError::Closed);
+    }
+
+    #[tokio::test]
+    async fn a_truncated_body_reads_as_a_closed_connection() {
+        let mut wire = Vec::new();
+        send(&mut wire, &Response::NoRun).await.unwrap();
+        wire.pop();
+        let mut read = wire.as_slice();
+        let closed = receive::<Response, _>(&mut read).await.unwrap_err();
+        assert_eq!(closed, IpcError::Closed);
+    }
+
+    #[tokio::test]
+    async fn bytes_that_are_not_json_are_refused() {
+        let mut wire = Vec::new();
+        let length = u32::try_from(3usize).unwrap();
+        wire.extend_from_slice(&length.to_le_bytes());
+        wire.extend_from_slice(b"{[}");
+        let mut read = wire.as_slice();
+        let refused = receive::<Response, _>(&mut read).await.unwrap_err();
+        let IpcError::Decode(_message) = refused else {
+            panic!("unreadable bytes are a decode failure");
+        };
+    }
+
+    #[tokio::test]
+    async fn several_messages_share_one_stream() {
+        let mut wire = Vec::new();
+        send(
+            &mut wire,
+            &Response::Line {
+                text: "one".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        send(
+            &mut wire,
+            &Response::Line {
+                text: "two".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        send(&mut wire, &Response::NoRun).await.unwrap();
+        let mut read = wire.as_slice();
+        let first: Response = receive(&mut read).await.unwrap();
+        let second: Response = receive(&mut read).await.unwrap();
+        let third: Response = receive(&mut read).await.unwrap();
+        assert_eq!(
+            first,
+            Response::Line {
+                text: "one".to_string()
+            }
+        );
+        assert_eq!(
+            second,
+            Response::Line {
+                text: "two".to_string()
+            }
+        );
+        assert_eq!(third, Response::NoRun);
+    }
+}

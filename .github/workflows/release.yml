@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  TARGET: aarch64-apple-darwin
+  TARBALL: ralphex-macos-runner-aarch64-apple-darwin.tar.gz
+
+jobs:
+  release:
+    runs-on: macos-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: jdx/mise-action@v3
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check the tag against Cargo.toml
+        id: version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$tag" != "$crate" ]; then
+            echo "tag $tag does not match Cargo.toml version $crate" >&2
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Gate
+        run: mise run check
+
+      - name: Build
+        run: cargo build --release --target "$TARGET"
+
+      - name: Import the signing certificate
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          cert="$RUNNER_TEMP/cert.p12"
+          keychain="$RUNNER_TEMP/build.keychain-db"
+          password="$(openssl rand -base64 24)"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$cert"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$cert" -k "$keychain" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          existing=()
+          while IFS= read -r line; do
+            existing+=("$(echo "$line" | tr -d ' "')")
+          done < <(security list-keychains -d user)
+          security list-keychains -d user -s "$keychain" "${existing[@]}"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain"
+          rm -f "$cert"
+
+      - name: Sign the binaries
+        env:
+          SIGN_IDENTITY: ${{ vars.SIGN_IDENTITY }}
+        run: |
+          daemon="target/$TARGET/release/ralphex-macos-runner"
+          client="target/$TARGET/release/rxd"
+          codesign --force --options runtime --timestamp --identifier dev.pkarpovich.ralphex-macos-runner --sign "$SIGN_IDENTITY" "$daemon"
+          codesign --force --options runtime --timestamp --identifier dev.pkarpovich.rxd --sign "$SIGN_IDENTITY" "$client"
+          codesign --verify --strict --verbose=2 "$daemon"
+          codesign --verify --strict --verbose=2 "$client"
+
+      - name: Package
+        id: package
+        run: |
+          tar -czf "$TARBALL" -C "target/$TARGET/release" ralphex-macos-runner rxd
+          sha="$(shasum -a 256 "$TARBALL" | cut -d ' ' -f 1)"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.TARBALL }}
+          generate_release_notes: true
+
+  formula:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/checkout@v5
+        with:
+          repository: pkarpovich/homebrew-apps
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Write the formula
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+          SHA256: ${{ needs.release.outputs.sha256 }}
+        run: |
+          mkdir -p tap/Formula
+          sed -e "s|@VERSION@|$VERSION|g" -e "s|@SHA256@|$SHA256|g" \
+            docs/formula-template.rb > tap/Formula/ralphex-macos-runner.rb
+
+      - name: Commit and push
+        working-directory: tap
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/ralphex-macos-runner.rb
+          if git diff --cached --quiet; then
+            echo "formula unchanged"
+            exit 0
+          fi
+          git commit -m "ralphex-macos-runner $VERSION"
+          git push

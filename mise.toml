@@ -1,0 +1,33 @@
+[tools]
+rust = { version = "1.98.0", components = "rustfmt,clippy" }
+actionlint = "1.7.12"
+
+[tasks.check]
+description = "Format, lint, test and workflow checks"
+run = [
+  "cargo fmt --check",
+  "cargo clippy --all-targets -- -D warnings",
+  "cargo test",
+  "actionlint",
+  "ruby -c docs/formula-template.rb",
+  "mise run check-release",
+]
+
+[tasks.check-release]
+description = "Structural check on the release workflow"
+run = '''
+set -e
+workflow=.github/workflows/release.yml
+for pattern in 'security import' 'set-key-partition-list'; do
+  if ! grep -qF -- "$pattern" "$workflow"; then
+    echo "$workflow is missing: $pattern" >&2
+    exit 1
+  fi
+done
+signs=$(grep -cF -- '--sign "$SIGN_IDENTITY"' "$workflow" || true)
+verifies=$(grep -cF -- 'codesign --verify' "$workflow" || true)
+if [ "$signs" -ne 2 ] || [ "$verifies" -ne 2 ]; then
+  echo "$workflow must sign and verify both binaries: $signs signed, $verifies verified" >&2
+  exit 1
+fi
+'''

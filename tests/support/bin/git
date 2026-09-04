@@ -1,0 +1,36 @@
+#!/bin/sh
+set -u
+
+record="${FAKE_RECORD:-}"
+if [ -n "$record" ]; then
+  {
+    echo "cmd: git"
+    echo "cwd: $(pwd -P)"
+    for arg in "$@"; do
+      printf 'arg: %s\n' "$(printf '%s' "$arg" | tr '\n' ' ')"
+    done
+  } >>"$record"
+fi
+
+key=""
+case "${1:-}" in
+  push) key="push" ;;
+  symbolic-ref) key="symbolic-ref" ;;
+esac
+
+for want in ${FAKE_FAIL:-}; do
+  if [ "$want" = "$key" ]; then
+    echo "fake git $key failed" >&2
+    exit 1
+  fi
+done
+
+if [ -n "${FAKE_DELAY:-}" ]; then
+  sleep "$FAKE_DELAY"
+fi
+
+case "$key" in
+  symbolic-ref) echo "${FAKE_ORIGIN_HEAD-origin/main}" ;;
+esac
+
+exit 0
