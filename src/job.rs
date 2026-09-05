@@ -9,13 +9,16 @@
 //! stdout and stderr arrive as one ordered stream, and handing the stream raw
 //! reads let a chunk of one land inside a line of the other in the farm's copy
 //! while the history, the tail and the attached clients still held that line
-//! whole. [`RunningJob`] waits for the exit or takes the group down.
+//! whole. No child may be forked between the terminal's creation and the
+//! close-on-exec flag both of its ends are given, so [`spawn`] holds a
+//! process-wide handoff from the moment it opens the terminal until the run is
+//! started. [`RunningJob`] waits for the exit or takes the group down.
 
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
@@ -32,6 +35,15 @@ use crate::protocol::types::{Branch, MAX_LOG_CHUNK, VALIDATE_TIMEOUT};
 
 const PTY_ROWS: u16 = 40;
 const PTY_COLS: u16 = 120;
+
+static TERMINAL_HANDOFF: Mutex<()> = Mutex::new(());
+
+fn hold_terminal_handoff() -> MutexGuard<'static, ()> {
+    match TERMINAL_HANDOFF.lock() {
+        Ok(handoff) => handoff,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 /// Whether ralphex runs in review mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,9 +302,10 @@ fn unanswered(path: &Path, budget: Duration) -> JobError {
 /// both of its output descriptors to the slave of a pseudo-terminal opened
 /// here, so it sees a terminal and emits the escape sequences a person watching
 /// `rxd` gets; a task of its own drains the master, which the child never
-/// inherits. A [`RunningJob`] dropped
-/// without being stopped kills the leader, so no path out of the agent can
-/// leave ralphex running in a checkout the next job is about to take.
+/// inherits - neither its own nor one opened for a run starting at the same
+/// moment. A [`RunningJob`] dropped without being stopped kills the leader, so
+/// no path out of the agent can leave ralphex running in a checkout the next
+/// job is about to take.
 ///
 /// # Errors
 ///
@@ -332,6 +345,7 @@ pub fn spawn(spec: &JobSpec, log: Arc<LogStream>) -> Result<RunningJob, JobError
     for (key, value) in env {
         command.env(key, value);
     }
+    let handoff = hold_terminal_handoff();
     let OpenptyResult { master, slave } = open_terminal()?;
     let errors = match slave.try_clone() {
         Ok(errors) => errors,
@@ -357,6 +371,7 @@ pub fn spawn(spec: &JobSpec, log: Arc<LogStream>) -> Result<RunningJob, JobError
 
     let spawned = command.spawn();
     drop(command);
+    drop(handoff);
     let child = match spawned {
         Ok(child) => child,
         Err(error) => return Err(JobError::SpawnFailed(format!("{ralphex_bin}: {error}"))),

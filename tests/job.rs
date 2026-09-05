@@ -612,3 +612,44 @@ async fn a_plan_inside_a_git_checkout_passes_validation() {
 
     validate(&spec).await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn no_run_inherits_the_terminal_opened_for_another_run() {
+    let farm = FakeFarm::start().await;
+    let (log, _handle) = stream(&farm);
+    let (dir, plan) = checkout();
+    let mut spec = spec(dir.path(), &plan);
+    with_env(&mut spec, "FAKE_RALPHEX_FDS", "1");
+
+    let mut runs = Vec::new();
+    for _ in 0..24 {
+        let spec = spec.clone();
+        let log = Arc::clone(&log);
+        runs.push(tokio::spawn(async move {
+            let mut job = spawn(&spec, log).unwrap();
+            job.wait().await.unwrap();
+            job.drain_output(Duration::from_secs(5)).await;
+        }));
+    }
+    for run in runs {
+        run.await.unwrap();
+    }
+    log.close().await;
+
+    let delivered = farm_text(&farm);
+    let mut listed = 0;
+    let mut inherited = Vec::new();
+    for line in delivered.lines() {
+        if line == "fds: listed" {
+            listed += 1;
+        }
+        if line.starts_with("fd: ") {
+            inherited.push(line);
+        }
+    }
+    assert_eq!(listed, 24, "a run could not list its descriptors");
+    assert!(
+        inherited.is_empty(),
+        "a run inherited a terminal opened for another run: {inherited:?}"
+    );
+}
