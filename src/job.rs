@@ -18,7 +18,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::signal::{Signal, killpg};
 use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
@@ -289,7 +289,8 @@ fn unanswered(path: &Path, budget: Duration) -> JobError {
 /// The child leads its own process group, reads nothing from stdin and writes
 /// both of its output descriptors to the slave of a pseudo-terminal opened
 /// here, so it sees a terminal and emits the escape sequences a person watching
-/// `rxd` gets; a task of its own drains the master. A [`RunningJob`] dropped
+/// `rxd` gets; a task of its own drains the master, which the child never
+/// inherits. A [`RunningJob`] dropped
 /// without being stopped kills the leader, so no path out of the agent can
 /// leave ralphex running in a checkout the next job is about to take.
 ///
@@ -420,6 +421,16 @@ fn open_terminal() -> Result<OpenptyResult, JobError> {
             return Err(JobError::SpawnFailed(format!(
                 "the pseudo-terminal refused a non-blocking master: {error}"
             )));
+        }
+    }
+    for end in [&master, &slave] {
+        match fcntl(end, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)) {
+            Ok(_flags) => {}
+            Err(error) => {
+                return Err(JobError::SpawnFailed(format!(
+                    "the pseudo-terminal refused to close on exec: {error}"
+                )));
+            }
         }
     }
 

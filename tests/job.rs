@@ -241,6 +241,36 @@ async fn the_run_sees_a_terminal_on_stdout() {
 }
 
 #[tokio::test]
+async fn the_run_inherits_neither_end_of_the_pseudo_terminal() {
+    let farm = FakeFarm::start().await;
+    let (log, _handle) = stream(&farm);
+    let (dir, plan) = checkout();
+    let mut spec = spec(dir.path(), &plan);
+    with_env(&mut spec, "FAKE_RALPHEX_FDS", "1");
+
+    let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
+    job.wait().await.unwrap();
+    job.drain_output(Duration::from_secs(5)).await;
+    log.close().await;
+
+    let delivered = farm_text(&farm);
+    assert!(
+        delivered.contains("fds: listed"),
+        "the run could not list its descriptors: {delivered}"
+    );
+    let mut inherited = Vec::new();
+    for line in delivered.lines() {
+        if line.starts_with("fd: ") {
+            inherited.push(line);
+        }
+    }
+    assert!(
+        inherited.is_empty(),
+        "the run inherited a descriptor of its own terminal: {inherited:?}"
+    );
+}
+
+#[tokio::test]
 async fn escape_sequences_reach_the_subscribers_but_not_the_farm() {
     let farm = FakeFarm::start().await;
     let (log, _handle) = stream(&farm);

@@ -33,6 +33,15 @@ if [ -n "${FAKE_RALPHEX_COLOR:-}" ]; then
   printf '2mlate\033[0m\n'
 fi
 
+if [ -n "${FAKE_RALPHEX_FDS:-}" ]; then
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -p $$ -a -d 3-64 | awk 'NR > 1 { print "fd: " $4 " " $NF }'
+    echo "fds: listed"
+  else
+    echo "fds: no lsof"
+  fi
+fi
+
 lines="${FAKE_RALPHEX_LINES:-0}"
 index=1
 while [ "$index" -le "$lines" ]; do
