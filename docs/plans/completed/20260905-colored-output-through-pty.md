@@ -243,11 +243,11 @@ A private enum in `src/bin/rxd.rs`, `Palette { Keep, Strip }`, decided once per 
 - Modify: `Cargo.toml`
 - Modify: `Cargo.lock`
 
-- [ ] in `README.md`, under "Run a plan from the terminal", add a paragraph: ralphex runs on a pseudo-terminal and its colours reach `rxd` when `rxd`'s stdout is a terminal; in a pipe `rxd` prints plain text; the farm, the dashboard and the completion tail always receive plain text
-- [ ] in `README.md`, adjust the architecture bullet that says the daemon "streams output" to say it streams plain text to the farm and the terminal's bytes to `rxd`
-- [ ] bump `version` in `Cargo.toml` to `0.2.0` and refresh `Cargo.lock` with `cargo update --workspace`
-- [ ] run `mise run check` one last time
-- [ ] move this plan to `docs/plans/completed/`
+- [x] in `README.md`, under "Run a plan from the terminal", add a paragraph: ralphex runs on a pseudo-terminal and its colours reach `rxd` when `rxd`'s stdout is a terminal; in a pipe `rxd` prints plain text; the farm, the dashboard and the completion tail always receive plain text
+- [x] in `README.md`, adjust the architecture bullet that says the daemon "streams output" to say it streams plain text to the farm and the terminal's bytes to `rxd`
+- [x] bump `version` in `Cargo.toml` to `0.2.0` and refresh `Cargo.lock` with `cargo update --workspace`
+- [x] run `mise run check` one last time
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
