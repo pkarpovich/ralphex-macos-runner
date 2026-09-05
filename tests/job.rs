@@ -151,7 +151,7 @@ async fn a_local_environment_entry_reaches_the_run() {
 }
 
 #[tokio::test]
-async fn both_pipes_reach_the_log_stream() {
+async fn both_output_descriptors_reach_the_log_stream() {
     let farm = FakeFarm::start().await;
     let (log, _handle) = stream(&farm);
     let (dir, plan) = checkout();
@@ -178,7 +178,7 @@ async fn both_pipes_reach_the_log_stream() {
 }
 
 #[tokio::test]
-async fn a_line_written_in_pieces_reaches_the_farm_unbroken() {
+async fn a_line_written_in_pieces_reaches_the_farm_in_the_order_it_was_written() {
     let farm = FakeFarm::start().await;
     let (log, _handle) = stream(&farm);
     let (dir, plan) = checkout();
@@ -188,22 +188,120 @@ async fn a_line_written_in_pieces_reaches_the_farm_unbroken() {
     let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
     job.wait().await.unwrap();
     job.drain_output(Duration::from_secs(5)).await;
+    let (replay, _live) = log.subscribe();
     log.close().await;
 
+    let mut whole = String::new();
+    for piece in 1..=8 {
+        whole.push_str(&format!("piece{piece}noise {piece}\n"));
+    }
+    let delivered = farm_text(&farm);
+    assert!(
+        delivered.contains(&whole),
+        "the pseudo-terminal reordered or lost a write: {delivered:?}"
+    );
+
+    let mut watched = String::new();
+    for line in &replay {
+        watched.push_str(line);
+        watched.push('\n');
+    }
+    assert!(
+        watched.contains(&whole),
+        "the subscribers saw a different stream than the farm: {watched:?}"
+    );
+}
+
+fn farm_text(farm: &FakeFarm) -> String {
     let mut delivered = Vec::new();
     for request in farm.requests_ending("/log") {
         delivered.extend(request.body);
     }
-    let delivered = String::from_utf8(delivered).unwrap();
-    let mut whole = String::new();
-    for piece in 1..=8 {
-        whole.push_str(&format!("piece{piece}"));
-    }
+    String::from_utf8(delivered).unwrap()
+}
+
+#[tokio::test]
+async fn the_run_sees_a_terminal_on_stdout() {
+    let farm = FakeFarm::start().await;
+    let (log, _handle) = stream(&farm);
+    let (dir, plan) = checkout();
+    let mut spec = spec(dir.path(), &plan);
+    with_env(&mut spec, "FAKE_RALPHEX_COLOR", "1");
+
+    let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
+    job.wait().await.unwrap();
+    job.drain_output(Duration::from_secs(5)).await;
+    log.close().await;
+
+    let delivered = farm_text(&farm);
     assert!(
-        delivered.contains(&whole),
-        "the stdout line reached the farm broken by stderr: {delivered}"
+        delivered.contains("tty: yes"),
+        "the run was handed a pipe rather than a terminal: {delivered}"
     );
-    assert!(delivered.contains("noise 8"), "{delivered}");
+}
+
+#[tokio::test]
+async fn escape_sequences_reach_the_subscribers_but_not_the_farm() {
+    let farm = FakeFarm::start().await;
+    let (log, _handle) = stream(&farm);
+    let (dir, plan) = checkout();
+    let mut spec = spec(dir.path(), &plan);
+    with_env(&mut spec, "FAKE_RALPHEX_COLOR", "1");
+
+    let (_replay, mut live) = log.subscribe();
+    let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
+    job.wait().await.unwrap();
+    job.drain_output(Duration::from_secs(5)).await;
+    let tail = log.tail();
+    log.close().await;
+
+    let mut watched = Vec::new();
+    while let Ok(line) = live.try_recv() {
+        watched.push(line);
+    }
+    let mut coloured = 0;
+    for line in &watched {
+        if line.contains("\u{1b}[32m") {
+            coloured += 1;
+        }
+    }
+    assert_eq!(
+        coloured, 2,
+        "the live client lost the colour the run wrote: {watched:?}"
+    );
+
+    let delivered = farm_text(&farm);
+    assert!(delivered.contains("green"), "{delivered}");
+    assert!(delivered.contains("late"), "{delivered}");
+    assert!(
+        !delivered.contains('\u{1b}'),
+        "an escape sequence reached the farm: {delivered:?}"
+    );
+    assert!(
+        !tail.contains('\u{1b}'),
+        "an escape sequence reached the tail: {tail:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_newline_reaches_the_farm_without_a_carriage_return() {
+    let farm = FakeFarm::start().await;
+    let (log, _handle) = stream(&farm);
+    let (dir, plan) = checkout();
+    let mut spec = spec(dir.path(), &plan);
+    with_env(&mut spec, "FAKE_RALPHEX_LINES", "3");
+
+    let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
+    job.wait().await.unwrap();
+    job.drain_output(Duration::from_secs(5)).await;
+    log.close().await;
+
+    let delivered = farm_text(&farm);
+    assert!(delivered.contains("out 3"), "{delivered}");
+    assert!(
+        !delivered.contains('\r'),
+        "the line discipline rewrote a newline: {delivered:?}"
+    );
 }
 
 #[tokio::test]
@@ -259,7 +357,7 @@ async fn a_megabyte_long_line_is_chunked_for_the_farm_and_split_for_subscribers(
 }
 
 #[tokio::test]
-async fn a_helper_holding_the_pipes_does_not_hold_up_the_exit_status() {
+async fn a_helper_holding_the_terminal_does_not_hold_up_the_exit_status() {
     let farm = FakeFarm::start().await;
     let (log, _handle) = stream(&farm);
     let (dir, plan) = checkout();
@@ -280,7 +378,7 @@ async fn a_helper_holding_the_pipes_does_not_hold_up_the_exit_status() {
 }
 
 #[tokio::test]
-async fn a_pipe_the_drain_gave_up_on_stops_feeding_the_log() {
+async fn a_terminal_the_drain_gave_up_on_stops_feeding_the_log() {
     let farm = FakeFarm::start().await;
     let (log, _handle) = stream(&farm);
     let (dir, plan) = checkout();
@@ -295,7 +393,7 @@ async fn a_pipe_the_drain_gave_up_on_stops_feeding_the_log() {
     let elapsed = started.elapsed();
     assert!(
         elapsed < Duration::from_millis(1800),
-        "the budget was spent once per pipe: {elapsed:?}"
+        "the budget was spent once per reader: {elapsed:?}"
     );
 
     tokio::time::sleep(Duration::from_secs(2)).await;

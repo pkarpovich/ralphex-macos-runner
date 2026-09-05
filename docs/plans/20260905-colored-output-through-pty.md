@@ -39,7 +39,7 @@ Load each skill below with the Skill tool and follow its conventions before impl
 - `src/ipc.rs`: `Response::Line { text: String }` is the only shape a line crosses the socket in; nothing changes there.
 - `src/protocol/types.rs`: `MAX_LOG_CHUNK` 64 KiB, `LOG_TAIL_LINES` 100, `LOG_TAIL_BYTES` 64 KiB, `LOG_BUFFER_BYTES` 4 MiB, `HISTORY_LINES` 2000, `HISTORY_BYTES` 4 MiB.
 - `Cargo.toml`: `nix = { version = "0.31.3", features = ["signal", "process", "user"] }`; `tokio` already has `net`, which is what gates `tokio::io::unix::AsyncFd`. No new crate is needed.
-- `nix` 0.31 (verified in the registry source): `nix::pty::openpty(winsize, termios) -> Result<OpenptyResult { master: OwnedFd, slave: OwnedFd }>`, `nix::pty::Winsize` (`ws_row`, `ws_col`, `ws_xpixel`, `ws_ypixel`, all `u16`), `nix::sys::termios::{tcgetattr, cfmakeraw, tcsetattr, SetArg}` and `nix::fcntl::{fcntl, FcntlArg::F_SETFL, OFlag::O_NONBLOCK}` all sit behind the `term` feature.
+- `nix` 0.31 (verified in the registry source): `nix::pty::openpty(winsize, termios) -> Result<OpenptyResult { master: OwnedFd, slave: OwnedFd }>`, `nix::pty::Winsize` (`ws_row`, `ws_col`, `ws_xpixel`, `ws_ypixel`, all `u16`), `nix::sys::termios::{tcgetattr, cfmakeraw, tcsetattr, SetArg}` sit behind the `term` feature. ⚠️ `nix::fcntl::{fcntl, FcntlArg, OFlag}` sit behind the `fs` feature, not `term` (found while implementing task 3), so `Cargo.toml` carries both.
 - ralphex 1.6.1 colour decision (verified in its vendored colour library): colour is on iff `NO_COLOR` is unset, `TERM` is not `dumb` and `isatty(stdout)`; `--no-color` only turns it off. Its only other terminal-dependent calls are the window size of stdout and an echo flag on stdin. It draws no spinners and rewrites no lines, so a terminal on stdout adds only SGR colour sequences to the stream.
 - Tests: `tests/support/fake-ralphex.sh` is a `sh` script driven by `FAKE_RALPHEX_*` variables; `tests/job.rs` drives `job::spawn` against a `FakeFarm` and reads what the farm received through `requests_ending("/log")` and `text()`; `tests/rxd_e2e.rs` starts the real daemon binary and the real `rxd` binary with a piped stdout and reads its lines; `tests/logstream.rs` covers the rings and the flusher.
 
@@ -202,15 +202,16 @@ A private enum in `src/bin/rxd.rs`, `Palette { Keep, Strip }`, decided once per 
 - Modify: `tests/support/fake-ralphex.sh`
 - Modify: `tests/job.rs`
 
-- [ ] in `job::spawn`, open the pseudo-terminal, set the slave raw, hand two slave descriptors to the child as stdout and stderr, set the master non-blocking and wrap it in `AsyncFd`, following the five ordered steps in Technical Details; map every failure before the spawn to `JobError::SpawnFailed`
-- [ ] replace the two `pump` tasks with one master pump that treats `EIO` and a zero read as the end, feeds the existing `LineAssembler` and finishes it; make sure no parent-side slave descriptor outlives `spawn`
-- [ ] update the `///` on `spawn` and `RunningJob` (it now drains one pseudo-terminal rather than two pipes) and the module docs at the top of `src/job.rs`
-- [ ] extend `tests/support/fake-ralphex.sh` with `FAKE_RALPHEX_COLOR` as specified in Technical Details
-- [ ] write `the_run_sees_a_terminal_on_stdout` in `tests/job.rs`: spawn the fake with `FAKE_RALPHEX_COLOR=1` and assert the farm's text contains `tty: yes`
-- [ ] write `escape_sequences_reach_the_subscribers_but_not_the_farm`: subscribe before spawning, assert the live receiver got a line containing `\u{1b}[32m`, the farm's text contains `green` and `late` with no `ESC` anywhere, and `tail()` has no `ESC`
-- [ ] write `a_newline_reaches_the_farm_without_a_carriage_return`: with the raw slave, the farm's text for `FAKE_RALPHEX_LINES=3` contains no `\r`
-- [ ] run the existing `tests/job.rs` cases unchanged - `both_pipes_reach_the_log_stream`, `a_line_written_in_pieces_reaches_the_farm_unbroken`, `a_megabyte_long_line_is_chunked_for_the_farm_and_split_for_subscribers`, `a_helper_holding_the_pipes_does_not_hold_up_the_exit_status`, `a_pipe_the_drain_gave_up_on_stops_feeding_the_log`, `stopping_takes_the_whole_process_group_down`, `a_group_member_that_ignores_the_signal_is_killed_within_the_grace` - and rename the two whose names say "pipes" to say what they now hold
-- [ ] run `mise run check` - must pass before task 4
+- [x] in `job::spawn`, open the pseudo-terminal, set the slave raw, hand two slave descriptors to the child as stdout and stderr, set the master non-blocking and wrap it in `AsyncFd`, following the five ordered steps in Technical Details; map every failure before the spawn to `JobError::SpawnFailed`
+- [x] replace the two `pump` tasks with one master pump that treats `EIO` and a zero read as the end, feeds the existing `LineAssembler` and finishes it; make sure no parent-side slave descriptor outlives `spawn`
+- [x] update the `///` on `spawn` and `RunningJob` (it now drains one pseudo-terminal rather than two pipes) and the module docs at the top of `src/job.rs`
+- [x] extend `tests/support/fake-ralphex.sh` with `FAKE_RALPHEX_COLOR` as specified in Technical Details
+- [x] write `the_run_sees_a_terminal_on_stdout` in `tests/job.rs`: spawn the fake with `FAKE_RALPHEX_COLOR=1` and assert the farm's text contains `tty: yes`
+- [x] write `escape_sequences_reach_the_subscribers_but_not_the_farm`: subscribe before spawning, assert the live receiver got a line containing `\u{1b}[32m`, the farm's text contains `green` and `late` with no `ESC` anywhere, and `tail()` has no `ESC`
+- [x] write `a_newline_reaches_the_farm_without_a_carriage_return`: with the raw slave, the farm's text for `FAKE_RALPHEX_LINES=3` contains no `\r`
+- [x] run the existing `tests/job.rs` cases unchanged - `both_pipes_reach_the_log_stream` (now `both_output_descriptors_reach_the_log_stream`), `a_megabyte_long_line_is_chunked_for_the_farm_and_split_for_subscribers`, `a_helper_holding_the_pipes_does_not_hold_up_the_exit_status` (now `a_helper_holding_the_terminal_...`), `a_pipe_the_drain_gave_up_on_stops_feeding_the_log` (now `a_terminal_the_drain_gave_up_on_...`), `stopping_takes_the_whole_process_group_down`, `a_group_member_that_ignores_the_signal_is_killed_within_the_grace` - and rename the ones whose names say "pipes" to say what they now hold
+- [x] ⚠️ `a_line_written_in_pieces_reaches_the_farm_unbroken` could not stay unchanged: one pseudo-terminal merges stdout and stderr into one ordered stream, so an unterminated stdout write joins the stderr line written after it, exactly as a terminal shows it. Renamed to `a_line_written_in_pieces_reaches_the_farm_in_the_order_it_was_written` and rewritten to assert the merged order, no loss, and that the farm's copy and the subscribers' copy carry the same stream
+- [x] run `mise run check` - must pass before task 4
 
 ### Task 4: Keep colour in rxd only on a terminal
 
@@ -233,7 +234,7 @@ A private enum in `src/bin/rxd.rs`, `Palette { Keep, Strip }`, decided once per 
 - [ ] verify the edge cases: a truncated sequence at a chunk cut, a line that is only a sequence, a helper holding the slave past the drain budget, `EIO` on the master ending the pump
 - [ ] run the full gate: `mise run check`
 - [ ] run the code-quality greps from the gate over `src/` and `tests/` and confirm nothing new
-- [ ] confirm `cargo tree -e features -i nix` shows `term` and no other new feature, and `Cargo.lock` gained no new crate
+- [ ] confirm `cargo tree -e features -i nix` shows `term` and `fs` and no other new feature, and `Cargo.lock` gained no new crate
 
 ### Task 6: Update documentation and bump the version
 

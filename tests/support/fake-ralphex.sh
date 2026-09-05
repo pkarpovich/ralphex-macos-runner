@@ -21,6 +21,18 @@ if [ -n "$record" ]; then
   } >"$record"
 fi
 
+if [ -n "${FAKE_RALPHEX_COLOR:-}" ]; then
+  if [ -t 1 ]; then
+    echo "tty: yes"
+  else
+    echo "tty: no"
+  fi
+  printf '\033[32mgreen\033[0m\n'
+  printf '\033[3'
+  sleep 0.05
+  printf '2mlate\033[0m\n'
+fi
+
 lines="${FAKE_RALPHEX_LINES:-0}"
 index=1
 while [ "$index" -le "$lines" ]; do

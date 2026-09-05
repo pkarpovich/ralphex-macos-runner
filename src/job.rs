@@ -2,26 +2,36 @@
 //!
 //! A [`JobSpec`] names everything the run needs; [`validate`] rejects a checkout
 //! or a plan the lifecycle table refuses before anything is spawned. [`spawn`]
-//! starts ralphex as the leader of its own process group and pumps both of its
-//! pipes into a [`LogStream`] one assembled line at a time, capped at
-//! [`MAX_LOG_CHUNK`]: the two pipes share the stream, and handing it raw reads
-//! let a chunk of stderr land inside a line of stdout in the farm's copy while
-//! the history, the tail and the attached clients still held that line whole.
-//! [`RunningJob`] waits for the exit or takes the group down.
+//! starts ralphex as the leader of its own process group, hands it a
+//! pseudo-terminal for both of its output descriptors so it colours its output
+//! the way it does for a person, and pumps the terminal's master into a
+//! [`LogStream`] one assembled line at a time, capped at [`MAX_LOG_CHUNK`]:
+//! stdout and stderr arrive as one ordered stream, and handing the stream raw
+//! reads let a chunk of one land inside a line of the other in the farm's copy
+//! while the history, the tail and the attached clients still held that line
+//! whole. [`RunningJob`] waits for the exit or takes the group down.
 
+use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::signal::{Signal, killpg};
+use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::Pid;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::unix::AsyncFd;
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 
 use crate::logstream::{LogStream, Terminator};
 use crate::protocol::types::{Branch, MAX_LOG_CHUNK, VALIDATE_TIMEOUT};
+
+const PTY_ROWS: u16 = 40;
+const PTY_COLS: u16 = 120;
 
 /// Whether ralphex runs in review mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,14 +286,17 @@ fn unanswered(path: &Path, budget: Duration) -> JobError {
 
 /// Starts ralphex for `spec` and tees its output into `log`.
 ///
-/// The child leads its own process group, reads nothing from stdin and has both
-/// of its pipes drained by tasks of their own. A [`RunningJob`] dropped without
-/// being stopped kills the leader, so no path out of the agent can leave ralphex
-/// running in a checkout the next job is about to take.
+/// The child leads its own process group, reads nothing from stdin and writes
+/// both of its output descriptors to the slave of a pseudo-terminal opened
+/// here, so it sees a terminal and emits the escape sequences a person watching
+/// `rxd` gets; a task of its own drains the master. A [`RunningJob`] dropped
+/// without being stopped kills the leader, so no path out of the agent can
+/// leave ralphex running in a checkout the next job is about to take.
 ///
 /// # Errors
 ///
-/// Returns [`JobError::SpawnFailed`] when the binary cannot be started or the
+/// Returns [`JobError::SpawnFailed`] when the pseudo-terminal cannot be opened,
+/// put in raw mode or watched, when the binary cannot be started, or when the
 /// started child reports no process id.
 ///
 /// # Panics
@@ -318,13 +331,32 @@ pub fn spawn(spec: &JobSpec, log: Arc<LogStream>) -> Result<RunningJob, JobError
     for (key, value) in env {
         command.env(key, value);
     }
+    let OpenptyResult { master, slave } = open_terminal()?;
+    let errors = match slave.try_clone() {
+        Ok(errors) => errors,
+        Err(error) => {
+            return Err(JobError::SpawnFailed(format!(
+                "the pseudo-terminal could not be shared with stderr: {error}"
+            )));
+        }
+    };
+    let master = match AsyncFd::new(File::from(master)) {
+        Ok(master) => master,
+        Err(error) => {
+            return Err(JobError::SpawnFailed(format!(
+                "the pseudo-terminal could not be watched: {error}"
+            )));
+        }
+    };
     command.stdin(Stdio::null());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
+    command.stdout(Stdio::from(slave));
+    command.stderr(Stdio::from(errors));
     command.process_group(0);
     command.kill_on_drop(true);
 
-    let mut child = match command.spawn() {
+    let spawned = command.spawn();
+    drop(command);
+    let child = match spawned {
         Ok(child) => child,
         Err(error) => return Err(JobError::SpawnFailed(format!("{ralphex_bin}: {error}"))),
     };
@@ -339,15 +371,7 @@ pub fn spawn(spec: &JobSpec, log: Arc<LogStream>) -> Result<RunningJob, JobError
         )));
     };
 
-    let mut readers = Vec::with_capacity(2);
-    let stdout = child.stdout.take();
-    if let Some(stdout) = stdout {
-        readers.push(tokio::spawn(pump(stdout, Arc::clone(&log))));
-    }
-    let stderr = child.stderr.take();
-    if let Some(stderr) = stderr {
-        readers.push(tokio::spawn(pump(stderr, Arc::clone(&log))));
-    }
+    let readers = vec![tokio::spawn(pump(master, log))];
 
     Ok(RunningJob {
         child,
@@ -356,7 +380,53 @@ pub fn spawn(spec: &JobSpec, log: Arc<LogStream>) -> Result<RunningJob, JobError
     })
 }
 
-/// A ralphex process and the tasks draining its pipes.
+fn open_terminal() -> Result<OpenptyResult, JobError> {
+    let winsize = Winsize {
+        ws_row: PTY_ROWS,
+        ws_col: PTY_COLS,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let opened = match openpty(Some(&winsize), None) {
+        Ok(opened) => opened,
+        Err(error) => {
+            return Err(JobError::SpawnFailed(format!(
+                "no pseudo-terminal for the run: {error}"
+            )));
+        }
+    };
+    let OpenptyResult { master, slave } = opened;
+
+    let mut settings = match tcgetattr(&slave) {
+        Ok(settings) => settings,
+        Err(error) => {
+            return Err(JobError::SpawnFailed(format!(
+                "the pseudo-terminal reported no settings: {error}"
+            )));
+        }
+    };
+    cfmakeraw(&mut settings);
+    match tcsetattr(&slave, SetArg::TCSANOW, &settings) {
+        Ok(()) => {}
+        Err(error) => {
+            return Err(JobError::SpawnFailed(format!(
+                "the pseudo-terminal refused raw mode: {error}"
+            )));
+        }
+    }
+    match fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)) {
+        Ok(_flags) => {}
+        Err(error) => {
+            return Err(JobError::SpawnFailed(format!(
+                "the pseudo-terminal refused a non-blocking master: {error}"
+            )));
+        }
+    }
+
+    Ok(OpenptyResult { master, slave })
+}
+
+/// A ralphex process and the task draining its pseudo-terminal.
 pub struct RunningJob {
     child: Child,
     pgid: Pid,
@@ -372,10 +442,11 @@ impl RunningJob {
 
     /// Waits for the run to exit.
     ///
-    /// The pipes are emptied separately by [`RunningJob::drain_output`]: a
-    /// helper that reparented out of the process group holds them open after
-    /// the leader is gone, and draining here would let a terminal event that
-    /// arrives in that window discard a status the run already produced.
+    /// The pseudo-terminal is emptied separately by
+    /// [`RunningJob::drain_output`]: a helper that reparented out of the process
+    /// group holds its slave open after the leader is gone, and draining here
+    /// would let a terminal event that arrives in that window discard a status
+    /// the run already produced.
     ///
     /// # Errors
     ///
@@ -413,13 +484,13 @@ impl RunningJob {
         Ok(exited)
     }
 
-    /// Waits out `budget` for the tasks draining the run's pipes to finish.
+    /// Waits out `budget` for the task draining the run's output to finish.
     ///
-    /// The budget covers the whole drain rather than each pipe in turn, and a
-    /// task still reading when it runs out is aborted: a helper that reparented
-    /// out of the process group holds the pipe open for as long as it lives, so
-    /// a task merely dropped here would outlive the run forever, holding the
-    /// log stream the flusher has already stopped serving.
+    /// The budget covers the whole drain, and a task still reading when it runs
+    /// out is aborted: a helper that reparented out of the process group holds
+    /// the pseudo-terminal's slave open for as long as it lives, so a task
+    /// merely dropped here would outlive the run forever, holding the log
+    /// stream the flusher has already stopped serving.
     pub async fn drain_output(&mut self, budget: Duration) {
         let readers = std::mem::take(&mut self.readers);
         let deadline = tokio::time::Instant::now() + budget;
@@ -433,21 +504,23 @@ impl RunningJob {
     }
 }
 
-async fn pump<R>(mut pipe: R, log: Arc<LogStream>)
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
+async fn pump(master: AsyncFd<File>, log: Arc<LogStream>) {
     let mut buffer = vec![0u8; MAX_LOG_CHUNK];
     let mut lines = LineAssembler::new();
     loop {
-        let read = pipe.read(&mut buffer).await;
-        let Ok(read) = read else {
+        let Ok(mut ready) = master.readable().await else {
             break;
         };
-        if read == 0 {
-            break;
+        let taken = ready.try_io(|terminal| {
+            let mut terminal = terminal.get_ref();
+            terminal.read(&mut buffer)
+        });
+        match taken {
+            Err(_would_block) => continue,
+            Ok(Err(_closed)) => break,
+            Ok(Ok(0)) => break,
+            Ok(Ok(read)) => lines.feed(&buffer[..read], &log),
         }
-        lines.feed(&buffer[..read], &log);
     }
     lines.finish(&log);
 }
