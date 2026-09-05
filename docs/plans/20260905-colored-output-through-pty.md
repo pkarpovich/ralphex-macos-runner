@@ -175,12 +175,12 @@ A private enum in `src/bin/rxd.rs`, `Palette { Keep, Strip }`, decided once per 
 - Create: `src/ansi.rs`
 - Modify: `src/lib.rs`
 
-- [ ] add `"term"` to the `nix` feature list in `Cargo.toml` and confirm `cargo build` still succeeds with nothing else changed
-- [ ] create `src/ansi.rs` with `pub fn plain(text: &str) -> String` implementing the grammar in Technical Details, documented with a one-line summary and an `# Examples` doctest that strips `ESC [ 3 2 m ok ESC [ 0 m` to `ok`
-- [ ] add `pub mod ansi;` to `src/lib.rs` and a sentence to the crate docs naming the two views the stripper separates
-- [ ] write a table-driven unit test module in `src/ansi.rs`: plain text unchanged, one SGR pair, several sequences in one line, a multi-parameter SGR, `ESC [ K`, an OSC ended by `BEL`, an OSC ended by `ST`, a bare `ESC` plus one character, a truncated `ESC [ 3` at the end, a tab and a carriage return kept, a line with Cyrillic and an emoji kept whole
-- [ ] write the error-shaped cases: an empty string, a string that is only `ESC`, a string that is only a complete sequence (all give an empty result)
-- [ ] run `mise run check` - must pass before task 2
+- [x] add `"term"` to the `nix` feature list in `Cargo.toml` and confirm `cargo build` still succeeds with nothing else changed
+- [x] create `src/ansi.rs` with `pub fn plain(text: &str) -> String` implementing the grammar in Technical Details, documented with a one-line summary and an `# Examples` doctest that strips `ESC [ 3 2 m ok ESC [ 0 m` to `ok`
+- [x] add `pub mod ansi;` to `src/lib.rs` and a sentence to the crate docs naming the two views the stripper separates
+- [x] write a table-driven unit test module in `src/ansi.rs`: plain text unchanged, one SGR pair, several sequences in one line, a multi-parameter SGR, `ESC [ K`, an OSC ended by `BEL`, an OSC ended by `ST`, a bare `ESC` plus one character, a truncated `ESC [ 3` at the end, a tab and a carriage return kept, a line with Cyrillic and an emoji kept whole
+- [x] write the error-shaped cases: an empty string, a string that is only `ESC`, a string that is only a complete sequence (all give an empty result)
+- [x] run `mise run check` - must pass before task 2
 
 ### Task 2: Split the farm's views from the local views in the log stream
 
