@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::signal::kill;
 use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
@@ -337,6 +337,8 @@ pub fn rxd_on_terminal(
         ws_ypixel: 0,
     };
     let OpenptyResult { master, slave } = openpty(Some(&winsize), None).unwrap();
+    fcntl(&master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).unwrap();
+    fcntl(&slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).unwrap();
     let mut settings = tcgetattr(&slave).unwrap();
     cfmakeraw(&mut settings);
     tcsetattr(&slave, SetArg::TCSANOW, &settings).unwrap();
