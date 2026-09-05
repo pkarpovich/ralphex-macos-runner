@@ -230,11 +230,11 @@ A private enum in `src/bin/rxd.rs`, `Palette { Keep, Strip }`, decided once per 
 
 ### Task 5: Verify acceptance criteria
 
-- [ ] verify all requirements from Overview are implemented: the child sees a terminal, the farm and the tail are plain, the history and the live clients carry the sequences, `rxd` strips in a pipe and keeps on a terminal
-- [ ] verify the edge cases: a truncated sequence at a chunk cut, a line that is only a sequence, a helper holding the slave past the drain budget, `EIO` on the master ending the pump
-- [ ] run the full gate: `mise run check`
-- [ ] run the code-quality greps from the gate over `src/` and `tests/` and confirm nothing new
-- [ ] confirm `cargo tree -e features -i nix` shows `term` and `fs` and no other new feature, and `Cargo.lock` gained no new crate
+- [x] verify all requirements from Overview are implemented: the child sees a terminal (`the_run_sees_a_terminal_on_stdout`), the farm and the tail are plain and the history and the live clients carry the sequences (`escape_sequences_reach_the_subscribers_but_not_the_farm`, `the_farm_and_the_tail_get_plain_text_while_the_history_keeps_the_colour`), `rxd` strips in a pipe and keeps on a terminal (`a_client_in_a_pipe_prints_plain_text`, `a_client_on_a_terminal_keeps_the_colour`, `a_late_attach_replays_the_colour_it_missed`)
+- [x] verify the edge cases: a truncated sequence at a chunk cut (`a_truncated_sequence_takes_the_rest_of_the_line_with_it` covers both halves - the cut piece loses its dangling `ESC`, the continuation piece keeps the remaining bytes as literal text, which is the behaviour Technical Details accepts), a line that is only a sequence (`a_line_that_is_only_an_escape_sequence_reaches_the_farm_as_an_empty_line`), a helper holding the slave past the drain budget (`a_helper_holding_the_terminal_does_not_hold_up_the_exit_status`, `a_terminal_the_drain_gave_up_on_stops_feeding_the_log`), `EIO` on the master ending the pump (the `Ok(Err(_closed)) => break` arm; every `tests/job.rs` case that drains after the child exits would burn its whole budget without it)
+- [x] run the full gate: `mise run check` - green, 0 failures across all suites, clippy clean under `-D warnings`
+- [x] run the code-quality greps from the gate over `src/` and `tests/` and confirm nothing new - all four return nothing
+- [x] confirm `cargo tree -e features -i nix` shows `term` and `fs` and no other new feature, and `Cargo.lock` gained no new crate - the tree lists `default`, `signal`, `process`, `user`, `feature` (transitive of the pre-existing `user`), `term` and `fs`; `Cargo.lock` is identical to `master`
 
 ### Task 6: Update documentation and bump the version
 
