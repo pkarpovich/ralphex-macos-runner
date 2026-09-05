@@ -305,6 +305,26 @@ async fn a_newline_reaches_the_farm_without_a_carriage_return() {
 }
 
 #[tokio::test]
+async fn the_last_output_a_run_left_unterminated_reaches_the_farm() {
+    let farm = FakeFarm::start().await;
+    let (log, _handle) = stream(&farm);
+    let (dir, plan) = checkout();
+    let mut spec = spec(dir.path(), &plan);
+    with_env(&mut spec, "FAKE_RALPHEX_UNTERMINATED", "no newline here");
+
+    let mut job = spawn(&spec, Arc::clone(&log)).unwrap();
+    job.wait().await.unwrap();
+    job.drain_output(Duration::from_secs(5)).await;
+    log.close().await;
+
+    let delivered = farm_text(&farm);
+    assert!(
+        delivered.contains("no newline here"),
+        "the master never reported the end of the output: {delivered:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_nonzero_exit_code_propagates() {
     let farm = FakeFarm::start().await;
     let (log, _handle) = stream(&farm);

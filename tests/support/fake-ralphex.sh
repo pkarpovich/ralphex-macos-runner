@@ -100,6 +100,10 @@ if [ -n "$ignore_term" ]; then
   done
 fi
 
+if [ -n "${FAKE_RALPHEX_UNTERMINATED:-}" ]; then
+  printf '%s' "$FAKE_RALPHEX_UNTERMINATED"
+fi
+
 sleep "${FAKE_RALPHEX_SLEEP:-0}"
 
 exit "${FAKE_RALPHEX_EXIT:-0}"

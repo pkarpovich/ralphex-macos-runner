@@ -118,8 +118,8 @@ A debug build uses `ralphex-macos-runner-dev` for its application and log direct
 
 ```fish
 # bump version in Cargo.toml, commit, then
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 The tag must match `version` in `Cargo.toml` exactly; the workflow fails if it does not. It runs `mise run check`, builds for `aarch64-apple-darwin`, signs both binaries with a Developer ID, publishes the tarball as a GitHub release and rewrites `Formula/ralphex-macos-runner.rb` in `pkarpovich/homebrew-apps` from `docs/formula-template.rb`. It needs the secrets `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD` and `HOMEBREW_TAP_TOKEN`, and the repository variable `SIGN_IDENTITY`.
