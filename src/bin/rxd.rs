@@ -6,15 +6,19 @@
 //! detaches the terminal: the run keeps going in the daemon. The handler is
 //! installed before the first answer is waited for, because the daemon can hold
 //! that answer for the length of a farm poll and the run it is about to open
-//! must not die with the terminal that asked for it.
+//! must not die with the terminal that asked for it. A run's lines carry
+//! ralphex's escape sequences as it wrote them: they are printed unchanged when
+//! this client's stdout is a terminal and stripped when it is anything else.
 
 use std::future::Future;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
+use ralphex_macos_runner::ansi;
 use ralphex_macos_runner::ipc::{self, IpcError, Response, RunRequest};
 use ralphex_macos_runner::job::Worktree;
 use ralphex_macos_runner::paths;
@@ -34,6 +38,21 @@ type Interrupt = Pin<Box<dyn Future<Output = ()> + Send>>;
 enum Notice {
     Poll,
     Quiet,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Palette {
+    Keep,
+    Strip,
+}
+
+impl Palette {
+    fn of_stdout() -> Palette {
+        match std::io::stdout().is_terminal() {
+            true => Palette::Keep,
+            false => Palette::Strip,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -176,6 +195,7 @@ async fn run_plan(socket: Option<PathBuf>, run: RunArgs) -> ExitCode {
 }
 
 async fn session(socket: Option<PathBuf>, command: ipc::Command, notice: Notice) -> ExitCode {
+    let palette = Palette::of_stdout();
     let mut stream = match connect(socket).await {
         Ok(stream) => stream,
         Err(message) => {
@@ -220,9 +240,9 @@ async fn session(socket: Option<PathBuf>, command: ipc::Command, notice: Notice)
             return ExitCode::FAILURE;
         }
     };
-    match show(first) {
+    match show(first, palette) {
         Some(code) => code,
-        None => follow(&mut stream, &mut interrupted).await,
+        None => follow(&mut stream, &mut interrupted, palette).await,
     }
 }
 
@@ -236,7 +256,7 @@ fn announce(notice: &Notice) {
     }
 }
 
-fn show(response: Response) -> Option<ExitCode> {
+fn show(response: Response, palette: Palette) -> Option<ExitCode> {
     match response {
         Response::Started {
             run_id,
@@ -247,7 +267,10 @@ fn show(response: Response) -> Option<ExitCode> {
             None
         }
         Response::Line { text } => {
-            println!("{text}");
+            match palette {
+                Palette::Keep => println!("{text}"),
+                Palette::Strip => println!("{}", ansi::plain(&text)),
+            }
             None
         }
         Response::Ended {
@@ -270,7 +293,11 @@ fn show(response: Response) -> Option<ExitCode> {
     }
 }
 
-async fn follow(stream: &mut UnixStream, interrupted: &mut Interrupt) -> ExitCode {
+async fn follow(
+    stream: &mut UnixStream,
+    interrupted: &mut Interrupt,
+    palette: Palette,
+) -> ExitCode {
     loop {
         let received = tokio::select! {
             received = ipc::receive::<Response, _>(stream) => received,
@@ -290,7 +317,7 @@ async fn follow(stream: &mut UnixStream, interrupted: &mut Interrupt) -> ExitCod
                 return ExitCode::FAILURE;
             }
         };
-        if let Some(code) = show(response) {
+        if let Some(code) = show(response, palette) {
             return code;
         }
     }

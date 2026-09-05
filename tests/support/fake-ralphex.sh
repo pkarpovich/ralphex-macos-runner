@@ -21,6 +21,27 @@ if [ -n "$record" ]; then
   } >"$record"
 fi
 
+if [ -n "${FAKE_RALPHEX_COLOR:-}" ]; then
+  if [ -t 1 ]; then
+    echo "tty: yes"
+  else
+    echo "tty: no"
+  fi
+  printf '\033[32mgreen\033[0m\n'
+  printf '\033[3'
+  sleep 0.05
+  printf '2mlate\033[0m\n'
+fi
+
+if [ -n "${FAKE_RALPHEX_FDS:-}" ]; then
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -p $$ -a -d 3-64 | awk 'NR > 1 { print "fd: " $4 " " $NF }'
+    echo "fds: listed"
+  else
+    echo "fds: no lsof"
+  fi
+fi
+
 lines="${FAKE_RALPHEX_LINES:-0}"
 index=1
 while [ "$index" -le "$lines" ]; do
@@ -86,6 +107,10 @@ if [ -n "$ignore_term" ]; then
   while :; do
     sleep 0.05
   done
+fi
+
+if [ -n "${FAKE_RALPHEX_UNTERMINATED:-}" ]; then
+  printf '%s' "$FAKE_RALPHEX_UNTERMINATED"
 fi
 
 sleep "${FAKE_RALPHEX_SLEEP:-0}"

@@ -4,15 +4,21 @@
 
 pub mod fake_farm;
 
+use std::fs::File;
 use std::future::Future;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
+use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::signal::kill;
+use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::Pid;
 use ralphex_macos_runner::agent::AgentOptions;
 use ralphex_macos_runner::logstream::Ticker;
@@ -20,6 +26,7 @@ use ralphex_macos_runner::pr::PrTools;
 use ralphex_macos_runner::protocol::client::Sleeper;
 use ralphex_macos_runner::protocol::types::{Branch, CompleteRequest, CreatePr, Job, RunId};
 use tempfile::TempDir;
+use tokio::io::unix::AsyncFd;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 
@@ -279,6 +286,83 @@ pub fn rxd_argv(checkout: &Checkout, args: &[&str], env: &[(&str, &str)]) -> tok
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
     command.spawn().unwrap()
+}
+
+/// The master side of a pseudo-terminal a client writes its output to.
+pub struct Terminal {
+    master: AsyncFd<File>,
+}
+
+impl Terminal {
+    /// Reads the master until every slave is closed and returns what it carried.
+    pub async fn drain(&mut self) -> String {
+        let mut bytes = Vec::new();
+        let mut buffer = vec![0u8; 8192];
+        loop {
+            let Ok(mut ready) = self.master.readable().await else {
+                break;
+            };
+            let taken = ready.try_io(|terminal| {
+                let mut terminal = terminal.get_ref();
+                terminal.read(&mut buffer)
+            });
+            match taken {
+                Err(_would_block) => continue,
+                Ok(Err(_closed)) => break,
+                Ok(Ok(0)) => break,
+                Ok(Ok(read)) => bytes.extend_from_slice(&buffer[..read]),
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+/// Spawns the real `rxd` against `socket` with a pseudo-terminal for its stdout.
+///
+/// # Panics
+///
+/// Panics when the pseudo-terminal cannot be opened or the binary cannot be
+/// started.
+#[must_use]
+pub fn rxd_on_terminal(
+    socket: &Path,
+    checkout: &Checkout,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (tokio::process::Child, Terminal) {
+    let winsize = Winsize {
+        ws_row: 40,
+        ws_col: 120,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let OpenptyResult { master, slave } = openpty(Some(&winsize), None).unwrap();
+    fcntl(&master, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).unwrap();
+    fcntl(&slave, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).unwrap();
+    let mut settings = tcgetattr(&slave).unwrap();
+    cfmakeraw(&mut settings);
+    tcsetattr(&slave, SetArg::TCSANOW, &settings).unwrap();
+    fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).unwrap();
+    let master = AsyncFd::new(File::from(master)).unwrap();
+
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_rxd"));
+    for argument in args {
+        command.arg(argument);
+    }
+    command.arg("--socket").arg(socket);
+    command.current_dir(checkout.dir());
+    command.env_remove("CLAUDE_CONFIG_DIR");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::from(slave));
+    command.stderr(Stdio::piped());
+    let spawned = command.spawn();
+    drop(command);
+    let client = spawned.unwrap();
+
+    (client, Terminal { master })
 }
 
 /// A [`Sleeper`] that returns at once, records every delay and advances a clock

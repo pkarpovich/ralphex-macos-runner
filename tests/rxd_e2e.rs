@@ -23,7 +23,7 @@ use ralphex_macos_runner::protocol::types::{
 use support::fake_farm::{FakeFarm, Reply};
 use support::{
     Checkout, Record, TestSleeper, alive, completion, dead, invocations, local_job, options, rxd,
-    rxd_argv, spawned, wait_for,
+    rxd_argv, rxd_on_terminal, spawned, wait_for,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::UnixStream;
@@ -839,5 +839,93 @@ async fn two_attached_clients_replay_the_history_and_follow_the_run() {
         assert!(printed.contains("err 2"), "{printed}");
         assert!(printed.contains("done"), "{printed}");
     }
+    drop(daemon.raise);
+}
+
+fn delivered(farm: &FakeFarm) -> String {
+    let mut bytes = Vec::new();
+    for request in farm.requests_ending("/log") {
+        bytes.extend(request.body);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+#[tokio::test]
+async fn a_client_in_a_pipe_prints_plain_text() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_COLOR", "1")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(local_job(&checkout, "local-color-1"))));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let output = client.wait_with_output().await.unwrap();
+
+    let printed = text(&output);
+    assert!(output.status.success(), "{printed}");
+    assert!(printed.contains("tty: yes"), "{printed}");
+    assert!(printed.contains("green"), "{printed}");
+    assert!(printed.contains("late"), "{printed}");
+    assert!(!printed.contains('\u{1b}'), "{printed}");
+    let received = delivered(&farm);
+    assert!(received.contains("green"), "{received}");
+    assert!(!received.contains('\u{1b}'), "{received}");
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_client_on_a_terminal_keeps_the_colour() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_COLOR", "1")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(local_job(&checkout, "local-color-2"))));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let (mut client, mut terminal) =
+        rxd_on_terminal(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let seen = terminal.drain().await;
+    let status = client.wait().await.unwrap();
+
+    assert!(status.success(), "{seen}");
+    assert!(seen.contains("\u{1b}[32mgreen\u{1b}[0m"), "{seen:?}");
+    assert!(seen.contains("\u{1b}[32mlate\u{1b}[0m"), "{seen:?}");
+    let received = delivered(&farm);
+    assert!(!received.contains('\u{1b}'), "{received}");
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_late_attach_replays_the_colour_it_missed() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_COLOR", "1"), ("FAKE_RALPHEX_SLEEP", "1")]);
+    let farm = FakeFarm::start().await;
+    farm.push_claim(Reply::Job(Box::new(local_job(&checkout, "FARM-COLOR-1"))));
+    farm.always_claim(Reply::Hold);
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::Yes).await;
+    let history = wait_for(|| {
+        let current = daemon.agent.current()?;
+        let (replay, _live) = current.log().subscribe();
+        let mut coloured = false;
+        for line in &replay {
+            if line.contains("\u{1b}[32mlate\u{1b}[0m") {
+                coloured = true;
+            }
+        }
+        match coloured {
+            true => Some(replay),
+            false => None,
+        }
+    })
+    .await;
+    assert!(history.is_some(), "the run never printed a coloured line");
+
+    let (mut client, mut terminal) = rxd_on_terminal(&daemon.socket, &checkout, &["attach"], &[]);
+    let seen = terminal.drain().await;
+    let status = client.wait().await.unwrap();
+
+    assert!(status.success(), "{seen}");
+    assert!(seen.contains("run FARM-COLOR-1"), "{seen}");
+    assert!(seen.contains("\u{1b}[32mgreen\u{1b}[0m"), "{seen:?}");
+    assert!(seen.contains("\u{1b}[32mlate\u{1b}[0m"), "{seen:?}");
     drop(daemon.raise);
 }

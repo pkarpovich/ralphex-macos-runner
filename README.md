@@ -4,7 +4,7 @@ A native runner for [ralphex-farm](https://github.com/pkarpovich/ralphex-farm). 
 
 Two binaries ship together:
 
-- `ralphex-macos-runner` - the daemon. Long-polls the farm for jobs, runs ralphex, streams output, heartbeats, reports completion, opens the pull request.
+- `ralphex-macos-runner` - the daemon. Long-polls the farm for jobs, runs ralphex, streams plain text to the farm and the terminal's own bytes to `rxd`, heartbeats, reports completion, opens the pull request.
 - `rxd` - the local client. `rxd <plan>` from a project directory opens a run on the farm **without a Linear ticket**, hands it to the daemon and streams the output to the terminal; Ctrl-C detaches and the run keeps going; `rxd attach` reconnects.
 
 Both entry points converge on the same execution path inside the daemon. The only difference is who opened the run and whether a terminal is attached.
@@ -63,6 +63,8 @@ rxd uninstall
 - Staying attached to the end exits 0 for `done` and 1 for `error`.
 - `CLAUDE_CONFIG_DIR` is forwarded from your environment when set, so a run started from a work shell uses the work Claude profile.
 
+ralphex runs on a pseudo-terminal, so it emits the colours it emits when you start it by hand. `rxd` keeps them when its own stdout is a terminal and strips them when it is not, so `rxd <plan> | cat` and a redirect to a file stay plain, and `rxd attach` replays the colours it missed. The farm, its dashboard and the `log_tail` of a failed run always receive plain text - the escape sequences never leave this Mac.
+
 When the daemon is inside a claim long-poll, `rxd` prints `waiting for the daemon to finish its farm poll (this can take up to 85 s)` and waits for the poll to return; nothing is aborted, so no job the farm dispatched can be lost. If the poll returns a job - or a run is already going - `rxd` reports the running run id and exits 1.
 
 The daemon runs ralphex in the checkout **as it is**: nothing is cloned, fetched, reset or cleaned, and the checkout is left on the feature branch afterwards, exactly like a run by hand.
@@ -100,7 +102,7 @@ Homebrew only replaces the binaries in its prefix; `rxd install` copies the new 
 
 The daemon exits **2** when the farm answers `409` to a claim or a heartbeat, meaning the two no longer speak the same protocol version. A running job is stopped through the normal signal sequence first, the log line names both versions, and launchd's `KeepAlive` restarts the daemon under its own throttle - so a mismatch shows up as a restart loop in the log, not as a silent runner that claims nothing. Exit 1 is a missing or invalid `config.toml` at startup; exit 0 is a clean shutdown after a drain. A farm that cannot be reached is not a startup failure: the claim loop logs `the claim failed: ...` once per poll and keeps trying.
 
-On `SIGTERM` or `SIGINT` the daemon stops claiming and lets a running job finish for up to `drain_timeout`, then stops it and reports it as `runner_shutdown`. A second `SIGTERM` or `SIGINT` cuts the remaining drain to nothing: the run is stopped at once and still reported `runner_shutdown`, so an operator who does not want to wait out the drain never has to reach for `SIGKILL`. A run `rxd` started is drained the same way: the daemon leaves only once its slot is free again. The plist carries an `ExitTimeOut` covering the whole sequence - `drain_timeout` plus the stop grace, the pipe drain, the log stream's last flush and the budget the completion is retried for - because launchd's default of 20 seconds would `SIGKILL` the daemon mid-drain and leave the farm to finalise the run `runner_lost`. Raising `drain_timeout` therefore needs another `rxd install` to rewrite the plist.
+On `SIGTERM` or `SIGINT` the daemon stops claiming and lets a running job finish for up to `drain_timeout`, then stops it and reports it as `runner_shutdown`. A second `SIGTERM` or `SIGINT` cuts the remaining drain to nothing: the run is stopped at once and still reported `runner_shutdown`, so an operator who does not want to wait out the drain never has to reach for `SIGKILL`. A run `rxd` started is drained the same way: the daemon leaves only once its slot is free again. The plist carries an `ExitTimeOut` covering the whole sequence - `drain_timeout` plus the stop grace, the terminal drain, the log stream's last flush and the budget the completion is retried for - because launchd's default of 20 seconds would `SIGKILL` the daemon mid-drain and leave the farm to finalise the run `runner_lost`. Raising `drain_timeout` therefore needs another `rxd install` to rewrite the plist.
 
 ## Development
 
@@ -116,8 +118,8 @@ A debug build uses `ralphex-macos-runner-dev` for its application and log direct
 
 ```fish
 # bump version in Cargo.toml, commit, then
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 The tag must match `version` in `Cargo.toml` exactly; the workflow fails if it does not. It runs `mise run check`, builds for `aarch64-apple-darwin`, signs both binaries with a Developer ID, publishes the tarball as a GitHub release and rewrites `Formula/ralphex-macos-runner.rb` in `pkarpovich/homebrew-apps` from `docs/formula-template.rb`. It needs the secrets `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD` and `HOMEBREW_TAP_TOKEN`, and the repository variable `SIGN_IDENTITY`.
