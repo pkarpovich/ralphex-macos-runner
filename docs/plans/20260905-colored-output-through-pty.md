@@ -220,13 +220,13 @@ A private enum in `src/bin/rxd.rs`, `Palette { Keep, Strip }`, decided once per 
 - Modify: `tests/support/mod.rs`
 - Modify: `tests/rxd_e2e.rs`
 
-- [ ] add the private `Palette` enum to `src/bin/rxd.rs`, decide it once from `std::io::stdout().is_terminal()` where the session starts, pass it to `show`, and print `Response::Line` through `ansi::plain` under `Strip`
-- [ ] update the `//!` at the top of `src/bin/rxd.rs` with one sentence on when colour is kept
-- [ ] add the pseudo-terminal launcher for `rxd` to `tests/support/mod.rs` as described in Technical Details, alongside the existing piped `rxd_argv`
-- [ ] write `a_client_in_a_pipe_prints_plain_text` in `tests/rxd_e2e.rs`: run the fake with `FAKE_RALPHEX_COLOR=1` through the daemon and the piped `rxd`, assert the client's lines contain `green` and no `ESC`, and the fake farm's text contains no `ESC`
-- [ ] write `a_client_on_a_terminal_keeps_the_colour`: same run through the pseudo-terminal launcher, assert the bytes read from the master contain `\u{1b}[32m`
-- [ ] write `a_late_attach_replays_the_colour_it_missed`: attach on a terminal after the run printed, assert the replay carries the sequence
-- [ ] run `mise run check` - must pass before task 5
+- [x] add the private `Palette` enum to `src/bin/rxd.rs`, decide it once from `std::io::stdout().is_terminal()` where the session starts, pass it to `show`, and print `Response::Line` through `ansi::plain` under `Strip`
+- [x] update the `//!` at the top of `src/bin/rxd.rs` with one sentence on when colour is kept
+- [x] add the pseudo-terminal launcher for `rxd` to `tests/support/mod.rs` as described in Technical Details, alongside the existing piped `rxd_argv`
+- [x] write `a_client_in_a_pipe_prints_plain_text` in `tests/rxd_e2e.rs`: run the fake with `FAKE_RALPHEX_COLOR=1` through the daemon and the piped `rxd`, assert the client's lines contain `green` and no `ESC`, and the fake farm's text contains no `ESC`
+- [x] write `a_client_on_a_terminal_keeps_the_colour`: same run through the pseudo-terminal launcher, assert the bytes read from the master contain `\u{1b}[32m`
+- [x] write `a_late_attach_replays_the_colour_it_missed`: attach on a terminal after the run printed, assert the replay carries the sequence
+- [x] run `mise run check` - must pass before task 5
 
 ### Task 5: Verify acceptance criteria
 
