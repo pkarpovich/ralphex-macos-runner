@@ -188,12 +188,12 @@ A private enum in `src/bin/rxd.rs`, `Palette { Keep, Strip }`, decided once per 
 - Modify: `src/logstream.rs`
 - Modify: `tests/logstream.rs`
 
-- [ ] in `LogStream::push_line`, feed the outgoing buffer and the `tail` ring the stripped line (`ansi::plain` over the lossy text, re-encoded as bytes for the buffer) and keep the `history` ring and the broadcast on the text as written; keep the single lock, the `\r` strip, the buffer bound and the fill notification
-- [ ] update the `///` on `push_line` so it names which two views are plain and which two keep the sequences, and update the module docs at the top of `src/logstream.rs`
-- [ ] write `the_farm_and_the_tail_get_plain_text_while_the_history_keeps_the_colour` in `tests/logstream.rs`: subscribe first, push one coloured line, close, and assert the farm's received text has no `ESC`, `tail()` has no `ESC`, the replay from a fresh `subscribe()` contains the sequence, and the live receiver got the sequence
-- [ ] write `a_coloured_line_counts_against_the_buffer_bound_by_its_plain_bytes`: push lines whose coloured length exceeds `LOG_BUFFER_BYTES` while their plain length does not, and assert nothing was dropped from the farm's copy
-- [ ] write `a_line_that_is_only_an_escape_sequence_reaches_the_farm_as_an_empty_line`: the farm receives the newline, the tail has an empty line
-- [ ] run `mise run check` - must pass before task 3
+- [x] in `LogStream::push_line`, feed the outgoing buffer and the `tail` ring the stripped line (`ansi::plain` over the lossy text, re-encoded as bytes for the buffer) and keep the `history` ring and the broadcast on the text as written; keep the single lock, the `\r` strip, the buffer bound and the fill notification
+- [x] update the `///` on `push_line` so it names which two views are plain and which two keep the sequences, and update the module docs at the top of `src/logstream.rs`
+- [x] write `the_farm_and_the_tail_get_plain_text_while_the_history_keeps_the_colour` in `tests/logstream.rs`: subscribe first, push one coloured line, close, and assert the farm's received text has no `ESC`, `tail()` has no `ESC`, the replay from a fresh `subscribe()` contains the sequence, and the live receiver got the sequence
+- [x] write `a_coloured_line_counts_against_the_buffer_bound_by_its_plain_bytes`: push lines whose coloured length exceeds `LOG_BUFFER_BYTES` while their plain length does not, and assert nothing was dropped from the farm's copy
+- [x] write `a_line_that_is_only_an_escape_sequence_reaches_the_farm_as_an_empty_line`: the farm receives the newline, the tail has an empty line
+- [x] run `mise run check` - must pass before task 3
 
 ### Task 3: Give the run a pseudo-terminal
 

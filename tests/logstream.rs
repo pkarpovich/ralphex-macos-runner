@@ -38,6 +38,14 @@ fn sequences(farm: &FakeFarm) -> Vec<u64> {
     seen
 }
 
+fn delivered(farm: &FakeFarm) -> String {
+    let mut bytes = Vec::new();
+    for request in farm.requests_ending("/log") {
+        bytes.extend(request.body);
+    }
+    String::from_utf8(bytes).unwrap()
+}
+
 fn sizes(farm: &FakeFarm) -> Vec<usize> {
     let mut seen = Vec::new();
     for request in farm.requests_ending("/log") {
@@ -290,4 +298,51 @@ async fn a_chunk_the_farm_loses_is_retried_under_the_same_sequence() {
 
     assert_eq!(sequences(&farm), vec![1, 1]);
     stream.close().await;
+}
+
+#[tokio::test]
+async fn the_farm_and_the_tail_get_plain_text_while_the_history_keeps_the_colour() {
+    let farm = FakeFarm::start().await;
+    let (stream, _handle) = stream(&farm);
+
+    let (_, mut live) = stream.subscribe();
+    stream.push_line("\u{1b}[32mgreen\u{1b}[0m".as_bytes(), Terminator::Newline);
+    stream.close().await;
+
+    assert_eq!(delivered(&farm), "green\n");
+    assert_eq!(stream.tail(), "green");
+    let (replay, _live) = stream.subscribe();
+    assert_eq!(replay, vec!["\u{1b}[32mgreen\u{1b}[0m".to_string()]);
+    assert_eq!(live.recv().await.unwrap(), "\u{1b}[32mgreen\u{1b}[0m");
+}
+
+#[tokio::test]
+async fn a_coloured_line_counts_against_the_buffer_bound_by_its_plain_bytes() {
+    let farm = FakeFarm::start().await;
+    let (stream, _handle) = stream(&farm);
+
+    let colour = "\u{1b}[0m".repeat(LOG_BUFFER_BYTES / 4);
+    let mut expected = String::new();
+    for index in 0..3 {
+        let line = format!("{colour}keep {index}");
+        stream.push_line(line.as_bytes(), Terminator::Newline);
+        expected.push_str(&format!("keep {index}\n"));
+    }
+    stream.close().await;
+
+    assert_eq!(delivered(&farm), expected);
+}
+
+#[tokio::test]
+async fn a_line_that_is_only_an_escape_sequence_reaches_the_farm_as_an_empty_line() {
+    let farm = FakeFarm::start().await;
+    let (stream, _handle) = stream(&farm);
+
+    stream.push_line(b"before", Terminator::Newline);
+    stream.push_line("\u{1b}[0m".as_bytes(), Terminator::Newline);
+    stream.push_line(b"after", Terminator::Newline);
+    stream.close().await;
+
+    assert_eq!(delivered(&farm), "before\n\nafter\n");
+    assert_eq!(stream.tail(), "before\n\nafter");
 }

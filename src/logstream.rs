@@ -3,10 +3,13 @@
 //! A [`LogStream`] takes the bytes a run prints, hands them to the farm in
 //! chunks under a strictly increasing sequence number, and keeps two bounded
 //! views of the same output: the tail a completion carries and the history an
-//! attaching client replays before it follows the live lines. The flush cadence
-//! arrives through the [`Ticker`] trait, so a test drives every flush itself,
-//! and a buffer that reaches [`MAX_LOG_CHUNK`] wakes the flusher without waiting
-//! for the next tick.
+//! attaching client replays before it follows the live lines. The run writes to
+//! a pseudo-terminal, so the four views part company on escape sequences: the
+//! outgoing chunks and the tail carry [`crate::ansi::plain`] text, while the
+//! history and the subscribers keep the sequences the run wrote. The flush
+//! cadence arrives through the [`Ticker`] trait, so a test drives every flush
+//! itself, and a buffer that reaches [`MAX_LOG_CHUNK`] wakes the flusher without
+//! waiting for the next tick.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -16,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Notify, broadcast, watch};
 use tokio::task::JoinHandle;
 
+use crate::ansi::plain;
 use crate::protocol::client::{FarmClient, FarmError};
 use crate::protocol::types::{
     HISTORY_BYTES, HISTORY_LINES, LOG_BUFFER_BYTES, LOG_CLOSE_TIMEOUT, LOG_FLUSH_INTERVAL,
@@ -208,12 +212,14 @@ impl LogStream {
 
     /// Records one emitted line in every view of the run's output at once.
     ///
-    /// The farm gets `line` byte for byte, followed by the newline that ended
-    /// it when `terminator` says there was one; the history, the tail and the
-    /// subscribers get its text with a trailing carriage return removed. Taking
-    /// the four under one lock is what keeps them the same log: a pipe that
-    /// wrote its own bytes in between would otherwise split this line in the
-    /// farm's copy while the other three still held it whole.
+    /// Every view sees the line's text with a trailing carriage return removed.
+    /// The outgoing farm buffer and the tail carry it through
+    /// [`plain`], followed for the buffer by the newline that ended it when
+    /// `terminator` says there was one; the history and the subscribers keep
+    /// the escape sequences the run wrote. Taking the four under one lock is
+    /// what keeps them the same log: a writer that put its own bytes in between
+    /// would otherwise split this line in the farm's copy while the other three
+    /// still held it whole.
     ///
     /// # Panics
     ///
@@ -224,8 +230,9 @@ impl LogStream {
             Some(text) => text.to_string(),
             None => text,
         };
+        let stripped = plain(&text);
         let mut buffers = self.buffers.lock().unwrap();
-        buffers.outgoing.extend(line);
+        buffers.outgoing.extend(stripped.as_bytes());
         match terminator {
             Terminator::Newline => buffers.outgoing.push_back(b'\n'),
             Terminator::Cut => {}
@@ -236,7 +243,7 @@ impl LogStream {
         }
         let filled = buffers.outgoing.len() >= MAX_LOG_CHUNK;
         buffers.history.push(&text);
-        buffers.tail.push(&text);
+        buffers.tail.push(&stripped);
         let _ = self.lines.send(text);
         drop(buffers);
         if filled {
