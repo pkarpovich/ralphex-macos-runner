@@ -65,6 +65,8 @@ pub fn plain(text: &str) -> String {
                     state = State::CsiParameters;
                 } else if character == ']' {
                     state = State::Osc;
+                } else if character == ESC {
+                    state = State::Escape;
                 } else {
                     state = State::Text;
                 }
@@ -135,6 +137,7 @@ mod tests {
             ("title\u{1b}]0;a window\u{7}stays", "titlestays"),
             ("title\u{1b}]0;a window\u{1b}\\stays", "titlestays"),
             ("bare\u{1b}Mescape", "bareescape"),
+            ("twice\u{1b}\u{1b}[31mred\u{1b}[0m", "twicered"),
             ("cut here\u{1b}[3", "cut here"),
             ("kept\ttab\rreturn", "kept\ttab\rreturn"),
             ("привет 🌍 whole", "привет 🌍 whole"),
