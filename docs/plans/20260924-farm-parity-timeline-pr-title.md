@@ -247,10 +247,10 @@ Configured with the progress sender, the run id, the **expected** plan path, a d
 - Modify: `src/agent.rs`
 - Modify: `tests/rxd_e2e.rs`
 
-- [ ] in `Agent::start_local`, read the plan (at most 1 MiB), parse it and set `OpenRunRequest.title`, as specified under "Run title"; a read failure is not an error and sends no title
-- [ ] write a test in `tests/rxd_e2e.rs`: a plan starting with `# Require dials` opens a run whose recorded `runs` request carries `"title":"Require dials"`
-- [ ] write tests for the fallback: a plan without a `# ` heading and a plan the daemon cannot read both open a run whose recorded request has no `title` key
-- [ ] run `mise run check` - must pass before task 4
+- [x] in `Agent::start_local`, read the plan (at most 1 MiB), parse it and set `OpenRunRequest.title`, as specified under "Run title"; a read failure is not an error and sends no title
+- [x] write a test in `tests/rxd_e2e.rs`: a plan starting with `# Require dials` opens a run whose recorded `runs` request carries `"title":"Require dials"`
+- [x] write tests for the fallback: a plan without a `# ` heading and a plan the daemon cannot read both open a run whose recorded request has no `title` key
+- [x] run `mise run check` - must pass before task 4
 
 ### Task 4: Track the phase from the section markers
 

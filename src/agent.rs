@@ -21,7 +21,9 @@
 //! failure has its reason in `message`, and the run's output is already on the
 //! dashboard.
 
+use std::fs::File;
 use std::future::Future;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +37,7 @@ use crate::config::Config;
 use crate::ipc::RunRequest;
 use crate::job::{self, JobError, JobSpec, LocalOptions, Review, RunningJob};
 use crate::logstream::{IntervalTicker, LogStream, Ticker};
+use crate::planfile::{self, Plan};
 use crate::pr::{PrSpec, PrTools, PrUrl, RunOrigin, open_pull_request};
 use crate::protocol::client::{FarmClient, FarmError, next_delay};
 use crate::protocol::types::{
@@ -44,6 +47,7 @@ use crate::protocol::types::{
 };
 
 const TERMINAL_CAPACITY: usize = 8;
+const PLAN_READ_LIMIT: u64 = 1024 * 1024;
 
 /// How far a shutdown of the daemon has got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -489,6 +493,7 @@ impl Agent {
             worktree,
             env,
         } = request;
+        let title = plan_title(Path::new(&plan));
         let opened = OpenRunRequest {
             runner: self.config.name.clone(),
             version: VERSION.to_string(),
@@ -498,7 +503,7 @@ impl Agent {
             plan,
             branch,
             create_pr,
-            title: None,
+            title,
         };
         let job = match self.client.open_run(&opened).await {
             Ok(job) => job,
@@ -853,6 +858,31 @@ pub fn repo_name(ctx: &Path) -> String {
         return ctx.display().to_string();
     };
     name.to_string_lossy().into_owned()
+}
+
+fn plan_title(plan: &Path) -> Option<String> {
+    let file = match File::open(plan) {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::warn!("the plan {} is unreadable: {error}", plan.display());
+            return None;
+        }
+    };
+    let mut content = String::new();
+    let limit = PLAN_READ_LIMIT + 1;
+    if let Err(error) = file.take(limit).read_to_string(&mut content) {
+        tracing::warn!("the plan {} is unreadable: {error}", plan.display());
+        return None;
+    }
+    if content.len() > PLAN_READ_LIMIT as usize {
+        tracing::warn!(
+            "the plan {} is over {PLAN_READ_LIMIT} bytes",
+            plan.display()
+        );
+        return None;
+    }
+    let Plan { title, tasks: _ } = planfile::parse(&content);
+    title
 }
 
 async fn running(slot: &mut watch::Receiver<RunSlot>) -> RunId {
@@ -1349,5 +1379,48 @@ mod tests {
         assert_eq!(agent.slot(), RunSlot::Free);
         agent.hold(RunSlot::Running(RunId("local-1".to_string())));
         assert_eq!(agent.slot(), RunSlot::Running(RunId("local-1".to_string())));
+    }
+
+    #[test]
+    fn a_plan_is_named_after_its_first_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.md");
+        std::fs::write(&plan, "# Require dials\n\n### Task 1: x\n").unwrap();
+
+        assert_eq!(plan_title(&plan).as_deref(), Some("Require dials"));
+    }
+
+    #[test]
+    fn a_plan_without_a_heading_or_on_no_disk_has_no_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.md");
+        std::fs::write(&plan, "### Task 1: x\n").unwrap();
+
+        assert_eq!(plan_title(&plan), None);
+        assert_eq!(plan_title(&dir.path().join("missing.md")), None);
+    }
+
+    #[test]
+    fn a_plan_over_the_read_limit_has_no_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.md");
+        let mut content = "# Require dials\n".to_string();
+        let limit = usize::try_from(PLAN_READ_LIMIT).unwrap();
+        content.push_str(&"x".repeat(limit));
+        std::fs::write(&plan, &content).unwrap();
+
+        assert_eq!(plan_title(&plan), None);
+    }
+
+    #[test]
+    fn a_plan_at_the_read_limit_keeps_its_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.md");
+        let mut content = "# Require dials\n".to_string();
+        let limit = usize::try_from(PLAN_READ_LIMIT).unwrap();
+        content.push_str(&"x".repeat(limit - content.len()));
+        std::fs::write(&plan, &content).unwrap();
+
+        assert_eq!(plan_title(&plan).as_deref(), Some("Require dials"));
     }
 }
