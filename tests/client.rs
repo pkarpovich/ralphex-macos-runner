@@ -8,8 +8,8 @@ use std::time::Duration;
 use ralphex_macos_runner::protocol::client::{FarmClient, FarmError};
 use ralphex_macos_runner::protocol::types::{
     Branch, COMPLETE_BUDGET, ClaimRequest, CompleteRequest, CompleteStatus, CreatePr,
-    HeartbeatAction, HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest, RunId, RunnerName,
-    Seq, VERSION,
+    HeartbeatAction, HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest, Phase,
+    ProgressRequest, RunId, RunnerName, Seq, VERSION,
 };
 use support::TestSleeper;
 use support::fake_farm::{FakeFarm, Reply, job_reply};
@@ -36,6 +36,7 @@ fn open_run_request() -> OpenRunRequest {
         plan: "/abs/checkout/docs/plans/x.md".to_string(),
         branch: Branch("x".to_string()),
         create_pr: CreatePr::Yes,
+        title: None,
     }
 }
 
@@ -46,6 +47,14 @@ fn complete_request() -> CompleteRequest {
         fail_reason: String::new(),
         message: String::new(),
         log_tail: String::new(),
+    }
+}
+
+fn progress_request() -> ProgressRequest {
+    ProgressRequest {
+        phase: Phase::Setup,
+        failed: false,
+        tasks: None,
     }
 }
 
@@ -418,4 +427,71 @@ async fn a_claim_that_cannot_reach_the_farm_reports_transport() {
         panic!("expected a transport error");
     };
     assert!(!message.is_empty());
+}
+
+#[tokio::test]
+async fn a_progress_snapshot_answered_204_succeeds() {
+    let farm = FakeFarm::start().await;
+    let client = client(&farm, Arc::new(TestSleeper::new()));
+
+    client
+        .post_progress(&RunId("local-1".to_string()), &progress_request())
+        .await
+        .unwrap();
+
+    let requests = farm.requests_ending("/progress");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].path, "/api/runner/jobs/local-1/progress");
+    assert_eq!(requests[0].authorization, "Bearer secret-token");
+    assert_eq!(requests[0].content_type, "application/json");
+    assert_eq!(
+        requests[0].text(),
+        r#"{"phase":"setup","failed":false,"tasks":null}"#
+    );
+}
+
+#[tokio::test]
+async fn a_progress_snapshot_answered_500_is_not_retried() {
+    let farm = FakeFarm::start().await;
+    farm.always_progress(server_error());
+    let sleeper = Arc::new(TestSleeper::new());
+    let client = client(&farm, Arc::clone(&sleeper));
+
+    let error = client
+        .post_progress(&RunId("local-1".to_string()), &progress_request())
+        .await
+        .unwrap_err();
+
+    assert_eq!(error, FarmError::Rejected(500, "boom".to_string()));
+    assert_eq!(farm.requests_ending("/progress").len(), 1);
+    assert!(sleeper.slept().is_empty());
+}
+
+#[tokio::test]
+async fn a_progress_snapshot_answered_410_latches_only_that_run_as_gone() {
+    let farm = FakeFarm::start().await;
+    farm.push_progress(Reply::Status(410, String::new()));
+    let client = client(&farm, Arc::new(TestSleeper::new()));
+    let gone = RunId("local-1".to_string());
+    let other = RunId("local-2".to_string());
+
+    let first = client
+        .post_progress(&gone, &progress_request())
+        .await
+        .unwrap_err();
+    let second = client
+        .post_progress(&gone, &progress_request())
+        .await
+        .unwrap_err();
+    client
+        .post_progress(&other, &progress_request())
+        .await
+        .unwrap();
+
+    assert_eq!(first, FarmError::Gone);
+    assert_eq!(second, FarmError::Gone);
+    let requests = farm.requests_ending("/progress");
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].path, "/api/runner/jobs/local-1/progress");
+    assert_eq!(requests[1].path, "/api/runner/jobs/local-2/progress");
 }

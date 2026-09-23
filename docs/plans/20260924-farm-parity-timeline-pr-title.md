@@ -220,12 +220,12 @@ Configured with the progress sender, the run id, the **expected** plan path, a d
 - Modify: `tests/client.rs`
 - Modify: `tests/support/fake_farm.rs`
 
-- [ ] add `ProgressRequest`, `ProgressTask`, `ProgressCheckbox`, `Phase`, `TaskStatus` and `PROGRESS_POST_TIMEOUT` to `src/protocol/types.rs` as specified under "Wire", and `title: Option<String>` to `OpenRunRequest`, skipped when `None`
-- [ ] add `FarmClient::post_progress` to `src/protocol/client.rs`: never retried, `REQUEST_TIMEOUT`, `410` latched per run id so later calls for that run send nothing
-- [ ] add a progress route to the fake farm (scripted replies, default `204`, recorded like the others)
-- [ ] add the three vectors from "Wire" to `tests/protocol_vectors.rs` and confirm every existing vector still passes unchanged
-- [ ] write client tests: `204` succeeds; a `500` is returned without a second attempt; a `410` returns the gone error and a second call for the same run makes no request, while a call for another run still does
-- [ ] run `mise run check` - must pass before task 2
+- [x] add `ProgressRequest`, `ProgressTask`, `ProgressCheckbox`, `Phase`, `TaskStatus` and `PROGRESS_POST_TIMEOUT` to `src/protocol/types.rs` as specified under "Wire", and `title: Option<String>` to `OpenRunRequest`, skipped when `None`
+- [x] add `FarmClient::post_progress` to `src/protocol/client.rs`: never retried, `REQUEST_TIMEOUT`, `410` latched per run id so later calls for that run send nothing
+- [x] add a progress route to the fake farm (scripted replies, default `204`, recorded like the others)
+- [x] add the three vectors from "Wire" to `tests/protocol_vectors.rs` and confirm every existing vector still passes unchanged
+- [x] write client tests: `204` succeeds; a `500` is returned without a second attempt; a `410` returns the gone error and a second call for the same run makes no request, while a call for another run still does
+- [x] run `mise run check` - must pass before task 2
 
 ### Task 2: Parse the plan file
 

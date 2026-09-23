@@ -70,6 +70,9 @@ pub const LOG_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
 /// The grace between the `SIGTERM` and the `SIGKILL` of a stopped process group.
 pub const STOP_GRACE: Duration = Duration::from_secs(10);
 
+/// The time one plan-progress snapshot may take to reach the farm.
+pub const PROGRESS_POST_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The time the git that inspects a checkout may take before it is killed.
 pub const VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -380,6 +383,9 @@ pub struct OpenRunRequest {
     pub branch: Branch,
     /// Whether the run ends with a pull request.
     pub create_pr: CreatePr,
+    /// The name the dashboard shows for the run, left out when the plan has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// A run the farm handed to this runner.
@@ -443,6 +449,68 @@ pub struct CompleteRequest {
     pub message: String,
     /// The trailing output of the run.
     pub log_tail: String,
+}
+
+/// The stage of a run the dashboard's timeline shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Phase {
+    /// ralphex is starting and has not begun a task yet.
+    Setup,
+    /// ralphex is working through the plan's tasks.
+    Tasks,
+    /// ralphex is reviewing the work.
+    Review,
+    /// The runner is pushing the branch and opening the pull request.
+    Pr,
+}
+
+/// How far one task of a plan has come.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskStatus {
+    /// No checkbox of the task is checked.
+    Pending,
+    /// Some checkboxes of the task are checked.
+    Active,
+    /// Every checkbox of the task is checked.
+    Done,
+}
+
+/// One checkbox of a task in a plan-progress snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressCheckbox {
+    /// The text after the checkbox.
+    pub text: String,
+    /// Whether the checkbox is ticked.
+    pub checked: bool,
+}
+
+/// One task of the plan in a plan-progress snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressTask {
+    /// The task's label as the plan writes it, such as `3` or `2.5`.
+    pub number: String,
+    /// The zero-based position of the task in the plan.
+    pub ord: u32,
+    /// The task's title.
+    pub title: String,
+    /// How far the task has come.
+    pub status: TaskStatus,
+    /// The task's checkboxes, in plan order.
+    pub checkboxes: Vec<ProgressCheckbox>,
+}
+
+/// The body of a plan-progress snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgressRequest {
+    /// The stage the run is in.
+    pub phase: Phase,
+    /// Whether the run has failed.
+    pub failed: bool,
+    /// The plan's tasks, [`None`] when the plan could not be read and the farm
+    /// keeps what it holds.
+    pub tasks: Option<Vec<ProgressTask>>,
 }
 
 #[cfg(test)]
@@ -649,6 +717,46 @@ mod tests {
             json!("x")
         );
         assert_eq!(serde_json::to_value(Seq(7)).unwrap(), json!(7));
+    }
+
+    #[test]
+    fn phases_and_task_statuses_are_lowercase() {
+        assert_eq!(serde_json::to_value(Phase::Setup).unwrap(), json!("setup"));
+        assert_eq!(serde_json::to_value(Phase::Tasks).unwrap(), json!("tasks"));
+        assert_eq!(
+            serde_json::to_value(Phase::Review).unwrap(),
+            json!("review")
+        );
+        assert_eq!(serde_json::to_value(Phase::Pr).unwrap(), json!("pr"));
+        assert_eq!(
+            serde_json::to_value(TaskStatus::Pending).unwrap(),
+            json!("pending")
+        );
+        assert_eq!(
+            serde_json::to_value(TaskStatus::Active).unwrap(),
+            json!("active")
+        );
+        assert_eq!(
+            serde_json::to_value(TaskStatus::Done).unwrap(),
+            json!("done")
+        );
+    }
+
+    #[test]
+    fn an_open_run_without_a_title_leaves_the_key_out() {
+        let request = OpenRunRequest {
+            runner: RunnerName("mbp".to_string()),
+            version: VERSION.to_string(),
+            runtime: RUNTIME.to_string(),
+            repo: "nhop".to_string(),
+            ctx: "/c".to_string(),
+            plan: "/c/p.md".to_string(),
+            branch: Branch("b".to_string()),
+            create_pr: CreatePr::No,
+            title: None,
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        assert!(!encoded.contains("title"), "{encoded}");
     }
 
     #[test]

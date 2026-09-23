@@ -6,7 +6,8 @@
 //! `204` for a chunk it took and for a chunk whose sequence number it has
 //! already seen, `400` only for a number below one - and the run route runs the
 //! same version check, so a client that repeats a sequence number or speaks
-//! another protocol version meets the same answer here as at the farm.
+//! another protocol version meets the same answer here as at the farm. The
+//! progress route answers `204` unless a test scripts it otherwise.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -101,6 +102,7 @@ struct Routes {
     log: Route,
     heartbeat: Route,
     complete: Route,
+    progress: Route,
     requests: Vec<Recorded>,
     last_seq: HashMap<String, u64>,
 }
@@ -129,6 +131,7 @@ impl FakeFarm {
             .route("/api/runner/jobs/{id}/log", post(log))
             .route("/api/runner/jobs/{id}/heartbeat", post(heartbeat))
             .route("/api/runner/jobs/{id}/complete", post(complete))
+            .route("/api/runner/jobs/{id}/progress", post(progress))
             .with_state(Arc::clone(&shared));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -177,6 +180,12 @@ impl FakeFarm {
         routes.complete.queue.push_back(reply);
     }
 
+    /// Queues `reply` for the next progress snapshot.
+    pub fn push_progress(&self, reply: Reply) {
+        let mut routes = self.shared.routes.lock().unwrap();
+        routes.progress.queue.push_back(reply);
+    }
+
     /// Answers every unqueued claim with `reply`.
     pub fn always_claim(&self, reply: Reply) {
         let mut routes = self.shared.routes.lock().unwrap();
@@ -199,6 +208,12 @@ impl FakeFarm {
     pub fn always_complete(&self, reply: Reply) {
         let mut routes = self.shared.routes.lock().unwrap();
         routes.complete.sticky = Some(reply);
+    }
+
+    /// Answers every unqueued progress snapshot with `reply`.
+    pub fn always_progress(&self, reply: Reply) {
+        let mut routes = self.shared.routes.lock().unwrap();
+        routes.progress.sticky = Some(reply);
     }
 
     /// Releases a held claim, which then answers `reply`.
@@ -380,6 +395,7 @@ fn version_mismatch(body: &Bytes) -> Option<Reply> {
         plan: _,
         branch: _,
         create_pr: _,
+        title: _,
     } = request;
     if version == VERSION {
         return None;
@@ -463,12 +479,27 @@ async fn complete(
     respond(take(&shared, RouteName::Complete, Reply::Accepted))
 }
 
+async fn progress(
+    State(shared): State<Arc<Shared>>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    record(&shared, &uri, &headers, &body);
+    let reply = take(&shared, RouteName::Progress, Reply::Accepted);
+    let Reply::Accepted = reply else {
+        return respond(reply);
+    };
+    accepted()
+}
+
 #[derive(Debug, Clone, Copy)]
 enum RouteName {
     Claim,
     Runs,
     Heartbeat,
     Complete,
+    Progress,
 }
 
 fn take(shared: &Arc<Shared>, name: RouteName, fallback: Reply) -> Reply {
@@ -478,6 +509,7 @@ fn take(shared: &Arc<Shared>, name: RouteName, fallback: Reply) -> Reply {
         RouteName::Runs => routes.runs.take(fallback),
         RouteName::Heartbeat => routes.heartbeat.take(fallback),
         RouteName::Complete => routes.complete.take(fallback),
+        RouteName::Progress => routes.progress.take(fallback),
     }
 }
 

@@ -498,6 +498,7 @@ impl Agent {
             plan,
             branch,
             create_pr,
+            title: None,
         };
         let job = match self.client.open_run(&opened).await {
             Ok(job) => job,
