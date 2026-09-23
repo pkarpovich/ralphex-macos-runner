@@ -234,12 +234,12 @@ Configured with the progress sender, the run id, the **expected** plan path, a d
 - Create: `src/planfile.rs`
 - Modify: `src/lib.rs`
 
-- [ ] add `regex` with `cargo add regex`
-- [ ] create `src/planfile.rs` with `pub fn parse(content: &str) -> Plan` and the `Plan`, `Task`, `Checkbox` types following "Plan parser" exactly, including the order of the checks, with a doctest
-- [ ] add `pub mod planfile;` to `src/lib.rs`
-- [ ] write table-driven tests: a plan with a title and three tasks in `done`/`active`/`pending`; `### Iteration 2.5: x` and `### Task [Final] Update docs: x` keep their labels verbatim; checkboxes after a `## ` section are not attached; checkboxes inside a fenced block (both backtick and tilde, with a longer closing fence) are ignored; a `# ` heading inside a fence is not the title; the first `# ` heading wins; `\r\n` input parses like `\n`; `X` counts as checked
-- [ ] write the edge cases: empty input, a plan with no task headers, a task with no checkboxes is `pending`, a `# ` line with only spaces is no title
-- [ ] run `mise run check` - must pass before task 3
+- [x] add `regex` with `cargo add regex`
+- [x] create `src/planfile.rs` with `pub fn parse(content: &str) -> Plan` and the `Plan`, `Task`, `Checkbox` types following "Plan parser" exactly, including the order of the checks, with a doctest
+- [x] add `pub mod planfile;` to `src/lib.rs`
+- [x] write table-driven tests: a plan with a title and three tasks in `done`/`active`/`pending`; `### Iteration 2.5: x` and `### Task [Final] Update docs: x` keep their labels verbatim; checkboxes after a `## ` section are not attached; checkboxes inside a fenced block (both backtick and tilde, with a longer closing fence) are ignored; a `# ` heading inside a fence is not the title; the first `# ` heading wins; `\r\n` input parses like `\n`; `X` counts as checked
+- [x] write the edge cases: empty input, a plan with no task headers, a task with no checkboxes is `pending`, a `# ` line with only spaces is no title
+- [x] run `mise run check` - must pass before task 3
 
 ### Task 3: Name a local run after its plan
 

@@ -17,6 +17,7 @@ pub mod ipc;
 pub mod job;
 pub mod logstream;
 pub mod paths;
+pub mod planfile;
 pub mod pr;
 pub mod protocol;
 pub mod service;
