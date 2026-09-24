@@ -6,6 +6,9 @@
 //! checkboxes inside an open task belong to it. Malformed input is never an
 //! error.
 
+use std::fs::File;
+use std::io::{self, Read};
+use std::path::Path;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -21,6 +24,37 @@ static CHECKBOX: LazyLock<Regex> = LazyLock::new(|| compile(r"^\s*-\s+\[([ xX])\
 
 fn compile(pattern: &str) -> Regex {
     Regex::new(pattern).expect("plan-file patterns are valid")
+}
+
+/// The largest plan, in bytes, [`read`] accepts.
+pub const READ_LIMIT: u64 = 1024 * 1024;
+
+/// Why [`read`] could not return a plan's text.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    /// The file could not be opened or read as UTF-8 text.
+    #[error("the plan is unreadable: {0}")]
+    Unreadable(#[from] io::Error),
+    /// The file is larger than [`READ_LIMIT`].
+    #[error("the plan is over {READ_LIMIT} bytes")]
+    TooLarge,
+}
+
+/// Reads the text of the plan at `path`, reading at most [`READ_LIMIT`] bytes.
+///
+/// # Errors
+///
+/// Returns [`ReadError::Unreadable`] when the file cannot be opened or is not
+/// UTF-8 text, and [`ReadError::TooLarge`] when it holds more than
+/// [`READ_LIMIT`] bytes.
+pub fn read(path: &Path) -> Result<String, ReadError> {
+    let file = File::open(path)?;
+    let mut content = String::new();
+    file.take(READ_LIMIT + 1).read_to_string(&mut content)?;
+    if content.len() as u64 > READ_LIMIT {
+        return Err(ReadError::TooLarge);
+    }
+    Ok(content)
 }
 
 /// A parsed plan: its title and its tasks in plan order.
@@ -194,6 +228,38 @@ pub fn parse(content: &str) -> Plan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_returns_a_plan_up_to_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.md");
+        let limit = usize::try_from(READ_LIMIT).unwrap();
+        std::fs::write(&path, "x".repeat(limit)).unwrap();
+        assert_eq!(read(&path).unwrap().len(), limit);
+    }
+
+    #[test]
+    fn read_refuses_a_plan_over_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.md");
+        let limit = usize::try_from(READ_LIMIT).unwrap();
+        std::fs::write(&path, "x".repeat(limit + 1)).unwrap();
+        let Err(ReadError::TooLarge) = read(&path) else {
+            panic!("a plan over the limit was read");
+        };
+    }
+
+    #[test]
+    fn read_reports_a_missing_or_binary_plan_as_unreadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("binary.md");
+        std::fs::write(&binary, [0xff, 0xfe]).unwrap();
+        for path in [dir.path().join("missing.md"), binary] {
+            let Err(ReadError::Unreadable(_)) = read(&path) else {
+                panic!("{} was read", path.display());
+            };
+        }
+    }
 
     fn checkbox(text: &str, checked: bool) -> Checkbox {
         Checkbox {

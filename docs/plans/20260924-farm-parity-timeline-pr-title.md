@@ -274,12 +274,14 @@ Configured with the progress sender, the run id, the **expected** plan path, a d
 - Modify: `src/progress.rs`
 - Create: `tests/progress.rs`
 
-- [ ] add `notify` with `cargo add notify` (latest stable, default features)
-- [ ] implement the plan watcher in `src/progress.rs` as specified under "Plan watcher": expected path and resolve, snapshot building, non-recursive watches on the plan directory and `completed/` with the ancestor fallback and attach retry, file-name filtering, debounce, the single coalescing posting task with the initial `setup` snapshot, stop, post phase and post failure; the progress sender is a trait so tests can record, and the debounce and attach retry are constructor parameters
-- [ ] bridge `notify`'s callback thread into the tokio task through a channel; the watcher and its thread end with stop
-- [ ] write tests in `tests/progress.rs` against a temporary directory and a recording sender, with a 20 ms debounce and a 50 ms retry: the first post is `setup` with `tasks: null` when the plan is absent; creating the plan posts its tasks; ticking a checkbox posts the new status; moving the plan into `completed/` keeps posting from there; a plan directory created after start (the worktree case) attaches through its ancestor and posts
-- [ ] write tests for the edges: a burst of writes inside the debounce posts once; an unreadable or task-less plan posts `tasks: null`; a sender error does not stop later posts; post phase `pr` freezes and is the last post after stop; post failure carries `failed: true` and the re-read tasks
-- [ ] run `mise run check` - must pass before task 6
+- [x] add `notify` with `cargo add notify` (latest stable, default features)
+- [x] implement the plan watcher in `src/progress.rs` as specified under "Plan watcher": expected path and resolve, snapshot building, non-recursive watches on the plan directory and `completed/` with the ancestor fallback and attach retry, file-name filtering, debounce, the single coalescing posting task with the initial `setup` snapshot, stop, post phase and post failure; the progress sender is a trait so tests can record, and the debounce and attach retry are constructor parameters
+- [x] bridge `notify`'s callback thread into the tokio task through a channel; the watcher and its thread end with stop
+- [x] write tests in `tests/progress.rs` against a temporary directory and a recording sender, with a 20 ms debounce and a 50 ms retry: the first post is `setup` with `tasks: null` when the plan is absent; creating the plan posts its tasks; ticking a checkbox posts the new status; moving the plan into `completed/` keeps posting from there; a plan directory created after start (the worktree case) attaches through its ancestor and posts
+- [x] write tests for the edges: a burst of writes inside the debounce posts once; an unreadable or task-less plan posts `tasks: null`; a sender error does not stop later posts; post phase `pr` freezes and is the last post after stop; post failure carries `failed: true` and the re-read tasks
+- [x] run `mise run check` - must pass before task 6
+- ➕ a directory is only handed to `notify` once it exists: its FSEvents backend stops and restarts the whole stream on every `watch` call, failed ones included, so retrying a missing `completed/` dropped the plan's own events. Attaching a directory after start requests a snapshot, because the plan may have landed there before the watch did
+- ➕ the bounded plan read moved from `agent.rs` to `planfile::read` (`READ_LIMIT`, `ReadError`), shared by the run title and the snapshots
 
 ### Task 6: Drive the watcher from the run
 

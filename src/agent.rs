@@ -21,9 +21,7 @@
 //! failure has its reason in `message`, and the run's output is already on the
 //! dashboard.
 
-use std::fs::File;
 use std::future::Future;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,7 +45,6 @@ use crate::protocol::types::{
 };
 
 const TERMINAL_CAPACITY: usize = 8;
-const PLAN_READ_LIMIT: u64 = 1024 * 1024;
 
 /// How far a shutdown of the daemon has got.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -861,26 +858,13 @@ pub fn repo_name(ctx: &Path) -> String {
 }
 
 fn plan_title(plan: &Path) -> Option<String> {
-    let file = match File::open(plan) {
-        Ok(file) => file,
+    let content = match planfile::read(plan) {
+        Ok(content) => content,
         Err(error) => {
-            tracing::warn!("the plan {} is unreadable: {error}", plan.display());
+            tracing::warn!("no title from {}: {error}", plan.display());
             return None;
         }
     };
-    let mut content = String::new();
-    let limit = PLAN_READ_LIMIT + 1;
-    if let Err(error) = file.take(limit).read_to_string(&mut content) {
-        tracing::warn!("the plan {} is unreadable: {error}", plan.display());
-        return None;
-    }
-    if content.len() > PLAN_READ_LIMIT as usize {
-        tracing::warn!(
-            "the plan {} is over {PLAN_READ_LIMIT} bytes",
-            plan.display()
-        );
-        return None;
-    }
     let Plan { title, tasks: _ } = planfile::parse(&content);
     title
 }
@@ -1405,7 +1389,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plan = dir.path().join("plan.md");
         let mut content = "# Require dials\n".to_string();
-        let limit = usize::try_from(PLAN_READ_LIMIT).unwrap();
+        let limit = usize::try_from(planfile::READ_LIMIT).unwrap();
         content.push_str(&"x".repeat(limit));
         std::fs::write(&plan, &content).unwrap();
 
@@ -1417,7 +1401,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let plan = dir.path().join("plan.md");
         let mut content = "# Require dials\n".to_string();
-        let limit = usize::try_from(PLAN_READ_LIMIT).unwrap();
+        let limit = usize::try_from(planfile::READ_LIMIT).unwrap();
         content.push_str(&"x".repeat(limit - content.len()));
         std::fs::write(&plan, &content).unwrap();
 
