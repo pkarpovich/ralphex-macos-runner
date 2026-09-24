@@ -6,11 +6,13 @@
 //! checkboxes inside an open task belong to it. Malformed input is never an
 //! error.
 
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{self, Read};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::LazyLock;
 
+use nix::fcntl::OFlag;
 use regex::Regex;
 
 use crate::protocol::types::TaskStatus;
@@ -38,6 +40,9 @@ pub enum ReadError {
     /// The file is larger than [`READ_LIMIT`].
     #[error("the plan is over {READ_LIMIT} bytes")]
     TooLarge,
+    /// The path names a directory, a FIFO or anything else that is not a regular file.
+    #[error("the plan is not a regular file")]
+    NotRegular,
 }
 
 /// Reads the text of the plan at `path`, reading at most [`READ_LIMIT`] bytes.
@@ -45,10 +50,16 @@ pub enum ReadError {
 /// # Errors
 ///
 /// Returns [`ReadError::Unreadable`] when the file cannot be opened or is not
-/// UTF-8 text, and [`ReadError::TooLarge`] when it holds more than
-/// [`READ_LIMIT`] bytes.
+/// UTF-8 text, [`ReadError::NotRegular`] when it is not a regular file, and
+/// [`ReadError::TooLarge`] when it holds more than [`READ_LIMIT`] bytes.
 pub fn read(path: &Path) -> Result<String, ReadError> {
-    let file = File::open(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(OFlag::O_NONBLOCK.bits())
+        .open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(ReadError::NotRegular);
+    }
     let mut content = String::new();
     file.take(READ_LIMIT + 1).read_to_string(&mut content)?;
     if content.len() as u64 > READ_LIMIT {
@@ -256,6 +267,18 @@ mod tests {
         std::fs::write(&binary, [0xff, 0xfe]).unwrap();
         for path in [dir.path().join("missing.md"), binary] {
             let Err(ReadError::Unreadable(_)) = read(&path) else {
+                panic!("{} was read", path.display());
+            };
+        }
+    }
+
+    #[test]
+    fn read_refuses_a_fifo_or_a_directory_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo.md");
+        nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        for path in [fifo, dir.path().to_path_buf()] {
+            let Err(ReadError::NotRegular) = read(&path) else {
                 panic!("{} was read", path.display());
             };
         }

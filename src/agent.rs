@@ -695,21 +695,19 @@ impl Agent {
             self.options.drain_timeout,
             terminals.clone(),
         ));
-        let watcher = self.watch_plan(&spec, &run_id);
+        let watcher = self.watch_plan(&spec, &run_id).await;
         log.track(watcher.tracker());
 
         let mut running = match job::spawn(&spec, Arc::clone(&log)) {
             Ok(running) => running,
             Err(error) => {
                 drain.abort();
-                let _stopped = watcher.stop().await;
+                let timeline = watcher.stop().await;
                 log.close().await;
+                let completion = failed(error.fail_reason(), error.to_string(), String::new());
+                mark_failure(&timeline, Some(&completion)).await;
                 return Finished {
-                    completion: Some(failed(
-                        error.fail_reason(),
-                        error.to_string(),
-                        String::new(),
-                    )),
+                    completion: Some(completion),
                     outcome: RunOutcome::Continue,
                     beats: Some(beats),
                     output,
@@ -789,7 +787,7 @@ impl Agent {
         }
     }
 
-    fn watch_plan(&self, spec: &JobSpec, run_id: &RunId) -> PlanWatcher {
+    async fn watch_plan(&self, spec: &JobSpec, run_id: &RunId) -> PlanWatcher {
         let JobSpec {
             ctx,
             plan,
@@ -811,6 +809,7 @@ impl Agent {
             expected_plan(ctx, plan, branch, *worktree),
             timings,
         )
+        .await
     }
 
     fn output_dir(&self, run_id: &RunId) -> Option<OutputDir> {

@@ -300,7 +300,7 @@ Configured with the progress sender, the run id, the **expected** plan path, a d
 - [x] run `mise run check` - must pass before task 7
 - ➕ re-attaching a watch runs on the blocking pool: an FSEvents `watch` restarts the stream and took up to 2.4 s under load, which blocked the runtime thread the events task ran on (on a current-thread runtime the posting task with it). `PlanWatcher::stop` returns at once even then; the watcher and its thread end when that attach finishes
 - ➕ `tests/support/fake-ralphex.sh` also takes `FAKE_RALPHEX_WAIT_FOR`, a file it waits for before exiting, so the e2e tests release the run only once the snapshots they check were posted; `src/job.rs` needed no change (`JobSpec` and `LocalOptions` already expose the worktree)
-- ⚠️ a spawn failure happens after the watcher started, so its initial `setup` snapshot may already be out; the watcher is stopped without a `failed` snapshot
+- ⚠️ a spawn failure happens after the watcher started, so its initial `setup` snapshot may already be out; the watcher is stopped and posts a `failed` snapshot, so the dashboard never keeps a started timeline for a run completed as an error
 - ⚠️ a pull-request failure posts `pr` and then `failed`, as the rules above ask, so a run finishing during the drain can post twice: Task 8 has to budget two `PROGRESS_POST_TIMEOUT`s, not one
 
 ### Task 7: Use the description finalize wrote
@@ -348,7 +348,7 @@ Configured with the progress sender, the run id, the **expected** plan path, a d
 - [x] run the code-quality greps from the gate over `src/` and `tests/` and confirm nothing new
 - [x] confirm `Cargo.toml` gained exactly `notify` and `regex`
 - ➕ the marker expressions spell `\d+` as `[0-9]+`: Rust's `\d` matches every Unicode decimal digit, Go's only ASCII, so `[0-9]` is the farm's expression unchanged in meaning
-- ⚠️ two tests older than this plan, on paths it does not touch, failed once each under the full gate and passed on every rerun: `no_run_inherits_the_terminal_opened_for_another_run` (`tests/job.rs`) saw a `LISTEN` socket, which is another test's fake farm bound while the children forked, because macOS sets `FD_CLOEXEC` on a new socket in a second step; `a_burst_larger_than_the_buffer_reaches_the_farm_whole_without_a_tick` (`tests/logstream.rs`) lost one chunk when its flusher fell 4 MiB behind under load. Left as they are: both are flaky tests, not regressions, and fixing them is outside this plan
+- ⚠️ two tests older than this plan, on paths it does not touch, failed once each under the full gate and passed on every rerun: `no_run_inherits_the_terminal_opened_for_another_run` (`tests/job.rs`) saw a `LISTEN` socket, which is another test's fake farm bound while the children forked, because macOS sets `FD_CLOEXEC` on a new socket in a second step; `a_burst_larger_than_the_buffer_reaches_the_farm_whole_without_a_tick` (`tests/logstream.rs`) lost one chunk when its flusher fell 4 MiB behind under load. Both are flaky tests, not regressions; the review paced the burst test's writer to stay within half the buffer of the farm, and the terminal test is left as it is
 
 ### Task 10: [Final] Update documentation, bump the version and close the plan
 

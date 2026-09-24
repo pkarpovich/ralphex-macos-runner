@@ -393,15 +393,6 @@ pub struct WatchTimings {
     pub attach_retry: Duration,
 }
 
-impl Default for WatchTimings {
-    fn default() -> Self {
-        WatchTimings {
-            debounce: DEFAULT_DEBOUNCE,
-            attach_retry: DEFAULT_ATTACH_RETRY,
-        }
-    }
-}
-
 struct Poster {
     sender: Arc<dyn ProgressSender>,
     run_id: RunId,
@@ -452,13 +443,13 @@ impl PlanWatcher {
     /// `timings.attach_retry` and on every event; until the plan's own
     /// directory attaches, its nearest existing ancestor is watched instead. A
     /// change to a file named like the plan requests a snapshot once
-    /// `timings.debounce` has passed without another.
+    /// `timings.debounce` has passed without another. The first directories are
+    /// handed to the watcher on the blocking pool, and this returns once they are.
     ///
     /// # Panics
     ///
     /// Panics when called outside a tokio runtime.
-    #[must_use]
-    pub fn start(
+    pub async fn start(
         sender: Arc<dyn ProgressSender>,
         run_id: RunId,
         expected: PathBuf,
@@ -466,7 +457,15 @@ impl PlanWatcher {
     ) -> PlanWatcher {
         let tracker = Arc::new(PhaseTracker::new());
         let (sink, events) = mpsc::unbounded_channel();
-        let watches = Watches::start(&expected, sink);
+        let watched = expected.clone();
+        let watches =
+            match tokio::task::spawn_blocking(move || Watches::start(&watched, sink)).await {
+                Ok(watches) => watches,
+                Err(error) => {
+                    tracing::warn!("the plan {} cannot be watched: {error}", expected.display());
+                    None
+                }
+            };
         let name = match expected.file_name() {
             Some(name) => name.to_os_string(),
             None => OsString::new(),

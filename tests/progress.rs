@@ -80,7 +80,7 @@ impl ProgressSender for Recorder {
     }
 }
 
-fn start(recorder: &Arc<Recorder>, expected: &Path, timings: WatchTimings) -> PlanWatcher {
+async fn start(recorder: &Arc<Recorder>, expected: &Path, timings: WatchTimings) -> PlanWatcher {
     let sender: Arc<dyn ProgressSender> = Arc::clone(recorder) as Arc<dyn ProgressSender>;
     PlanWatcher::start(
         sender,
@@ -88,6 +88,7 @@ fn start(recorder: &Arc<Recorder>, expected: &Path, timings: WatchTimings) -> Pl
         expected.to_path_buf(),
         timings,
     )
+    .await
 }
 
 fn plan_dir() -> (tempfile::TempDir, PathBuf) {
@@ -128,7 +129,7 @@ async fn the_first_post_is_setup_without_tasks_when_the_plan_is_absent() {
     let (_dir, expected) = plan_dir();
     let recorder = Arc::new(Recorder::default());
 
-    let watcher = start(&recorder, &expected, FAST);
+    let watcher = start(&recorder, &expected, FAST).await;
     recorder
         .wait_for("a setup post", |posts| !posts.is_empty())
         .await;
@@ -152,7 +153,7 @@ async fn the_first_post_is_setup_without_tasks_when_the_plan_is_absent() {
 async fn creating_the_plan_posts_its_tasks_and_ticking_it_posts_the_new_status() {
     let (_dir, expected) = plan_dir();
     let recorder = Arc::new(Recorder::default());
-    let watcher = start(&recorder, &expected, FAST);
+    let watcher = start(&recorder, &expected, FAST).await;
     recorder
         .wait_for("a setup post", |posts| !posts.is_empty())
         .await;
@@ -197,7 +198,7 @@ async fn a_plan_moved_into_completed_keeps_posting_from_there() {
     let (_dir, expected) = plan_dir();
     std::fs::write(&expected, PLAN).unwrap();
     let recorder = Arc::new(Recorder::default());
-    let watcher = start(&recorder, &expected, FAST);
+    let watcher = start(&recorder, &expected, FAST).await;
     recorder
         .wait_for("a setup post", |posts| {
             last_statuses(posts) == [TaskStatus::Pending]
@@ -206,10 +207,16 @@ async fn a_plan_moved_into_completed_keeps_posting_from_there() {
 
     let completed = expected.parent().unwrap().join("completed");
     std::fs::create_dir(&completed).unwrap();
+    recorder
+        .wait_for("a post once completed/ is watched", |posts| {
+            posts.len() >= 2
+        })
+        .await;
+    let before = recorder.posts().len();
     let moved = completed.join(expected.file_name().unwrap());
     std::fs::rename(&expected, &moved).unwrap();
     recorder
-        .wait_for("a post after the move", |posts| posts.len() >= 2)
+        .wait_for("a post after the move", |posts| posts.len() > before)
         .await;
     assert_eq!(
         last_statuses(&recorder.posts()),
@@ -239,7 +246,7 @@ async fn a_plan_directory_created_after_start_attaches_and_posts() {
         .join("plans")
         .join("x.md");
     let recorder = Arc::new(Recorder::default());
-    let watcher = start(&recorder, &expected, FAST);
+    let watcher = start(&recorder, &expected, FAST).await;
     recorder
         .wait_for("a setup post", |posts| !posts.is_empty())
         .await;
@@ -269,7 +276,7 @@ async fn a_burst_of_writes_inside_the_debounce_posts_once() {
         debounce: Duration::from_millis(400),
         attach_retry: Duration::from_millis(50),
     };
-    let watcher = start(&recorder, &expected, timings);
+    let watcher = start(&recorder, &expected, timings).await;
     recorder
         .wait_for("a setup post", |posts| !posts.is_empty())
         .await;
@@ -298,7 +305,7 @@ async fn an_unreadable_or_task_less_plan_posts_no_tasks() {
         std::fs::write(&expected, content).unwrap();
         let recorder = Arc::new(Recorder::default());
 
-        let watcher = start(&recorder, &expected, FAST);
+        let watcher = start(&recorder, &expected, FAST).await;
         recorder
             .wait_for("a setup post", |posts| !posts.is_empty())
             .await;
@@ -320,7 +327,7 @@ async fn a_sender_error_does_not_stop_later_posts() {
     std::fs::write(&expected, PLAN).unwrap();
     let recorder = Arc::new(Recorder::failing(1));
 
-    let watcher = start(&recorder, &expected, FAST);
+    let watcher = start(&recorder, &expected, FAST).await;
     recorder
         .wait_for("a failed setup post", |posts| !posts.is_empty())
         .await;
@@ -340,7 +347,7 @@ async fn the_markers_move_the_phase_of_the_posted_snapshots() {
     let (_dir, expected) = plan_dir();
     std::fs::write(&expected, PLAN).unwrap();
     let recorder = Arc::new(Recorder::default());
-    let watcher = start(&recorder, &expected, FAST);
+    let watcher = start(&recorder, &expected, FAST).await;
     recorder
         .wait_for("a setup post", |posts| !posts.is_empty())
         .await;
@@ -366,7 +373,7 @@ async fn post_phase_freezes_the_phase_and_is_the_last_post_after_stop() {
     let (_dir, expected) = plan_dir();
     std::fs::write(&expected, PLAN).unwrap();
     let recorder = Arc::new(Recorder::default());
-    let watcher = start(&recorder, &expected, FAST);
+    let watcher = start(&recorder, &expected, FAST).await;
     recorder
         .wait_for("a setup post", |posts| !posts.is_empty())
         .await;
@@ -392,7 +399,7 @@ async fn post_failure_marks_the_run_failed_with_the_re_read_tasks() {
     let (_dir, expected) = plan_dir();
     std::fs::write(&expected, PLAN).unwrap();
     let recorder = Arc::new(Recorder::default());
-    let watcher = start(&recorder, &expected, FAST);
+    let watcher = start(&recorder, &expected, FAST).await;
     recorder
         .wait_for("a setup post", |posts| !posts.is_empty())
         .await;

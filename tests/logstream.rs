@@ -252,6 +252,16 @@ async fn a_buffer_past_its_bound_drops_its_oldest_bytes() {
     stream.close().await;
 }
 
+async fn caught_up(farm: &FakeFarm, written: usize) {
+    let paced = tokio::time::timeout(Duration::from_secs(10), async {
+        while written - sizes(farm).iter().sum::<usize>() > LOG_BUFFER_BYTES / 2 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    assert!(paced.is_ok(), "the flusher never woke without a tick");
+}
+
 #[tokio::test]
 async fn a_burst_larger_than_the_buffer_reaches_the_farm_whole_without_a_tick() {
     let farm = FakeFarm::start().await;
@@ -264,7 +274,7 @@ async fn a_burst_larger_than_the_buffer_reaches_the_farm_whole_without_a_tick() 
         let bytes = vec![byte; MAX_LOG_CHUNK];
         stream.write(&bytes);
         written.extend(bytes);
-        tokio::task::yield_now().await;
+        caught_up(&farm, written.len()).await;
     }
     stream.close().await;
 
