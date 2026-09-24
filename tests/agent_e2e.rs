@@ -19,8 +19,8 @@ use ralphex_macos_runner::protocol::types::{
 };
 use support::fake_farm::{FakeFarm, Reply};
 use support::{
-    Checkout, Record, TestSleeper, completion, dead, invocations, options, snapshots, spawned,
-    ticket_job, wait_for,
+    Checkout, Record, TestSleeper, completion, dead, gone_within, invocations, options, snapshots,
+    spawned, ticket_job, wait_for,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -1737,6 +1737,45 @@ async fn a_canceled_run_posts_a_failed_snapshot_before_its_completion() {
     assert_eq!(last.phase, Phase::Tasks, "{posted:?}");
     assert_eq!(failures(&posted), 1, "{posted:?}");
     assert!(last_index(&farm, "/progress") < first_index(&farm, "/complete"));
+}
+
+#[tokio::test]
+async fn a_cancel_stops_the_run_while_the_opening_snapshot_is_still_in_flight() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_SLEEP", "120")]);
+    let farm = farm_with(ticket_job(&checkout.path(), &checkout.plan(), CreatePr::No)).await;
+    farm.push_progress(Reply::Hold);
+    let _running = start(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(checkout.tools()),
+    ));
+
+    let record = spawned(checkout.record()).await;
+    let opening = wait_for(|| snapshots(&farm).first().cloned()).await;
+    assert!(opening.is_some(), "the opening snapshot was never sent");
+    farm.push_heartbeat(Reply::Beat(HeartbeatAction::Cancel));
+
+    let stopped = gone_within(record.pid, Duration::from_secs(5)).await;
+    farm.release_progress(Reply::Accepted);
+    assert!(
+        stopped,
+        "the run kept going while the opening snapshot was in flight"
+    );
+    let CompleteRequest {
+        status: _,
+        pr_url: _,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+    assert_eq!(fail_reason, "canceled");
+    let posted = snapshots(&farm);
+    let Some(last) = posted.last() else {
+        panic!("nothing was posted");
+    };
+    assert!(last.failed, "{posted:?}");
+    assert_eq!(failures(&posted), 1, "{posted:?}");
 }
 
 #[tokio::test]

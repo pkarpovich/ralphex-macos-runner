@@ -18,7 +18,7 @@ use std::time::Duration;
 use notify::event::ModifyKind;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use regex::Regex;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
 
@@ -444,6 +444,7 @@ pub struct PlanWatcher {
     tracker: Arc<PhaseTracker>,
     events: JoinHandle<()>,
     posts: JoinHandle<()>,
+    opened: oneshot::Receiver<()>,
 }
 
 impl PlanWatcher {
@@ -491,12 +492,18 @@ impl PlanWatcher {
             run_id,
             expected,
         });
-        let posts = tokio::spawn(post_requested(Arc::clone(&poster), Arc::clone(&tracker)));
+        let (opening, opened) = oneshot::channel();
+        let posts = tokio::spawn(post_requested(
+            Arc::clone(&poster),
+            Arc::clone(&tracker),
+            opening,
+        ));
         PlanWatcher {
             poster,
             tracker,
             events,
             posts,
+            opened,
         }
     }
 
@@ -508,17 +515,22 @@ impl PlanWatcher {
 
     /// Stops watching and posting, and returns what can still post the run's last snapshots.
     ///
-    /// A post in flight is abandoned. The file-system watcher is released on
-    /// the blocking pool, since ending its thread waits on the file-system
-    /// events daemon, and this returns without waiting for it.
+    /// The opening [`Phase::Setup`] snapshot is waited for, within its
+    /// [`PROGRESS_POST_TIMEOUT`], so it can neither be lost to a run that ends
+    /// at once nor land after the snapshots posted from here on; any later post
+    /// in flight is abandoned. The file-system watcher is released on the
+    /// blocking pool, since ending its thread waits on the file-system events
+    /// daemon, and this returns without waiting for it.
     pub async fn stop(self) -> StoppedWatcher {
         let PlanWatcher {
             poster,
             tracker,
             events,
             posts,
+            opened,
         } = self;
         events.abort();
+        let _opened = opened.await;
         posts.abort();
         let _ended = events.await;
         let _ended = posts.await;
@@ -553,10 +565,15 @@ impl StoppedWatcher {
     }
 }
 
-async fn post_requested(poster: Arc<Poster>, tracker: Arc<PhaseTracker>) {
+async fn post_requested(
+    poster: Arc<Poster>,
+    tracker: Arc<PhaseTracker>,
+    opening: oneshot::Sender<()>,
+) {
     poster
         .post_within_deadline(Phase::Setup, Outcome::Running)
         .await;
+    let _sent = opening.send(());
     loop {
         tracker.requested().await;
         poster.post(tracker.phase(), Outcome::Running).await;

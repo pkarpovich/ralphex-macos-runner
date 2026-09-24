@@ -25,6 +25,7 @@ const TICKED: &str = "# Require dials\n\n### Task 1: Add it\n- [x] write it\n- [
 struct Recorder {
     posts: Mutex<Vec<(RunId, ProgressRequest)>>,
     failures: Mutex<u32>,
+    latency: Duration,
 }
 
 impl Recorder {
@@ -32,6 +33,15 @@ impl Recorder {
         Recorder {
             posts: Mutex::new(Vec::new()),
             failures: Mutex::new(failures),
+            latency: Duration::ZERO,
+        }
+    }
+
+    fn slow(latency: Duration) -> Recorder {
+        Recorder {
+            posts: Mutex::new(Vec::new()),
+            failures: Mutex::new(0),
+            latency,
         }
     }
 
@@ -67,6 +77,7 @@ impl ProgressSender for Recorder {
         request: &'a ProgressRequest,
     ) -> Pin<Box<dyn Future<Output = Result<(), FarmError>> + Send + 'a>> {
         Box::pin(async move {
+            tokio::time::sleep(self.latency).await;
             let mut posts = self.posts.lock().unwrap();
             posts.push((run_id.clone(), request.clone()));
             drop(posts);
@@ -392,6 +403,21 @@ async fn post_phase_freezes_the_phase_and_is_the_last_post_after_stop() {
     assert_eq!(posts[1].phase, Phase::Pr);
     assert!(!posts[1].failed);
     assert_eq!(statuses(&posts[1]), [TaskStatus::Pending]);
+}
+
+#[tokio::test]
+async fn a_stop_right_after_start_still_delivers_setup_before_the_last_post() {
+    let (_dir, expected) = plan_dir();
+    let recorder = Arc::new(Recorder::slow(Duration::from_millis(200)));
+    let watcher = start(&recorder, &expected, FAST).await;
+
+    let stopped = watcher.stop().await;
+    stopped.post_phase(Phase::Pr).await;
+
+    let posts = recorder.posts();
+    assert_eq!(posts.len(), 2, "{posts:#?}");
+    assert_eq!(posts[0].phase, Phase::Setup);
+    assert_eq!(posts[1].phase, Phase::Pr);
 }
 
 #[tokio::test]

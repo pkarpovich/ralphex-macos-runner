@@ -240,6 +240,14 @@ impl FakeFarm {
         self.shared.release.notify_one();
     }
 
+    /// Releases a held progress post, which then answers `reply`.
+    pub fn release_progress(&self, reply: Reply) {
+        let mut routes = self.shared.routes.lock().unwrap();
+        routes.progress.queue.push_front(reply);
+        drop(routes);
+        self.shared.release.notify_one();
+    }
+
     /// Returns every request this farm received, in order.
     #[must_use]
     pub fn requests(&self) -> Vec<Recorded> {
@@ -487,6 +495,15 @@ async fn progress(
 ) -> Response {
     record(&shared, &uri, &headers, &body);
     let reply = take(&shared, RouteName::Progress, Reply::Accepted);
+    let reply = match reply {
+        Reply::Hold => {
+            shared.release.notified().await;
+            take(&shared, RouteName::Progress, Reply::Accepted)
+        }
+        Reply::Job(_) | Reply::NoJob | Reply::Accepted | Reply::Beat(_) | Reply::Status(..) => {
+            reply
+        }
+    };
     let Reply::Accepted = reply else {
         return respond(reply);
     };

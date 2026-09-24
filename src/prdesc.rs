@@ -330,6 +330,24 @@ pub fn fallback_title(origin: &RunOrigin) -> String {
         } => format!("{identifier}: {title}"),
         RunOrigin::Local { title } => title.clone(),
     };
+    fit_title(title)
+}
+
+/// Returns `title` cut to [`TITLE_LIMIT`] characters, ending in `...` when it had to be cut.
+///
+/// # Examples
+///
+/// ```
+/// use ralphex_macos_runner::prdesc::{fit_title, TITLE_LIMIT};
+///
+/// assert_eq!(fit_title("Require dials".to_string()), "Require dials");
+///
+/// let cut = fit_title("t".repeat(TITLE_LIMIT + 1));
+/// assert_eq!(cut.chars().count(), TITLE_LIMIT);
+/// assert!(cut.ends_with("..."));
+/// ```
+#[must_use]
+pub fn fit_title(title: String) -> String {
     if title.chars().count() <= TITLE_LIMIT {
         return title;
     }

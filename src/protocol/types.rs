@@ -76,6 +76,9 @@ pub const PROGRESS_POST_TIMEOUT: Duration = Duration::from_secs(10);
 /// The time the plan watcher may take to watch its first directories.
 pub const WATCH_START_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The time the removal of a run's output directory may take before it is left behind.
+pub const OUTPUT_REMOVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The time the git that inspects a checkout may take before it is killed.
 pub const VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
 

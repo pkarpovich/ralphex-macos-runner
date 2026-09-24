@@ -20,8 +20,8 @@ use crate::config::{Config, Loaded};
 use crate::ipc;
 use crate::paths::{self, APP_NAME, PathError};
 use crate::protocol::types::{
-    COMPLETE_BUDGET, LOG_CLOSE_TIMEOUT, PR_BUDGET, PROGRESS_POST_TIMEOUT, REQUEST_TIMEOUT,
-    RETRY_MAX_DELAY, RunId, STOP_GRACE, VALIDATE_TIMEOUT, WATCH_START_TIMEOUT,
+    COMPLETE_BUDGET, LOG_CLOSE_TIMEOUT, OUTPUT_REMOVE_TIMEOUT, PR_BUDGET, PROGRESS_POST_TIMEOUT,
+    REQUEST_TIMEOUT, RETRY_MAX_DELAY, RunId, STOP_GRACE, VALIDATE_TIMEOUT, WATCH_START_TIMEOUT,
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -221,12 +221,14 @@ impl std::fmt::Display for Uninstalled {
 /// the run to finish, [`STOP_GRACE`] to stop the
 /// process group, another [`STOP_GRACE`] for the pipe drain,
 /// [`LOG_CLOSE_TIMEOUT`] for the log stream's last flush, [`PR_BUDGET`] for a
-/// pull-request sequence a run that exited `0` still owes, two
-/// [`PROGRESS_POST_TIMEOUT`]s for the timeline's last snapshots - `pr` before
-/// the push and `failed` when the pull request then fails - and
-/// [`COMPLETE_BUDGET`] for the completion - which overruns its budget by a
-/// backoff and a request, because the budget is checked before the sleep rather
-/// than after the attempt.
+/// pull-request sequence a run that exited `0` still owes, three
+/// [`PROGRESS_POST_TIMEOUT`]s for the timeline - the opening `setup` snapshot
+/// the watcher's stop waits for, `pr` before the push and `failed` when the
+/// pull request then fails - [`COMPLETE_BUDGET`] for the completion - which
+/// overruns its budget by a backoff and a request, because the budget is
+/// checked before the sleep rather than after the attempt - and
+/// [`OUTPUT_REMOVE_TIMEOUT`] for the output directory removed before the run
+/// slot is given back.
 ///
 /// # Examples
 ///
@@ -237,7 +239,7 @@ impl std::fmt::Display for Uninstalled {
 ///
 /// assert_eq!(
 ///     service::exit_timeout(Duration::from_secs(120)),
-///     Duration::from_secs(30 + 10 + 120 + 10 + 10 + 30 + 600 + 10 + 10 + 180 + 30 + 30)
+///     Duration::from_secs(30 + 10 + 120 + 10 + 10 + 30 + 600 + 10 + 10 + 10 + 180 + 30 + 30 + 10)
 /// );
 /// ```
 #[must_use]
@@ -251,9 +253,11 @@ pub fn exit_timeout(drain_timeout: Duration) -> Duration {
         + PR_BUDGET
         + PROGRESS_POST_TIMEOUT
         + PROGRESS_POST_TIMEOUT
+        + PROGRESS_POST_TIMEOUT
         + COMPLETE_BUDGET
         + RETRY_MAX_DELAY
         + REQUEST_TIMEOUT
+        + OUTPUT_REMOVE_TIMEOUT
 }
 
 /// Returns the property list launchd loads the daemon from.
@@ -793,8 +797,9 @@ mod tests {
         let pipes = STOP_GRACE;
         let logs = LOG_CLOSE_TIMEOUT;
         let pull_request = PR_BUDGET;
-        let timeline = PROGRESS_POST_TIMEOUT + PROGRESS_POST_TIMEOUT;
+        let timeline = PROGRESS_POST_TIMEOUT + PROGRESS_POST_TIMEOUT + PROGRESS_POST_TIMEOUT;
         let completion = COMPLETE_BUDGET + RETRY_MAX_DELAY + REQUEST_TIMEOUT;
+        let output = OUTPUT_REMOVE_TIMEOUT;
         assert_eq!(
             exit_timeout(drain_timeout),
             validation
@@ -806,6 +811,7 @@ mod tests {
                 + pull_request
                 + timeline
                 + completion
+                + output
         );
     }
 
@@ -819,7 +825,7 @@ mod tests {
             Path::new("/logs"),
             exit_timeout(drain_timeout),
         );
-        assert!(plist.contains("<integer>1550</integer>"), "{plist}");
+        assert!(plist.contains("<integer>1570</integer>"), "{plist}");
     }
 
     #[test]
