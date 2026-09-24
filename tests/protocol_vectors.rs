@@ -2,11 +2,13 @@
 //!
 //! Each vector is transcribed verbatim from the plan's "Conformance vectors"
 //! section, deserialized into this crate's type and re-serialized; the two JSON
-//! values must be equal.
+//! values must be equal. The vectors added for the run title and the progress
+//! snapshots are also compared byte for byte, because they mirror the farm's
+//! own goldens.
 
 use ralphex_macos_runner::protocol::types::{
     ClaimRequest, CompleteRequest, HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest,
-    RepoCapability,
+    ProgressRequest, RepoCapability,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -20,6 +22,15 @@ where
     let decoded: T = serde_json::from_str(vector).unwrap();
     let encoded = serde_json::to_value(&decoded).unwrap();
     assert_eq!(encoded, expected);
+}
+
+fn byte_exact<T>(vector: &str)
+where
+    T: DeserializeOwned + Serialize,
+{
+    round_trip::<T>(vector);
+    let decoded: T = serde_json::from_str(vector).unwrap();
+    assert_eq!(serde_json::to_string(&decoded).unwrap(), vector);
 }
 
 #[test]
@@ -90,6 +101,32 @@ fn open_run_request_full() {
 fn open_run_request_empty() {
     round_trip::<OpenRunRequest>(
         r#"{"runner":"","version":"","runtime":"","repo":"","ctx":"","plan":"","branch":"","create_pr":false}"#,
+    );
+}
+
+#[test]
+fn open_run_request_with_a_title() {
+    byte_exact::<OpenRunRequest>(
+        r#"{"runner":"mbp","version":"1","runtime":"native","repo":"nhop","ctx":"/Users/op/Projects/nhop","plan":"/Users/op/Projects/nhop/docs/plans/20260907-require-dials.md","branch":"20260907-require-dials","create_pr":false,"title":"Require dials through degradation"}"#,
+    );
+}
+
+#[test]
+fn open_run_request_without_a_title_stays_unchanged() {
+    byte_exact::<OpenRunRequest>(
+        r#"{"runner":"mbp","version":"1","runtime":"native","repo":"ralphex-farm","ctx":"/abs/checkout","plan":"/abs/checkout/docs/plans/x.md","branch":"x","create_pr":true}"#,
+    );
+}
+
+#[test]
+fn progress_request_setup_without_tasks() {
+    byte_exact::<ProgressRequest>(r#"{"phase":"setup","failed":false,"tasks":null}"#);
+}
+
+#[test]
+fn progress_request_failed_with_tasks() {
+    byte_exact::<ProgressRequest>(
+        r#"{"phase":"tasks","failed":true,"tasks":[{"number":"1","ord":0,"title":"Add the parser","status":"done","checkboxes":[{"text":"write it","checked":true}]},{"number":"2","ord":1,"title":"Wire it","status":"active","checkboxes":[{"text":"call it","checked":true},{"text":"test it","checked":false}]},{"number":"3","ord":2,"title":"Document it","status":"pending","checkboxes":[]}]}"#,
     );
 }
 

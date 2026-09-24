@@ -490,6 +490,65 @@ async fn a_branch_the_client_names_reaches_the_farm() {
 }
 
 #[tokio::test]
+async fn a_local_run_is_named_after_its_plan_heading() {
+    let checkout = Checkout::new();
+    std::fs::write(checkout.plan(), "# Require dials\n\n### Task 1: x\n").unwrap();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(local_job(&checkout, "local-title-1"))));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let output = client.wait_with_output().await.unwrap();
+
+    assert!(output.status.success(), "{}", text(&output));
+    let opened = farm.requests_ending("/runs");
+    let body = opened[0].text();
+    assert!(body.contains(r#""title":"Require dials""#), "{body}");
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_plan_without_a_heading_opens_a_run_without_a_title() {
+    let checkout = Checkout::new();
+    std::fs::write(checkout.plan(), "### Task 1: x\n- [ ] do it\n").unwrap();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(local_job(&checkout, "local-title-2"))));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let output = client.wait_with_output().await.unwrap();
+
+    assert!(output.status.success(), "{}", text(&output));
+    let opened = farm.requests_ending("/runs");
+    let body = opened[0].text();
+    assert!(!body.contains(r#""title""#), "{body}");
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_plan_the_daemon_cannot_read_opens_a_run_without_a_title() {
+    let checkout = Checkout::new();
+    std::fs::write(checkout.plan(), "# Require dials\n").unwrap();
+    std::fs::set_permissions(checkout.plan(), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(local_job(&checkout, "local-title-3"))));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let output = client.wait_with_output().await.unwrap();
+
+    std::fs::set_permissions(checkout.plan(), std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(output.status.success(), "{}", text(&output));
+    let opened = farm.requests_ending("/runs");
+    let body = opened[0].text();
+    assert!(!body.contains(r#""title""#), "{body}");
+    drop(daemon.raise);
+}
+
+#[tokio::test]
 async fn a_local_run_the_farm_forgets_is_reported_to_the_client() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_SLEEP", "120")]);

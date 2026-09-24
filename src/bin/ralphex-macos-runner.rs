@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
+use std::future::Future;
+
 use clap::Parser;
 use ralphex_macos_runner::agent::{Agent, AgentExit, AgentOptions, Shutdown, hasten};
 use ralphex_macos_runner::config::{Config, Loaded};
@@ -38,9 +40,28 @@ struct Cli {
     socket: Option<PathBuf>,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    let Cli { config, socket } = Cli::parse();
+fn main() -> ExitCode {
+    run_to_exit(serve(Cli::parse()))
+}
+
+fn run_to_exit(serving: impl Future<Output = ExitCode>) -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("the runtime could not be started: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = runtime.block_on(serving);
+    runtime.shutdown_background();
+    code
+}
+
+async fn serve(cli: Cli) -> ExitCode {
+    let Cli { config, socket } = cli;
     let filter = match EnvFilter::try_from_default_env() {
         Ok(filter) => filter,
         Err(_absent) => EnvFilter::new("info"),
@@ -97,8 +118,17 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let farm_out = match paths::farm_out_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let options = AgentOptions {
         drain_timeout: config.drain_timeout,
+        farm_out: Some(farm_out),
         ..AgentOptions::default()
     };
     tracing::info!(
@@ -150,5 +180,32 @@ async fn raise_on_signal(raise: watch::Sender<Shutdown>) {
                 tracing::warn!("second signal received, stopping the run now");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    #[test]
+    fn a_blocking_read_that_never_returns_does_not_hold_the_exit() {
+        let (hold, held) = mpsc::channel::<()>();
+        let (exited, exit) = mpsc::channel();
+        thread::spawn(move || {
+            let code = run_to_exit(async move {
+                let _stuck = tokio::task::spawn_blocking(move || held.recv());
+                ExitCode::from(VERSION_MISMATCH)
+            });
+            let _ = exited.send(code);
+        });
+
+        let code = exit.recv_timeout(Duration::from_secs(10));
+        drop(hold);
+
+        assert_eq!(code, Ok(ExitCode::from(VERSION_MISMATCH)));
     }
 }

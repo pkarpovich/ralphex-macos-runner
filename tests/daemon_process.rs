@@ -8,9 +8,10 @@ use std::time::Duration;
 
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+use ralphex_macos_runner::prdesc::PR_FILE_VAR;
 use ralphex_macos_runner::protocol::types::{CompleteRequest, CompleteStatus};
 use support::fake_farm::{FakeFarm, Reply};
-use support::{Checkout, completion, dead, local_job, spawned, wait_for};
+use support::{Checkout, Record, completion, dead, local_job, spawned, wait_for};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 const MISMATCH: &str = r#"{"error":"the runner speaks 1, the farm speaks 2"}"#;
@@ -26,10 +27,15 @@ fn config_file(checkout: &Checkout, farm: &FakeFarm, ralphex: &Path) -> PathBuf 
     path
 }
 
-fn daemon(config: &Path, socket: &Path) -> tokio::process::Child {
+fn home(checkout: &Checkout) -> PathBuf {
+    checkout.dir().join("home")
+}
+
+fn daemon(config: &Path, socket: &Path, home: &Path) -> tokio::process::Child {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_ralphex-macos-runner"));
     command.arg("--config").arg(config);
     command.arg("--socket").arg(socket);
+    command.env("HOME", home);
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
@@ -86,7 +92,7 @@ async fn a_protocol_mismatch_exits_with_the_status_launchd_restarts_on() {
     let config = config_file(&checkout, &farm, &ralphex);
     let socket = checkout.dir().join("daemon.sock");
 
-    let daemon = daemon(&config, &socket);
+    let daemon = daemon(&config, &socket, &home(&checkout));
     let output = daemon.wait_with_output().await.unwrap();
 
     assert_eq!(output.status.code(), Some(2));
@@ -101,7 +107,7 @@ async fn a_configuration_that_is_not_there_exits_with_a_failure() {
     let absent = checkout.dir().join("absent.toml");
     let socket = checkout.dir().join("daemon.sock");
 
-    let daemon = daemon(&absent, &socket);
+    let daemon = daemon(&absent, &socket, &home(&checkout));
     let output = daemon.wait_with_output().await.unwrap();
 
     assert_eq!(output.status.code(), Some(1));
@@ -118,7 +124,7 @@ async fn a_signalled_daemon_drains_the_run_a_client_started() {
     farm.push_runs(Reply::Job(Box::new(local_job(&checkout, "local-1"))));
     let config = config_file(&checkout, &farm, &ralphex);
     let socket = checkout.dir().join("daemon.sock");
-    let mut daemon = daemon(&config, &socket);
+    let mut daemon = daemon(&config, &socket, &home(&checkout));
     listening(&socket).await;
     let polling = wait_for(|| match farm.requests_ending("/claim").is_empty() {
         true => None,
@@ -136,6 +142,21 @@ async fn a_signalled_daemon_drains_the_run_a_client_started() {
     assert!(waiting.contains("waiting for the daemon"), "{waiting}");
     farm.release_claim(Reply::NoJob);
     let record = spawned(checkout.record()).await;
+    let pr_file = wait_for(|| Record::read(checkout.record()).env_value(PR_FILE_VAR)).await;
+    let Some(pr_file) = pr_file else {
+        panic!("the run was not told where to write its description");
+    };
+    let pr_file = PathBuf::from(pr_file);
+    assert!(
+        pr_file.starts_with(home(&checkout)),
+        "{}",
+        pr_file.display()
+    );
+    assert!(
+        pr_file.ends_with("farm-out/local-1/pr.md"),
+        "{}",
+        pr_file.display()
+    );
     signal(&daemon, Signal::SIGTERM);
 
     let CompleteRequest {
@@ -154,6 +175,10 @@ async fn a_signalled_daemon_drains_the_run_a_client_started() {
         panic!("the daemon never exited");
     };
     assert_eq!(exited.unwrap().code(), Some(0));
+    let Some(output) = pr_file.parent() else {
+        panic!("{} has no directory", pr_file.display());
+    };
+    assert!(!output.exists(), "{} outlived the run", output.display());
     let mut rest = String::new();
     while let Ok(Some(line)) = printed.next_line().await {
         rest.push_str(&line);

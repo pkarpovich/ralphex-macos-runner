@@ -1,21 +1,22 @@
 //! The HTTP client that speaks the farm protocol.
 //!
-//! [`FarmClient`] owns the five calls a runner makes, the retry policy each one
+//! [`FarmClient`] owns the six calls a runner makes, the retry policy each one
 //! carries and the mapping from an HTTP status to a [`FarmError`]. Delays and
 //! the passage of time arrive through the [`Sleeper`] trait, so a test drives
 //! the whole retry table without waiting on a clock.
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use reqwest::header::CONTENT_TYPE;
 
 use crate::protocol::types::{
     CLAIM_WINDOW, COMPLETE_BUDGET, ClaimRequest, CompleteRequest, HeartbeatRequest,
-    HeartbeatResponse, Job, OpenRunRequest, REQUEST_TIMEOUT, RETRY_BASE_DELAY, RETRY_MAX_ATTEMPTS,
-    RETRY_MAX_DELAY, RunId, Seq,
+    HeartbeatResponse, Job, OpenRunRequest, ProgressRequest, REQUEST_TIMEOUT, RETRY_BASE_DELAY,
+    RETRY_MAX_ATTEMPTS, RETRY_MAX_DELAY, RunId, Seq,
 };
 
 /// The time a claim long-poll may take, the farm's window plus a margin.
@@ -86,6 +87,7 @@ pub struct FarmClient {
     farm_url: String,
     token: String,
     sleeper: Arc<dyn Sleeper>,
+    progress_gone: Mutex<HashSet<RunId>>,
 }
 
 impl FarmClient {
@@ -116,6 +118,7 @@ impl FarmClient {
             farm_url: farm_url.trim_end_matches('/').to_string(),
             token: token.to_string(),
             sleeper,
+            progress_gone: Mutex::new(HashSet::new()),
         })
     }
 
@@ -276,6 +279,56 @@ impl FarmClient {
         })
         .await?;
         Ok(())
+    }
+
+    /// Sends one plan-progress snapshot of a run.
+    ///
+    /// The call is never retried, because every snapshot supersedes the one
+    /// before it. Once the farm answers `410` for a run, every later call for
+    /// that run returns [`FarmError::Gone`] without a request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FarmError::Gone`] when the farm has forgotten the run,
+    /// [`FarmError::Transport`] when it cannot be reached and
+    /// [`FarmError::BadRequest`] or [`FarmError::Rejected`] when it refuses
+    /// the snapshot.
+    ///
+    /// # Panics
+    ///
+    /// Panics when another holder of the gone-run lock panicked.
+    pub async fn post_progress(
+        &self,
+        run_id: &RunId,
+        request: &ProgressRequest,
+    ) -> Result<(), FarmError> {
+        if self.progress_is_gone(run_id) {
+            return Err(FarmError::Gone);
+        }
+        let url = self.endpoint(&format!(
+            "api/runner/jobs/{}/progress",
+            encode_segment(run_id.as_str())
+        ));
+        let attempt = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.token)
+            .timeout(REQUEST_TIMEOUT)
+            .json(request);
+        match self.send(attempt).await {
+            Ok(_) => Ok(()),
+            Err(FarmError::Gone) => {
+                let mut gone = self.progress_gone.lock().unwrap();
+                gone.insert(run_id.clone());
+                Err(FarmError::Gone)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn progress_is_gone(&self, run_id: &RunId) -> bool {
+        let gone = self.progress_gone.lock().unwrap();
+        gone.contains(run_id)
     }
 
     fn endpoint(&self, path: &str) -> String {

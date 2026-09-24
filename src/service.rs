@@ -20,8 +20,8 @@ use crate::config::{Config, Loaded};
 use crate::ipc;
 use crate::paths::{self, APP_NAME, PathError};
 use crate::protocol::types::{
-    COMPLETE_BUDGET, LOG_CLOSE_TIMEOUT, PR_BUDGET, REQUEST_TIMEOUT, RETRY_MAX_DELAY, RunId,
-    STOP_GRACE, VALIDATE_TIMEOUT,
+    COMPLETE_BUDGET, LOG_CLOSE_TIMEOUT, OUTPUT_REMOVE_TIMEOUT, PR_BUDGET, PROGRESS_POST_TIMEOUT,
+    REQUEST_TIMEOUT, RETRY_MAX_DELAY, RunId, STOP_GRACE, VALIDATE_TIMEOUT, WATCH_START_TIMEOUT,
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -216,13 +216,19 @@ impl std::fmt::Display for Uninstalled {
 /// to finalise a finished run `runner_lost`. The sum walks every await the
 /// daemon makes after the signal: [`VALIDATE_TIMEOUT`] for the checkout
 /// inspection a run started just before the signal still runs outside the
-/// drain, `drain_timeout` for the run to finish, [`STOP_GRACE`] to stop the
+/// drain, [`WATCH_START_TIMEOUT`] for the plan watcher's first directories,
+/// which hold back the drain's terminal until they answer, `drain_timeout` for
+/// the run to finish, [`STOP_GRACE`] to stop the
 /// process group, another [`STOP_GRACE`] for the pipe drain,
 /// [`LOG_CLOSE_TIMEOUT`] for the log stream's last flush, [`PR_BUDGET`] for a
-/// pull-request sequence a run that exited `0` still owes, and
-/// [`COMPLETE_BUDGET`] for the completion - which overruns its budget by a
-/// backoff and a request, because the budget is checked before the sleep rather
-/// than after the attempt.
+/// pull-request sequence a run that exited `0` still owes, three
+/// [`PROGRESS_POST_TIMEOUT`]s for the timeline - the opening `setup` snapshot
+/// the watcher's stop waits for, `pr` before the push and `failed` when the
+/// pull request then fails - [`COMPLETE_BUDGET`] for the completion - which
+/// overruns its budget by a backoff and a request, because the budget is
+/// checked before the sleep rather than after the attempt - and
+/// [`OUTPUT_REMOVE_TIMEOUT`] for the output directory removed before the run
+/// slot is given back.
 ///
 /// # Examples
 ///
@@ -233,20 +239,25 @@ impl std::fmt::Display for Uninstalled {
 ///
 /// assert_eq!(
 ///     service::exit_timeout(Duration::from_secs(120)),
-///     Duration::from_secs(30 + 120 + 10 + 10 + 30 + 600 + 180 + 30 + 30)
+///     Duration::from_secs(30 + 10 + 120 + 10 + 10 + 30 + 600 + 10 + 10 + 10 + 180 + 30 + 30 + 10)
 /// );
 /// ```
 #[must_use]
 pub fn exit_timeout(drain_timeout: Duration) -> Duration {
     VALIDATE_TIMEOUT
+        + WATCH_START_TIMEOUT
         + drain_timeout
         + STOP_GRACE
         + STOP_GRACE
         + LOG_CLOSE_TIMEOUT
         + PR_BUDGET
+        + PROGRESS_POST_TIMEOUT
+        + PROGRESS_POST_TIMEOUT
+        + PROGRESS_POST_TIMEOUT
         + COMPLETE_BUDGET
         + RETRY_MAX_DELAY
         + REQUEST_TIMEOUT
+        + OUTPUT_REMOVE_TIMEOUT
 }
 
 /// Returns the property list launchd loads the daemon from.
@@ -780,15 +791,27 @@ mod tests {
     #[test]
     fn the_exit_timeout_covers_every_await_the_shutdown_makes() {
         let validation = VALIDATE_TIMEOUT;
+        let watch_start = WATCH_START_TIMEOUT;
         let drain_timeout = DEFAULT_DRAIN_TIMEOUT;
         let stop = STOP_GRACE;
         let pipes = STOP_GRACE;
         let logs = LOG_CLOSE_TIMEOUT;
         let pull_request = PR_BUDGET;
+        let timeline = PROGRESS_POST_TIMEOUT + PROGRESS_POST_TIMEOUT + PROGRESS_POST_TIMEOUT;
         let completion = COMPLETE_BUDGET + RETRY_MAX_DELAY + REQUEST_TIMEOUT;
+        let output = OUTPUT_REMOVE_TIMEOUT;
         assert_eq!(
             exit_timeout(drain_timeout),
-            validation + drain_timeout + stop + pipes + logs + pull_request + completion
+            validation
+                + watch_start
+                + drain_timeout
+                + stop
+                + pipes
+                + logs
+                + pull_request
+                + timeline
+                + completion
+                + output
         );
     }
 
@@ -802,7 +825,7 @@ mod tests {
             Path::new("/logs"),
             exit_timeout(drain_timeout),
         );
-        assert!(plist.contains("<integer>1520</integer>"), "{plist}");
+        assert!(plist.contains("<integer>1570</integer>"), "{plist}");
     }
 
     #[test]

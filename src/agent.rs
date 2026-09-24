@@ -35,12 +35,19 @@ use crate::config::Config;
 use crate::ipc::RunRequest;
 use crate::job::{self, JobError, JobSpec, LocalOptions, Review, RunningJob};
 use crate::logstream::{IntervalTicker, LogStream, Ticker};
+use crate::planfile::{self, Plan};
 use crate::pr::{PrSpec, PrTools, PrUrl, RunOrigin, open_pull_request};
+use crate::prdesc::{self, Description, OutputDir, PR_FILE_VAR};
+use crate::progress::{
+    DEFAULT_ATTACH_RETRY, DEFAULT_DEBOUNCE, PlanWatcher, ProgressSender, StoppedWatcher,
+    WatchTimings, expected_plan,
+};
 use crate::protocol::client::{FarmClient, FarmError, next_delay};
 use crate::protocol::types::{
-    ClaimRequest, CompleteRequest, CompleteStatus, CreatePr, HEARTBEAT_INTERVAL, HeartbeatAction,
-    HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest, RETRY_BASE_DELAY, RUNTIME, RunId,
-    RunnerName, STOP_GRACE, VERSION,
+    Branch, ClaimRequest, CompleteRequest, CompleteStatus, CreatePr, HEARTBEAT_INTERVAL,
+    HeartbeatAction, HeartbeatRequest, HeartbeatResponse, Job, OUTPUT_REMOVE_TIMEOUT,
+    OpenRunRequest, Phase, RETRY_BASE_DELAY, RUNTIME, RunId, RunnerName, STOP_GRACE,
+    VALIDATE_TIMEOUT, VERSION,
 };
 
 const TERMINAL_CAPACITY: usize = 8;
@@ -256,6 +263,13 @@ pub struct AgentOptions {
     pub ticker: Arc<dyn Ticker>,
     /// The programs the pull-request sequence runs.
     pub pr_tools: PrTools,
+    /// The quiet period after the last change to the plan before its snapshot is posted.
+    pub plan_debounce: Duration,
+    /// The interval between attempts to watch plan directories that do not exist yet.
+    pub plan_attach_retry: Duration,
+    /// The directory each run's finalize output directory is made under; without
+    /// one no run is told where to write its pull request description.
+    pub farm_out: Option<PathBuf>,
 }
 
 impl Default for AgentOptions {
@@ -267,6 +281,9 @@ impl Default for AgentOptions {
             claim_retry_delay: RETRY_BASE_DELAY,
             ticker: Arc::new(IntervalTicker),
             pr_tools: PrTools::default(),
+            plan_debounce: DEFAULT_DEBOUNCE,
+            plan_attach_retry: DEFAULT_ATTACH_RETRY,
+            farm_out: None,
         }
     }
 }
@@ -290,7 +307,11 @@ enum Settled {
 
 struct PullRequest {
     ctx: PathBuf,
-    spec: PrSpec,
+    branch: Branch,
+    origin: RunOrigin,
+    plan: String,
+    run_id: RunId,
+    pr_file: Option<PathBuf>,
     create_pr: CreatePr,
 }
 
@@ -298,6 +319,7 @@ struct Finished {
     completion: Option<CompleteRequest>,
     outcome: RunOutcome,
     beats: Option<JoinHandle<()>>,
+    output: Option<OutputDir>,
 }
 
 /// The runner's claim loop and its single run slot.
@@ -489,6 +511,7 @@ impl Agent {
             worktree,
             env,
         } = request;
+        let title = plan_title(Path::new(&plan)).await;
         let opened = OpenRunRequest {
             runner: self.config.name.clone(),
             version: VERSION.to_string(),
@@ -498,6 +521,7 @@ impl Agent {
             plan,
             branch,
             create_pr,
+            title,
         };
         let job = match self.client.open_run(&opened).await {
             Ok(job) => job,
@@ -567,6 +591,7 @@ impl Agent {
             completion,
             outcome,
             beats,
+            output,
         } = self.execute(job, local, shutdown, current).await;
         let ended = match completion {
             Some(completion) => self.report(&run_id, completion).await,
@@ -579,6 +604,9 @@ impl Agent {
         };
         if let Some(beats) = beats {
             beats.abort();
+        }
+        if let Some(output) = output {
+            remove_output(output).await;
         }
         self.leave(current, ended);
         outcome
@@ -625,6 +653,7 @@ impl Agent {
                 )),
                 outcome: RunOutcome::Continue,
                 beats: Some(beats),
+                output: None,
             };
         }
 
@@ -636,30 +665,9 @@ impl Agent {
             local,
             ralphex_bin: self.config.ralphex_bin.clone(),
         };
-        if let Err(error) = job::validate(&spec).await {
-            return Finished {
-                completion: Some(failed(
-                    error.fail_reason(),
-                    error.to_string(),
-                    String::new(),
-                )),
-                outcome: RunOutcome::Continue,
-                beats: Some(beats),
-            };
-        }
-
-        let log = current.log();
-        let drain = tokio::spawn(drain_after(
-            shutdown,
-            self.options.drain_timeout,
-            terminals.clone(),
-        ));
-
-        let mut running = match job::spawn(&spec, Arc::clone(&log)) {
-            Ok(running) => running,
+        let top = match job::validate(&spec).await {
+            Ok(top) => top,
             Err(error) => {
-                drain.abort();
-                log.close().await;
                 return Finished {
                     completion: Some(failed(
                         error.fail_reason(),
@@ -668,6 +676,42 @@ impl Agent {
                     )),
                     outcome: RunOutcome::Continue,
                     beats: Some(beats),
+                    output: None,
+                };
+            }
+        };
+
+        let output = self.output_dir(&run_id);
+        let pr_file = output.as_ref().map(OutputDir::pr_file);
+        let mut spec = spec;
+        if let Some(pr_file) = &pr_file {
+            spec.local
+                .env
+                .push((PR_FILE_VAR.to_string(), pr_file.display().to_string()));
+        }
+
+        let log = current.log();
+        let drain = tokio::spawn(drain_after(
+            shutdown,
+            self.options.drain_timeout,
+            terminals.clone(),
+        ));
+        let watcher = self.watch_plan(&spec, &top, &run_id).await;
+        log.track(watcher.tracker());
+
+        let mut running = match job::spawn(&spec, Arc::clone(&log)) {
+            Ok(running) => running,
+            Err(error) => {
+                drain.abort();
+                let timeline = watcher.stop().await;
+                log.close().await;
+                let completion = failed(error.fail_reason(), error.to_string(), String::new());
+                mark_failure(&timeline, Some(&completion)).await;
+                return Finished {
+                    completion: Some(completion),
+                    outcome: RunOutcome::Continue,
+                    beats: Some(beats),
+                    output,
                 };
             }
         };
@@ -678,20 +722,28 @@ impl Agent {
 
         let exited = match ended {
             Ended::Terminal(reason) => {
-                if let Err(error) = running.stop(self.options.stop_grace).await {
+                let (halted, timeline) =
+                    tokio::join!(running.stop(self.options.stop_grace), watcher.stop());
+                if let Err(error) = halted {
                     tracing::warn!("run {run_id} could not be stopped: {error}");
                 }
                 running.drain_output(self.options.stop_grace).await;
                 log.close().await;
-                return stopped(reason, &run_id, beats);
+                let finished = stopped(reason, &run_id, beats, output);
+                mark_failure(&timeline, finished.completion.as_ref()).await;
+                return finished;
             }
             Ended::Exited(exited) => exited,
         };
+        let timeline = watcher.stop().await;
 
-        let origin = origin(identifier, issue_url, title);
         let pull_request = PullRequest {
             ctx: PathBuf::from(&ctx),
-            spec: PrSpec::describe(branch, &origin, &plan_path, &run_id),
+            branch,
+            origin: origin(identifier, issue_url, title),
+            plan: plan_path,
+            run_id: run_id.clone(),
+            pr_file,
             create_pr,
         };
         let mut finishing = Box::pin(finish(
@@ -701,6 +753,7 @@ impl Agent {
             exited,
             pull_request,
             &self.options.pr_tools,
+            &timeline,
         ));
         let settled = loop {
             let interrupt = tokio::select! {
@@ -725,11 +778,53 @@ impl Agent {
                 completion: Some(completion),
                 outcome: RunOutcome::Continue,
                 beats: Some(beats),
+                output,
             },
             Settled::Interrupted(reason) => {
                 drop(finishing);
                 log.close().await;
-                stopped(reason, &run_id, beats)
+                let finished = stopped(reason, &run_id, beats, output);
+                mark_failure(&timeline, finished.completion.as_ref()).await;
+                finished
+            }
+        }
+    }
+
+    async fn watch_plan(&self, spec: &JobSpec, top: &Path, run_id: &RunId) -> PlanWatcher {
+        let JobSpec {
+            ctx: _,
+            plan,
+            branch,
+            review: _,
+            local,
+            ralphex_bin: _,
+        } = spec;
+        let LocalOptions { worktree, env: _ } = local;
+        let client = Arc::clone(&self.client);
+        let sender: Arc<dyn ProgressSender> = client;
+        let timings = WatchTimings {
+            debounce: self.options.plan_debounce,
+            attach_retry: self.options.plan_attach_retry,
+        };
+        PlanWatcher::start(
+            sender,
+            run_id.clone(),
+            expected_plan(top, plan, branch, *worktree),
+            timings,
+        )
+        .await
+    }
+
+    fn output_dir(&self, run_id: &RunId) -> Option<OutputDir> {
+        let Some(root) = &self.options.farm_out else {
+            tracing::warn!("run {run_id} has no output directory, none is configured");
+            return None;
+        };
+        match OutputDir::create(root, run_id) {
+            Ok(output) => Some(output),
+            Err(error) => {
+                tracing::warn!("run {run_id} has no output directory: {error}");
+                None
             }
         }
     }
@@ -854,6 +949,74 @@ pub fn repo_name(ctx: &Path) -> String {
     name.to_string_lossy().into_owned()
 }
 
+async fn remove_output(output: OutputDir) {
+    let path = output.path().to_path_buf();
+    removal_within(OUTPUT_REMOVE_TIMEOUT, &path, move || output.remove()).await;
+}
+
+async fn removal_within(
+    budget: Duration,
+    path: &Path,
+    remove: impl FnOnce() -> std::io::Result<()> + Send + 'static,
+) {
+    let removal = tokio::task::spawn_blocking(remove);
+    match tokio::time::timeout(budget, removal).await {
+        Err(_elapsed) => tracing::warn!(
+            "the output directory {} was not removed within {budget:?}",
+            path.display()
+        ),
+        Ok(Err(error)) => tracing::warn!(
+            "the output directory {} could not be removed: {error}",
+            path.display()
+        ),
+        Ok(Ok(Err(error))) => tracing::warn!(
+            "the output directory {} could not be removed: {error}",
+            path.display()
+        ),
+        Ok(Ok(Ok(()))) => {}
+    }
+}
+
+async fn plan_title(plan: &Path) -> Option<String> {
+    let path = plan.to_path_buf();
+    title_within(VALIDATE_TIMEOUT, plan, move || read_title(&path)).await
+}
+
+async fn title_within(
+    budget: Duration,
+    plan: &Path,
+    read: impl FnOnce() -> Option<String> + Send + 'static,
+) -> Option<String> {
+    let reading = tokio::task::spawn_blocking(read);
+    match tokio::time::timeout(budget, reading).await {
+        Err(_elapsed) => {
+            tracing::warn!(
+                "no title from {}: it did not answer within {budget:?}",
+                plan.display()
+            );
+            None
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("no title from {}: {error}", plan.display());
+            None
+        }
+        Ok(Ok(title)) => title,
+    }
+}
+
+fn read_title(plan: &Path) -> Option<String> {
+    let content = match planfile::read(plan) {
+        Ok(content) => content,
+        Err(error) => {
+            tracing::warn!("no title from {}: {error}", plan.display());
+            return None;
+        }
+    };
+    let Plan { title, tasks: _ } = planfile::parse(&content);
+    let title = title?;
+    Some(prdesc::fit_title(title))
+}
+
 async fn running(slot: &mut watch::Receiver<RunSlot>) -> RunId {
     loop {
         let held = slot.borrow_and_update().clone();
@@ -912,7 +1075,7 @@ async fn hurried(shutdown: &mut watch::Receiver<Shutdown>) -> Raised {
 
 fn origin(identifier: String, issue_url: String, title: String) -> RunOrigin {
     if identifier.is_empty() {
-        return RunOrigin::Local;
+        return RunOrigin::Local { title };
     }
     RunOrigin::Ticket {
         identifier,
@@ -1037,31 +1200,86 @@ async fn finish(
     exited: Result<ExitStatus, JobError>,
     pull_request: PullRequest,
     tools: &PrTools,
+    timeline: &StoppedWatcher,
 ) -> CompleteRequest {
     running.drain_output(stop_grace).await;
     log.close().await;
+    let completion = settle(log, exited, pull_request, tools, timeline).await;
+    mark_failure(timeline, Some(&completion)).await;
+    completion
+}
+
+async fn settle(
+    log: &LogStream,
+    exited: Result<ExitStatus, JobError>,
+    pull_request: PullRequest,
+    tools: &PrTools,
+    timeline: &StoppedWatcher,
+) -> CompleteRequest {
     let status = match exited {
         Err(error) => return failed(error.fail_reason(), error.to_string(), String::new()),
         Ok(status) => status,
     };
     let PullRequest {
         ctx,
-        spec,
+        branch,
+        origin,
+        plan,
+        run_id,
+        pr_file,
         create_pr,
     } = pull_request;
     match status.success() {
         false => failed("nonzero_exit", exit_message(status), log.tail()),
         true => match create_pr {
             CreatePr::No => done(String::new()),
-            CreatePr::Yes => match open_pull_request(&ctx, &spec, tools).await {
-                Ok(PrUrl(url)) => done(url),
-                Err(error) => failed(error.fail_reason(), error.to_string(), String::new()),
-            },
+            CreatePr::Yes => {
+                timeline.post_phase(Phase::Pr).await;
+                let written = written(&run_id, pr_file.as_deref());
+                let spec = PrSpec::describe(branch, &origin, &plan, &run_id, written);
+                match open_pull_request(&ctx, &spec, tools).await {
+                    Ok(PrUrl(url)) => done(url),
+                    Err(error) => failed(error.fail_reason(), error.to_string(), String::new()),
+                }
+            }
         },
     }
 }
 
-fn stopped(reason: Terminal, run_id: &RunId, beats: JoinHandle<()>) -> Finished {
+fn written(run_id: &RunId, pr_file: Option<&Path>) -> Option<Description> {
+    let pr_file = pr_file?;
+    match prdesc::read(pr_file) {
+        Ok(written) => Some(written),
+        Err(error) => {
+            tracing::warn!("the description of run {run_id} is unusable, it falls back: {error}");
+            None
+        }
+    }
+}
+
+async fn mark_failure(timeline: &StoppedWatcher, completion: Option<&CompleteRequest>) {
+    let Some(CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason: _,
+        message: _,
+        log_tail: _,
+    }) = completion
+    else {
+        return;
+    };
+    match status {
+        CompleteStatus::Error => timeline.post_failure().await,
+        CompleteStatus::Done => {}
+    }
+}
+
+fn stopped(
+    reason: Terminal,
+    run_id: &RunId,
+    beats: JoinHandle<()>,
+    output: Option<OutputDir>,
+) -> Finished {
     match reason {
         Terminal::Cancel => Finished {
             completion: Some(failed(
@@ -1071,6 +1289,7 @@ fn stopped(reason: Terminal, run_id: &RunId, beats: JoinHandle<()>) -> Finished 
             )),
             outcome: RunOutcome::Continue,
             beats: Some(beats),
+            output,
         },
         Terminal::Drain => Finished {
             completion: Some(failed(
@@ -1080,6 +1299,7 @@ fn stopped(reason: Terminal, run_id: &RunId, beats: JoinHandle<()>) -> Finished 
             )),
             outcome: RunOutcome::Continue,
             beats: Some(beats),
+            output,
         },
         Terminal::Gone => {
             tracing::warn!("run {run_id} is unknown to the farm and was stopped");
@@ -1087,12 +1307,14 @@ fn stopped(reason: Terminal, run_id: &RunId, beats: JoinHandle<()>) -> Finished 
                 completion: None,
                 outcome: RunOutcome::Continue,
                 beats: Some(beats),
+                output,
             }
         }
         Terminal::VersionMismatch { message } => Finished {
             completion: None,
             outcome: RunOutcome::VersionMismatch { message },
             beats: Some(beats),
+            output,
         },
     }
 }
@@ -1294,7 +1516,9 @@ mod tests {
     fn a_job_without_an_identifier_is_a_local_run() {
         assert_eq!(
             origin(String::new(), String::new(), String::new()),
-            RunOrigin::Local
+            RunOrigin::Local {
+                title: String::new()
+            }
         );
         assert_eq!(
             origin(
@@ -1319,12 +1543,18 @@ mod tests {
             claim_retry_delay,
             ticker: _,
             pr_tools,
+            plan_debounce,
+            plan_attach_retry,
+            farm_out,
         } = AgentOptions::default();
         assert_eq!(heartbeat_interval, HEARTBEAT_INTERVAL);
         assert_eq!(drain_timeout, crate::config::DEFAULT_DRAIN_TIMEOUT);
         assert_eq!(stop_grace, STOP_GRACE);
         assert_eq!(claim_retry_delay, RETRY_BASE_DELAY);
         assert_eq!(pr_tools, PrTools::default());
+        assert_eq!(plan_debounce, Duration::from_millis(300));
+        assert_eq!(plan_attach_retry, Duration::from_secs(2));
+        assert_eq!(farm_out, None);
     }
 
     #[test]
@@ -1348,5 +1578,118 @@ mod tests {
         assert_eq!(agent.slot(), RunSlot::Free);
         agent.hold(RunSlot::Running(RunId("local-1".to_string())));
         assert_eq!(agent.slot(), RunSlot::Running(RunId("local-1".to_string())));
+    }
+
+    #[test]
+    fn a_plan_is_named_after_its_first_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.md");
+        std::fs::write(&plan, "# Require dials\n\n### Task 1: x\n").unwrap();
+
+        assert_eq!(read_title(&plan).as_deref(), Some("Require dials"));
+    }
+
+    #[test]
+    fn a_plan_without_a_heading_or_on_no_disk_has_no_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.md");
+        std::fs::write(&plan, "### Task 1: x\n").unwrap();
+
+        assert_eq!(read_title(&plan), None);
+        assert_eq!(read_title(&dir.path().join("missing.md")), None);
+    }
+
+    #[tokio::test]
+    async fn a_plan_that_does_not_answer_in_time_has_no_title() {
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+
+        let title = title_within(Duration::from_millis(50), Path::new("x.md"), move || {
+            stalled.recv().ok().map(|()| "late".to_string())
+        })
+        .await;
+
+        assert_eq!(title, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn an_output_removal_that_does_not_answer_in_time_is_left_behind() {
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+
+        removal_within(
+            Duration::from_millis(50),
+            Path::new("farm-out/1"),
+            move || {
+                stalled
+                    .recv()
+                    .map_err(|error| std::io::Error::other(error.to_string()))
+            },
+        )
+        .await;
+
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn an_output_directory_is_removed_off_the_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        let output = OutputDir::create(root.path(), &RunId("run-1".to_string())).unwrap();
+        let path = output.path().to_path_buf();
+        std::fs::create_dir_all(path.join("deep").join("tree")).unwrap();
+        std::fs::write(path.join("deep").join("tree").join("pr.md"), "x").unwrap();
+
+        remove_output(output).await;
+
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_plan_is_named_off_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.md");
+        std::fs::write(&plan, "# Require dials\n").unwrap();
+
+        assert_eq!(plan_title(&plan).await.as_deref(), Some("Require dials"));
+    }
+
+    #[test]
+    fn a_plan_over_the_read_limit_has_no_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.md");
+        let mut content = "# Require dials\n".to_string();
+        let limit = usize::try_from(planfile::READ_LIMIT).unwrap();
+        content.push_str(&"x".repeat(limit));
+        std::fs::write(&plan, &content).unwrap();
+
+        assert_eq!(read_title(&plan), None);
+    }
+
+    #[test]
+    fn a_plan_at_the_read_limit_keeps_its_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.md");
+        let mut content = "# Require dials\n".to_string();
+        let limit = usize::try_from(planfile::READ_LIMIT).unwrap();
+        content.push_str(&"x".repeat(limit - content.len()));
+        std::fs::write(&plan, &content).unwrap();
+
+        assert_eq!(read_title(&plan).as_deref(), Some("Require dials"));
+    }
+
+    #[test]
+    fn a_plan_heading_over_the_title_limit_is_cut_to_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.md");
+        let heading = "<".repeat(prdesc::TITLE_LIMIT * 100);
+        std::fs::write(&plan, format!("# {heading}\n")).unwrap();
+
+        let title = read_title(&plan).unwrap();
+
+        assert_eq!(title.chars().count(), prdesc::TITLE_LIMIT);
+        assert_eq!(title, format!("{}...", "<".repeat(prdesc::TITLE_LIMIT - 3)));
     }
 }
