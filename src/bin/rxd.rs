@@ -9,7 +9,11 @@
 //! must not die with the terminal that asked for it. A run's lines carry
 //! ralphex's escape sequences as it wrote them: they are printed unchanged when
 //! this client's stdout is a terminal and stripped when it is anything else.
+//! The run inherits this client's `CLAUDE_CONFIG_DIR` and every `AGTERM_*`
+//! variable, so the Claude Code hooks inside it report their status to the
+//! agterm session `rxd` was started from, as they do for a run started by hand.
 
+use std::ffi::OsString;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -28,6 +32,8 @@ use ralphex_macos_runner::service;
 use tokio::net::UnixStream;
 
 const FORWARDED: &str = "CLAUDE_CONFIG_DIR";
+
+const FORWARDED_PREFIX: &str = "AGTERM_";
 
 const WAIT_NOTICE: Duration = Duration::from_millis(250);
 
@@ -393,10 +399,7 @@ fn describe(run: RunArgs) -> Result<RunRequest, String> {
         true => Worktree::Yes,
         false => Worktree::No,
     };
-    let mut env = Vec::new();
-    if let Ok(forwarded) = std::env::var(FORWARDED) {
-        env.push((FORWARDED.to_string(), forwarded));
-    }
+    let env = forwarded(std::env::vars_os());
     Ok(RunRequest {
         ctx: ctx.display().to_string(),
         plan: plan.display().to_string(),
@@ -407,9 +410,84 @@ fn describe(run: RunArgs) -> Result<RunRequest, String> {
     })
 }
 
+fn forwarded(vars: impl IntoIterator<Item = (OsString, OsString)>) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    for (key, value) in vars {
+        let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+            continue;
+        };
+        if key == FORWARDED || key.starts_with(FORWARDED_PREFIX) {
+            env.push((key.to_string(), value.to_string()));
+        }
+    }
+    env
+}
+
 fn plan_stem(plan: &Path) -> String {
     let Some(stem) = plan.file_stem() else {
         return "ralphex".to_string();
     };
     stem.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    use super::forwarded;
+
+    fn var(key: &str, value: &str) -> (OsString, OsString) {
+        (OsString::from(key), OsString::from(value))
+    }
+
+    #[test]
+    fn the_claude_profile_and_the_agterm_session_reach_the_run() {
+        let vars = vec![
+            var("CLAUDE_CONFIG_DIR", "/work/claude"),
+            var("AGTERM_SESSION_ID", "session-1"),
+            var("AGTERM_SOCKET", "/run/agterm.sock"),
+            var("AGTERM_PANE_ID", "pane-1"),
+            var("HOME", "/home/op"),
+            var("PATH", "/usr/bin"),
+            var("MY_AGTERM_SESSION_ID", "not-a-prefix-match"),
+        ];
+
+        let env = forwarded(vars);
+
+        assert_eq!(
+            env,
+            vec![
+                ("CLAUDE_CONFIG_DIR".to_string(), "/work/claude".to_string()),
+                ("AGTERM_SESSION_ID".to_string(), "session-1".to_string()),
+                ("AGTERM_SOCKET".to_string(), "/run/agterm.sock".to_string()),
+                ("AGTERM_PANE_ID".to_string(), "pane-1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_shell_outside_agterm_forwards_nothing_of_it() {
+        let env = forwarded(vec![var("HOME", "/home/op"), var("TERM", "xterm")]);
+
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn a_variable_that_is_not_utf8_is_skipped() {
+        let vars = vec![
+            (
+                OsString::from("AGTERM_SESSION_ID"),
+                OsString::from_vec(vec![0xff, 0xfe]),
+            ),
+            var("AGTERM_SOCKET", "/run/agterm.sock"),
+        ];
+
+        let env = forwarded(vars);
+
+        assert_eq!(
+            env,
+            vec![("AGTERM_SOCKET".to_string(), "/run/agterm.sock".to_string())]
+        );
+    }
 }

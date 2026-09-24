@@ -62,6 +62,7 @@ rxd uninstall
 - Ctrl-C prints `detached; the run continues` and exits 0. Before the run id has arrived it says so instead and still exits 0 - the daemon may go on to start the run, which `rxd attach` then reaches. `rxd attach` reconnects, replays what has already been printed and then follows live; several terminals may attach at once.
 - Staying attached to the end exits 0 for `done` and 1 for `error`.
 - `CLAUDE_CONFIG_DIR` is forwarded from your environment when set, so a run started from a work shell uses the work Claude profile.
+- Every `AGTERM_*` variable is forwarded too, so inside [agterm](https://github.com/umputun/agterm) the Claude Code status hooks of the run light up the session `rxd` was started from, exactly as they do for `ralphex` run by hand.
 
 ralphex runs on a pseudo-terminal, so it emits the colours it emits when you start it by hand. `rxd` keeps them when its own stdout is a terminal and strips them when it is not, so `rxd <plan> | cat` and a redirect to a file stay plain, and `rxd attach` replays the colours it missed. The farm, its dashboard and the `log_tail` of a failed run always receive plain text - the escape sequences never leave this Mac.
 
