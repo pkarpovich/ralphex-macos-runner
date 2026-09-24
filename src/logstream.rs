@@ -14,12 +14,13 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::{Notify, broadcast, watch};
 use tokio::task::JoinHandle;
 
 use crate::ansi::plain;
+use crate::progress::PhaseTracker;
 use crate::protocol::client::{FarmClient, FarmError};
 use crate::protocol::types::{
     HISTORY_BYTES, HISTORY_LINES, LOG_BUFFER_BYTES, LOG_CLOSE_TIMEOUT, LOG_FLUSH_INTERVAL,
@@ -145,6 +146,7 @@ pub struct LogStream {
     phase: watch::Sender<Phase>,
     filled: Arc<Notify>,
     flusher: Mutex<Option<JoinHandle<()>>>,
+    tracker: OnceLock<Arc<PhaseTracker>>,
 }
 
 impl LogStream {
@@ -182,6 +184,7 @@ impl LogStream {
             phase,
             filled,
             flusher: Mutex::new(Some(flusher)),
+            tracker: OnceLock::new(),
         }
     }
 
@@ -210,6 +213,13 @@ impl LogStream {
         }
     }
 
+    /// Feeds the plain text of every later line to `tracker`.
+    ///
+    /// A stream has at most one tracker: a second call keeps the first.
+    pub fn track(&self, tracker: Arc<PhaseTracker>) {
+        let _kept = self.tracker.set(tracker);
+    }
+
     /// Records one emitted line in every view of the run's output at once.
     ///
     /// Every view sees the line's text with a trailing carriage return removed.
@@ -219,7 +229,8 @@ impl LogStream {
     /// the escape sequences the run wrote. Taking the four under one lock is
     /// what keeps them the same log: a writer that put its own bytes in between
     /// would otherwise split this line in the farm's copy while the other three
-    /// still held it whole.
+    /// still held it whole. The tracker set with [`LogStream::track`] then sees
+    /// the plain text, outside the lock.
     ///
     /// # Panics
     ///
@@ -248,6 +259,9 @@ impl LogStream {
         drop(buffers);
         if filled {
             self.filled.notify_one();
+        }
+        if let Some(tracker) = self.tracker.get() {
+            tracker.observe(&stripped);
         }
     }
 

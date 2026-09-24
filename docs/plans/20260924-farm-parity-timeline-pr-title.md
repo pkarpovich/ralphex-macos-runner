@@ -260,12 +260,12 @@ Configured with the progress sender, the run id, the **expected** plan path, a d
 - Modify: `src/logstream.rs`
 - Modify: `tests/logstream.rs`
 
-- [ ] create `src/progress.rs` with the marker scanner and the phase tracker as specified under "Phase tracker and markers": a pure `fn` that classifies one line into task-iteration, review or nothing (doctested), and a tracker holding the current phase, the frozen flag and a snapshot-request signal
-- [ ] give `LogStream` an optional phase tracker set once per run, and call it from `push_line` with the plain text of each line, outside the buffer lock
-- [ ] write table-driven scanner tests: both expressions match their examples (`--- task iteration 12 ---`, `--- claude review 0: all findings ---`, `--- codex external review ---`, `--- codex iteration 3 ---`, `--- claude evaluating codex findings ---`); near misses do not (`--- review 1 ---`, `--- finalize step ---`, `--- task iteration x ---`, a marker with trailing text); a coloured marker matches after stripping; a 257-byte line never matches
-- [ ] write tracker tests: the phase starts `setup`; a task iteration requests a snapshot even when the phase is already `tasks`; freezing ignores later markers
-- [ ] write a `tests/logstream.rs` test: lines pushed through a stream with a tracker move its phase
-- [ ] run `mise run check` - must pass before task 5
+- [x] create `src/progress.rs` with the marker scanner and the phase tracker as specified under "Phase tracker and markers": a pure `fn` that classifies one line into task-iteration, review or nothing (doctested), and a tracker holding the current phase, the frozen flag and a snapshot-request signal
+- [x] give `LogStream` an optional phase tracker set once per run, and call it from `push_line` with the plain text of each line, outside the buffer lock
+- [x] write table-driven scanner tests: both expressions match their examples (`--- task iteration 12 ---`, `--- claude review 0: all findings ---`, `--- codex external review ---`, `--- codex iteration 3 ---`, `--- claude evaluating codex findings ---`); near misses do not (`--- review 1 ---`, `--- finalize step ---`, `--- task iteration x ---`, a marker with trailing text); a coloured marker matches after stripping; a 257-byte line never matches
+- [x] write tracker tests: the phase starts `setup`; a task iteration requests a snapshot even when the phase is already `tasks`; freezing ignores later markers
+- [x] write a `tests/logstream.rs` test: lines pushed through a stream with a tracker move its phase
+- [x] run `mise run check` - must pass before task 5
 
 ### Task 5: Watch the plan and post snapshots
 

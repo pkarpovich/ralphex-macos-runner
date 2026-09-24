@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ralphex_macos_runner::logstream::{LogStream, Terminator};
+use ralphex_macos_runner::progress::PhaseTracker;
 use ralphex_macos_runner::protocol::client::{FarmClient, FarmError};
 use ralphex_macos_runner::protocol::types::{
-    HISTORY_LINES, LOG_BUFFER_BYTES, LOG_TAIL_LINES, MAX_LOG_CHUNK, RunId, Seq,
+    HISTORY_LINES, LOG_BUFFER_BYTES, LOG_TAIL_LINES, MAX_LOG_CHUNK, Phase, RunId, Seq,
 };
 use support::fake_farm::{FakeFarm, Reply};
 use support::{TestSleeper, TickHandle, manual_ticker};
@@ -345,4 +346,45 @@ async fn a_line_that_is_only_an_escape_sequence_reaches_the_farm_as_an_empty_lin
 
     assert_eq!(delivered(&farm), "before\n\nafter\n");
     assert_eq!(stream.tail(), "before\n\nafter");
+}
+
+#[tokio::test]
+async fn lines_pushed_through_a_tracked_stream_move_its_phase() {
+    let farm = FakeFarm::start().await;
+    let (stream, _handle) = stream(&farm);
+    let tracker = Arc::new(PhaseTracker::new());
+    stream.track(Arc::clone(&tracker));
+
+    stream.push_line(b"starting up", Terminator::Newline);
+    assert_eq!(tracker.phase(), Phase::Setup);
+    stream.push_line(
+        "\u{1b}[36m--- task iteration 1 ---\u{1b}[0m\r".as_bytes(),
+        Terminator::Newline,
+    );
+    assert_eq!(tracker.phase(), Phase::Tasks);
+    stream.push_line(
+        b"--- claude review 0: all findings ---",
+        Terminator::Newline,
+    );
+    assert_eq!(tracker.phase(), Phase::Review);
+    tokio::time::timeout(Duration::from_secs(5), tracker.requested())
+        .await
+        .unwrap();
+    stream.close().await;
+}
+
+#[tokio::test]
+async fn a_stream_keeps_its_first_tracker() {
+    let farm = FakeFarm::start().await;
+    let (stream, _handle) = stream(&farm);
+    let first = Arc::new(PhaseTracker::new());
+    let second = Arc::new(PhaseTracker::new());
+    stream.track(Arc::clone(&first));
+    stream.track(Arc::clone(&second));
+
+    stream.push_line(b"--- task iteration 1 ---", Terminator::Newline);
+
+    assert_eq!(first.phase(), Phase::Tasks);
+    assert_eq!(second.phase(), Phase::Setup);
+    stream.close().await;
 }
