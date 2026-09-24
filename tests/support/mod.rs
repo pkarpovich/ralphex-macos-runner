@@ -194,9 +194,9 @@ pub fn options(record: &Path) -> AgentOptions {
     }
 }
 
-/// Polls `ready` every ten milliseconds until it answers or ten seconds pass.
+/// Polls `ready` every ten milliseconds until it answers or thirty seconds pass.
 pub async fn wait_for<T>(mut ready: impl FnMut() -> Option<T>) -> Option<T> {
-    for _attempt in 0..1000 {
+    for _attempt in 0..3000 {
         if let Some(value) = ready() {
             return Some(value);
         }

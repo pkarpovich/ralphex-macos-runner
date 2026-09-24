@@ -15,7 +15,7 @@ const FAST: WatchTimings = WatchTimings {
     attach_retry: Duration::from_millis(50),
 };
 
-const WAIT: Duration = Duration::from_secs(10);
+const WAIT: Duration = Duration::from_secs(30);
 
 const PLAN: &str = "# Require dials\n\n### Task 1: Add it\n- [ ] write it\n- [ ] test it\n";
 

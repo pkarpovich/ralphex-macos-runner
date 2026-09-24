@@ -508,9 +508,9 @@ impl PlanWatcher {
 
     /// Stops watching and posting, and returns what can still post the run's last snapshots.
     ///
-    /// A post in flight is abandoned. The file-system watcher and its thread
-    /// end before this returns, unless an attempt to watch another directory is
-    /// in progress on the blocking pool: they then end as soon as it finishes.
+    /// A post in flight is abandoned. The file-system watcher is released on
+    /// the blocking pool, since ending its thread waits on the file-system
+    /// events daemon, and this returns without waiting for it.
     pub async fn stop(self) -> StoppedWatcher {
         let PlanWatcher {
             poster,
@@ -730,9 +730,10 @@ async fn follow_events(
     tracker: Arc<PhaseTracker>,
     timings: WatchTimings,
 ) {
-    let Some(mut watches) = watches else {
+    let Some(watches) = watches else {
         return;
     };
+    let mut watches = Offloaded(Some(watches));
     let WatchTimings {
         debounce,
         attach_retry,
@@ -741,7 +742,10 @@ async fn follow_events(
     retry.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut deadline = None;
     loop {
-        let detached = match watches.attachment() {
+        let Offloaded(Some(held)) = &watches else {
+            return;
+        };
+        let detached = match held.attachment() {
             Attachment::Attached => false,
             Attachment::Detached => true,
         };
@@ -759,10 +763,10 @@ async fn follow_events(
                     Err(error) => tracing::debug!("the plan watcher reported: {error}"),
                 }
                 if detached {
-                    let Some(attached) = reattach(watches, &tracker).await else {
+                    let Some(attached) = reattach(watches.0.take(), &tracker).await else {
                         return;
                     };
-                    watches = attached;
+                    watches.0 = Some(attached);
                 }
             }
             () = quiet(deadline) => {
@@ -770,10 +774,10 @@ async fn follow_events(
                 tracker.request();
             }
             _ = retry.tick(), if detached => {
-                let Some(attached) = reattach(watches, &tracker).await else {
+                let Some(attached) = reattach(watches.0.take(), &tracker).await else {
                     return;
                 };
-                watches = attached;
+                watches.0 = Some(attached);
             }
         }
     }
@@ -801,7 +805,22 @@ async fn start_within<T: Send + 'static>(
     }
 }
 
-async fn reattach(watches: Watches, tracker: &PhaseTracker) -> Option<Watches> {
+struct Offloaded<T: Send + 'static>(Option<T>);
+
+impl<T: Send + 'static> Drop for Offloaded<T> {
+    fn drop(&mut self) {
+        let Some(held) = self.0.take() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let _released = runtime.spawn_blocking(move || drop(held));
+    }
+}
+
+async fn reattach(watches: Option<Watches>, tracker: &PhaseTracker) -> Option<Watches> {
+    let watches = watches?;
     let attaching = tokio::task::spawn_blocking(move || {
         let mut watches = watches;
         let attached = watches.attach();
@@ -845,6 +864,27 @@ mod tests {
         .await;
 
         assert_eq!(watches, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(release);
+    }
+
+    struct Stalling(Option<std::sync::mpsc::Receiver<()>>);
+
+    impl Drop for Stalling {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _released = release.recv();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_watcher_that_stalls_on_release_does_not_hold_the_runtime() {
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+
+        drop(Offloaded(Some(Stalling(Some(stalled)))));
+
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(release);
     }
