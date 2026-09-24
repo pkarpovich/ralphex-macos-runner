@@ -85,9 +85,28 @@ branch: my-feature-branch
 
 Both paths are absolute and the plan must sit inside `ctx` - the farm holds no checkout, so whether they exist is this runner's business. `pr: false` ends the run at the local branch in the checkout - nothing is pushed and no pull request is opened. `mode: review` re-runs only the review pipeline.
 
+## Run name
+
+A run `rxd` opens has no Linear ticket to take a name from, so the daemon reads the plan's first `# ` heading and sends it as the run's title; the dashboard shows that instead of the plan's file name. A plan without a heading, or one the daemon cannot read, keeps the file name. A ticket job is named after its ticket as before.
+
+## Timeline
+
+The dashboard draws a run's timeline from the plan-progress snapshots the daemon posts, the same ones the container runner posts. Each snapshot carries the phase and the plan's tasks with their checkboxes, parsed the way the farm parses them: `### Task N:` and `### Iteration N:` headers, `- [ ]` and `- [x]` lines under them, fenced blocks skipped.
+
+- The first snapshot, phase `setup`, goes out as soon as the run is validated, before ralphex starts.
+- The daemon watches the plan's directory and the `completed/` directory beside it, so ticking a checkbox or moving the plan into `completed/` posts a new snapshot after a short debounce. With `--worktree` it watches the plan's copy under `.ralphex/worktrees/<branch>/` instead.
+- ralphex's section markers move the phase: `--- task iteration N ---` to `tasks`, the claude and codex review markers to `review`. Any other section, finalize included, leaves the phase where it is.
+- A run that asked for a pull request posts `pr` as its last snapshot, just before the push. A run that ends in error - a nonzero exit, a cancel, a shutdown, a failed pull request - posts one last snapshot marked failed before it completes.
+
+A snapshot is never retried: the next one supersedes it, and a failed post is only a warning in the log.
+
 ## Pull request
 
-After a successful run, and only when the job asked for one: an existing open pull request for the branch is updated with a plain `git push` and its URL reported; otherwise the branch is pushed with `-u`, the base branch is read from `origin/HEAD` (falling back to `gh repo view`), and `gh pr create` opens it. The body is a short fixed block naming the plan, the run and the ticket - the farm's finalize-prompt machinery is not involved, so your personal `finalize_enabled` stays untouched.
+After a successful run, and only when the job asked for one: an existing open pull request for the branch is updated with a plain `git push` and its URL reported, its title and body untouched; otherwise the branch is pushed with `-u`, the base branch is read from `origin/HEAD` (falling back to `gh repo view`), and `gh pr create` opens it.
+
+The title and body come from ralphex's finalize step, as on a container run. Before ralphex starts, the daemon points `FARM_PR_FILE` at `pr.md` in a directory of the run's own under `~/Library/Application Support/ralphex-macos-runner/farm-out/`; finalize writes the title on the first line and the body after it. The farm's footer - the ticket, the plan path and the run id - is always appended, and the directory is removed once the run is completed.
+
+For that to happen, finalize must be enabled in your personal ralphex config (`finalize_enabled = true`) with the farm's finalize prompt at `prompts/finalize.txt`; the daemon never writes either. Put `--skip-finalize` on the aliases you run ralphex with by hand, so runs outside the farm never finalize. When the file is missing, empty or malformed, the daemon logs `the description of run ... is unusable` and the pull request opens with a fallback: the ticket's identifier and title (or the run's name for a local run) and a footer-only body.
 
 ## Update
 

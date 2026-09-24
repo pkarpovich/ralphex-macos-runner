@@ -358,11 +358,11 @@ Configured with the progress sender, the run id, the **expected** plan path, a d
 - Modify: `Cargo.toml`
 - Modify: `Cargo.lock`
 
-- [ ] `README.md`: a section on the timeline (what is posted and when), on the generated description (finalize must be enabled in the personal ralphex config with the farm's prompt, and `--skip-finalize` belongs on by-hand aliases; without it the pull request opens with the fallback), and the run name
-- [ ] `CLAUDE.md`: the new modules in the module map, the watcher and description rules under Key Patterns, and the new non-goals (no pull request refresh, no new phases, marker rules identical to the farm's)
-- [ ] bump `version` in `Cargo.toml` to `0.3.0` and refresh `Cargo.lock` with `cargo update --workspace`
-- [ ] run `mise run check` one last time
-- [ ] move this plan to `docs/plans/completed/`
+- [x] `README.md`: a section on the timeline (what is posted and when), on the generated description (finalize must be enabled in the personal ralphex config with the farm's prompt, and `--skip-finalize` belongs on by-hand aliases; without it the pull request opens with the fallback), and the run name
+- [x] `CLAUDE.md`: the new modules in the module map, the watcher and description rules under Key Patterns, and the new non-goals (no pull request refresh, no new phases, marker rules identical to the farm's)
+- [x] bump `version` in `Cargo.toml` to `0.3.0` and refresh `Cargo.lock` with `cargo update --workspace`
+- [x] run `mise run check` one last time
+- [x] move this plan to `docs/plans/completed/`
 
 ## Post-Completion
 
