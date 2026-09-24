@@ -401,7 +401,15 @@ struct Poster {
 
 impl Poster {
     async fn post(&self, phase: Phase, outcome: Outcome) {
-        let request = snapshot(&self.expected, phase, outcome);
+        let expected = self.expected.clone();
+        let taken = tokio::task::spawn_blocking(move || snapshot(&expected, phase, outcome)).await;
+        let request = match taken {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!("the plan of run {} was not read: {error}", self.run_id);
+                return;
+            }
+        };
         if let Err(error) = self.sender.post(&self.run_id, &request).await {
             tracing::warn!(
                 "the progress of run {} was not posted: {error}",
@@ -427,7 +435,9 @@ impl Poster {
 /// first, then one whenever the plan file changes or its
 /// [`PlanWatcher::tracker`] requests one. Every post comes from one task, so
 /// two are never in flight at once, and requests made while one is pending
-/// coalesce. A failed post is logged and forgotten.
+/// coalesce. A failed post is logged and forgotten. The plan is read on the
+/// blocking pool, so a mount that stops answering holds a blocking thread, not
+/// a runtime worker, and cannot outlast [`PROGRESS_POST_TIMEOUT`] after stop.
 pub struct PlanWatcher {
     poster: Arc<Poster>,
     tracker: Arc<PhaseTracker>,

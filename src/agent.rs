@@ -46,7 +46,7 @@ use crate::protocol::client::{FarmClient, FarmError, next_delay};
 use crate::protocol::types::{
     Branch, ClaimRequest, CompleteRequest, CompleteStatus, CreatePr, HEARTBEAT_INTERVAL,
     HeartbeatAction, HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest, Phase,
-    RETRY_BASE_DELAY, RUNTIME, RunId, RunnerName, STOP_GRACE, VERSION,
+    RETRY_BASE_DELAY, RUNTIME, RunId, RunnerName, STOP_GRACE, VALIDATE_TIMEOUT, VERSION,
 };
 
 const TERMINAL_CAPACITY: usize = 8;
@@ -510,7 +510,7 @@ impl Agent {
             worktree,
             env,
         } = request;
-        let title = plan_title(Path::new(&plan));
+        let title = plan_title(Path::new(&plan)).await;
         let opened = OpenRunRequest {
             runner: self.config.name.clone(),
             version: VERSION.to_string(),
@@ -946,7 +946,34 @@ pub fn repo_name(ctx: &Path) -> String {
     name.to_string_lossy().into_owned()
 }
 
-fn plan_title(plan: &Path) -> Option<String> {
+async fn plan_title(plan: &Path) -> Option<String> {
+    let path = plan.to_path_buf();
+    title_within(VALIDATE_TIMEOUT, plan, move || read_title(&path)).await
+}
+
+async fn title_within(
+    budget: Duration,
+    plan: &Path,
+    read: impl FnOnce() -> Option<String> + Send + 'static,
+) -> Option<String> {
+    let reading = tokio::task::spawn_blocking(read);
+    match tokio::time::timeout(budget, reading).await {
+        Err(_elapsed) => {
+            tracing::warn!(
+                "no title from {}: it did not answer within {budget:?}",
+                plan.display()
+            );
+            None
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("no title from {}: {error}", plan.display());
+            None
+        }
+        Ok(Ok(title)) => title,
+    }
+}
+
+fn read_title(plan: &Path) -> Option<String> {
     let content = match planfile::read(plan) {
         Ok(content) => content,
         Err(error) => {
@@ -1527,7 +1554,7 @@ mod tests {
         let plan = dir.path().join("plan.md");
         std::fs::write(&plan, "# Require dials\n\n### Task 1: x\n").unwrap();
 
-        assert_eq!(plan_title(&plan).as_deref(), Some("Require dials"));
+        assert_eq!(read_title(&plan).as_deref(), Some("Require dials"));
     }
 
     #[test]
@@ -1536,8 +1563,32 @@ mod tests {
         let plan = dir.path().join("plan.md");
         std::fs::write(&plan, "### Task 1: x\n").unwrap();
 
-        assert_eq!(plan_title(&plan), None);
-        assert_eq!(plan_title(&dir.path().join("missing.md")), None);
+        assert_eq!(read_title(&plan), None);
+        assert_eq!(read_title(&dir.path().join("missing.md")), None);
+    }
+
+    #[tokio::test]
+    async fn a_plan_that_does_not_answer_in_time_has_no_title() {
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+
+        let title = title_within(Duration::from_millis(50), Path::new("x.md"), move || {
+            stalled.recv().ok().map(|()| "late".to_string())
+        })
+        .await;
+
+        assert_eq!(title, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn a_plan_is_named_off_the_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.md");
+        std::fs::write(&plan, "# Require dials\n").unwrap();
+
+        assert_eq!(plan_title(&plan).await.as_deref(), Some("Require dials"));
     }
 
     #[test]
@@ -1549,7 +1600,7 @@ mod tests {
         content.push_str(&"x".repeat(limit));
         std::fs::write(&plan, &content).unwrap();
 
-        assert_eq!(plan_title(&plan), None);
+        assert_eq!(read_title(&plan), None);
     }
 
     #[test]
@@ -1561,6 +1612,6 @@ mod tests {
         content.push_str(&"x".repeat(limit - content.len()));
         std::fs::write(&plan, &content).unwrap();
 
-        assert_eq!(plan_title(&plan).as_deref(), Some("Require dials"));
+        assert_eq!(read_title(&plan).as_deref(), Some("Require dials"));
     }
 }
