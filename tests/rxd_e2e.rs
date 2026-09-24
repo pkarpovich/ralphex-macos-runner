@@ -324,6 +324,45 @@ async fn the_claude_profile_of_the_client_reaches_ralphex() {
 }
 
 #[tokio::test]
+async fn the_agterm_session_of_the_client_reaches_ralphex() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(local_job(&checkout, "local-agterm"))));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(
+        &daemon.socket,
+        &checkout,
+        &["plan.md", "--no-pr"],
+        &[
+            ("AGTERM_SESSION_ID", "client-session"),
+            ("AGTERM_SOCKET", "/run/client-agterm.sock"),
+            ("AGTERM_PANE_ID", "client-pane"),
+            ("RXD_TEST_UNRELATED", "stays-home"),
+        ],
+    );
+    let output = client.wait_with_output().await.unwrap();
+
+    assert!(output.status.success(), "{}", text(&output));
+    let record = Record::read(checkout.record());
+    assert_eq!(
+        record.env_value("AGTERM_SESSION_ID"),
+        Some("client-session".to_string())
+    );
+    assert_eq!(
+        record.env_value("AGTERM_SOCKET"),
+        Some("/run/client-agterm.sock".to_string())
+    );
+    assert_eq!(
+        record.env_value("AGTERM_PANE_ID"),
+        Some("client-pane".to_string())
+    );
+    assert_eq!(record.env_value("RXD_TEST_UNRELATED"), None);
+    drop(daemon.raise);
+}
+
+#[tokio::test]
 async fn a_client_waits_through_a_poll_and_starts_when_it_comes_back_empty() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);

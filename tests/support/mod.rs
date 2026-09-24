@@ -275,6 +275,20 @@ pub async fn dead(pid: i32) -> bool {
     gone_within(pid, Duration::from_secs(10)).await
 }
 
+/// Removes from `command` what the test process would otherwise hand `rxd`: the
+/// Claude profile and the agterm session of the terminal running the tests.
+pub fn scrub_client_env(command: &mut tokio::process::Command) {
+    command.env_remove("CLAUDE_CONFIG_DIR");
+    for (key, _value) in std::env::vars_os() {
+        let Some(key) = key.to_str() else {
+            continue;
+        };
+        if key.starts_with("AGTERM_") {
+            command.env_remove(key);
+        }
+    }
+}
+
 /// Spawns the real `rxd` against `socket`, in `checkout`, with `args`.
 ///
 /// # Panics
@@ -306,7 +320,7 @@ pub fn rxd_argv(checkout: &Checkout, args: &[&str], env: &[(&str, &str)]) -> tok
         command.arg(argument);
     }
     command.current_dir(checkout.dir());
-    command.env_remove("CLAUDE_CONFIG_DIR");
+    scrub_client_env(&mut command);
     for (key, value) in env {
         command.env(key, value);
     }
@@ -379,7 +393,7 @@ pub fn rxd_on_terminal(
     }
     command.arg("--socket").arg(socket);
     command.current_dir(checkout.dir());
-    command.env_remove("CLAUDE_CONFIG_DIR");
+    scrub_client_env(&mut command);
     for (key, value) in env {
         command.env(key, value);
     }
