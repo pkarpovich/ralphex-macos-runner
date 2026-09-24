@@ -202,7 +202,7 @@ Configured with the progress sender, the run id, the **expected** plan path, a d
 
 ### Shutdown budget
 
-`exit_timeout` gains `PROGRESS_POST_TIMEOUT` once: a run finishing during the drain posts either `pr` or `failed`, never both.
+`exit_timeout` gains `PROGRESS_POST_TIMEOUT` twice: a run finishing during the drain posts `pr` before the push and `failed` when the pull request then fails.
 
 ## What Goes Where
 
@@ -335,9 +335,10 @@ Configured with the progress sender, the run id, the **expected** plan path, a d
 **Files:**
 - Modify: `src/service.rs`
 
-- [ ] add `PROGRESS_POST_TIMEOUT` to `service::exit_timeout` and to its doc comment listing the awaits
-- [ ] update the test that pins the sum so it includes the new term
-- [ ] run `mise run check` - must pass before task 9
+- [x] add `PROGRESS_POST_TIMEOUT` to `service::exit_timeout` and to its doc comment listing the awaits
+- [x] update the test that pins the sum so it includes the new term
+- [x] run `mise run check` - must pass before task 9
+- ➕ the term is added twice, not once: a pull-request failure posts `pr` and then `failed` (see Task 6); the `ExitTimeOut` sentence in `CLAUDE.md` lists it too
 
 ### Task 9: Verify acceptance criteria
 
