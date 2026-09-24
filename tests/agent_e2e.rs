@@ -1660,6 +1660,35 @@ async fn a_worktree_run_posts_the_tasks_of_the_worktree_copy() {
 }
 
 #[tokio::test]
+async fn a_worktree_run_from_a_subdirectory_posts_the_tasks_of_the_copy_under_the_top_level() {
+    let checkout = Checkout::new();
+    let nested = checkout.path().join("docs");
+    std::fs::create_dir(&nested).unwrap();
+    let plan = nested.join("plan.md");
+    std::fs::write(&plan, TIMELINE_PLAN).unwrap();
+    let release = checkout.dir().join("release").display().to_string();
+    let ralphex = checkout.ralphex(&[
+        ("FAKE_RALPHEX_TICK", "1"),
+        ("FAKE_RALPHEX_WAIT_FOR", &release),
+    ]);
+    let farm = FakeFarm::start().await;
+    let agent = agent(&farm, config(&farm, &ralphex), options(checkout.tools()));
+    let (_raise, shutdown) = watch::channel(Shutdown::Running);
+    let local = LocalOptions {
+        worktree: Worktree::Yes,
+        env: Vec::new(),
+    };
+    let job = ticket_job(&nested, &plan, CreatePr::No);
+    let running = tokio::spawn(async move { agent.run_job(job, local, shutdown).await });
+
+    release_after(&farm, Path::new(&release), any_ticked).await;
+    running.await.unwrap();
+
+    let copy = checkout.path().join(".ralphex/worktrees/x/docs/plan.md");
+    assert!(copy.is_file(), "the fake never wrote the worktree copy");
+}
+
+#[tokio::test]
 async fn a_nonzero_exit_posts_a_failed_snapshot_before_its_completion() {
     let checkout = Checkout::new();
     checkout.write_plan(TIMELINE_PLAN);

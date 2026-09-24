@@ -610,7 +610,24 @@ async fn a_plan_inside_a_git_checkout_passes_validation() {
     git_init(dir.path());
     let spec = spec(dir.path(), &plan);
 
-    validate(&spec).await.unwrap();
+    let top = validate(&spec).await.unwrap();
+
+    assert_eq!(top, dir.path().canonicalize().unwrap());
+}
+
+#[tokio::test]
+async fn a_checkout_subdirectory_validates_to_the_top_level() {
+    let (dir, _plan) = checkout();
+    git_init(dir.path());
+    let nested = dir.path().join("docs");
+    std::fs::create_dir(&nested).unwrap();
+    let plan = nested.join("plan.md");
+    std::fs::write(&plan, "# plan\n").unwrap();
+    let spec = spec(&nested, &plan);
+
+    let top = validate(&spec).await.unwrap();
+
+    assert_eq!(top, dir.path().canonicalize().unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]

@@ -665,18 +665,21 @@ impl Agent {
             local,
             ralphex_bin: self.config.ralphex_bin.clone(),
         };
-        if let Err(error) = job::validate(&spec).await {
-            return Finished {
-                completion: Some(failed(
-                    error.fail_reason(),
-                    error.to_string(),
-                    String::new(),
-                )),
-                outcome: RunOutcome::Continue,
-                beats: Some(beats),
-                output: None,
-            };
-        }
+        let top = match job::validate(&spec).await {
+            Ok(top) => top,
+            Err(error) => {
+                return Finished {
+                    completion: Some(failed(
+                        error.fail_reason(),
+                        error.to_string(),
+                        String::new(),
+                    )),
+                    outcome: RunOutcome::Continue,
+                    beats: Some(beats),
+                    output: None,
+                };
+            }
+        };
 
         let output = self.output_dir(&run_id);
         let pr_file = output.as_ref().map(OutputDir::pr_file);
@@ -693,7 +696,7 @@ impl Agent {
             self.options.drain_timeout,
             terminals.clone(),
         ));
-        let watcher = self.watch_plan(&spec, &run_id).await;
+        let watcher = self.watch_plan(&spec, &top, &run_id).await;
         log.track(watcher.tracker());
 
         let mut running = match job::spawn(&spec, Arc::clone(&log)) {
@@ -787,9 +790,9 @@ impl Agent {
         }
     }
 
-    async fn watch_plan(&self, spec: &JobSpec, run_id: &RunId) -> PlanWatcher {
+    async fn watch_plan(&self, spec: &JobSpec, top: &Path, run_id: &RunId) -> PlanWatcher {
         let JobSpec {
-            ctx,
+            ctx: _,
             plan,
             branch,
             review: _,
@@ -806,7 +809,7 @@ impl Agent {
         PlanWatcher::start(
             sender,
             run_id.clone(),
-            expected_plan(ctx, plan, branch, *worktree),
+            expected_plan(top, plan, branch, *worktree),
             timings,
         )
         .await

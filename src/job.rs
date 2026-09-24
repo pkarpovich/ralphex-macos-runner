@@ -14,8 +14,10 @@
 //! process-wide handoff from the moment it opens the terminal until the run is
 //! started. [`RunningJob`] waits for the exit or takes the group down.
 
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::Read;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -203,7 +205,8 @@ impl Files for HostFiles {
     }
 }
 
-/// Checks that the checkout is a git checkout and the plan lies inside it.
+/// Checks that the checkout is a git checkout and the plan lies inside it, and
+/// returns the checkout's top level, the directory ralphex bases a worktree on.
 ///
 /// [`VALIDATE_TIMEOUT`] is the budget for the whole inspection, the git child
 /// and every filesystem call alike, and the filesystem calls run on a blocking
@@ -215,14 +218,18 @@ impl Files for HostFiles {
 /// # Errors
 ///
 /// Returns [`JobError::CtxInvalid`] when `ctx` does not resolve to a directory
-/// in which `git rev-parse --git-dir` succeeds, or when the inspection outlives
+/// in which `git rev-parse --show-toplevel` succeeds, or when the inspection outlives
 /// [`VALIDATE_TIMEOUT`], and [`JobError::PlanNotFound`] when the plan does not
 /// resolve to a path under `ctx`.
-pub async fn validate(spec: &JobSpec) -> Result<(), JobError> {
+pub async fn validate(spec: &JobSpec) -> Result<PathBuf, JobError> {
     inspect(spec, Arc::new(HostFiles), VALIDATE_TIMEOUT).await
 }
 
-async fn inspect(spec: &JobSpec, files: Arc<dyn Files>, budget: Duration) -> Result<(), JobError> {
+async fn inspect(
+    spec: &JobSpec,
+    files: Arc<dyn Files>,
+    budget: Duration,
+) -> Result<PathBuf, JobError> {
     let JobSpec {
         ctx,
         plan,
@@ -249,13 +256,13 @@ async fn inspect(spec: &JobSpec, files: Arc<dyn Files>, budget: Duration) -> Res
 
     let mut command = Command::new("git");
     command.arg("rev-parse");
-    command.arg("--git-dir");
+    command.arg("--show-toplevel");
     command.current_dir(&ctx);
     command.stdin(Stdio::null());
-    command.stdout(Stdio::null());
+    command.stdout(Stdio::piped());
     command.stderr(Stdio::null());
     command.kill_on_drop(true);
-    let inspected = tokio::time::timeout_at(deadline, command.status()).await;
+    let inspected = tokio::time::timeout_at(deadline, command.output()).await;
     let Ok(inspected) = inspected else {
         return Err(JobError::CtxInvalid(format!(
             "git was killed after {budget:?} in {}",
@@ -268,12 +275,13 @@ async fn inspect(spec: &JobSpec, files: Arc<dyn Files>, budget: Duration) -> Res
             ctx.display()
         )));
     };
-    if !inspected.success() {
+    if !inspected.status.success() {
         return Err(JobError::CtxInvalid(format!(
             "{} is not a git checkout",
             ctx.display()
         )));
     }
+    let top = PathBuf::from(OsStr::from_bytes(inspected.stdout.trim_ascii_end()));
 
     let asked = plan.clone();
     let root = ctx.clone();
@@ -285,7 +293,7 @@ async fn inspect(spec: &JobSpec, files: Arc<dyn Files>, budget: Duration) -> Res
             "{} could not be inspected: {error}",
             plan.display()
         ))),
-        Ok(Ok(resolved)) => resolved.map(|_plan| ()),
+        Ok(Ok(resolved)) => resolved.map(|_plan| top),
     }
 }
 

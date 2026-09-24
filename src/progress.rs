@@ -266,8 +266,9 @@ impl ProgressSender for FarmClient {
 /// Returns where the plan a run works through is expected on disk.
 ///
 /// Without a worktree this is `plan` itself. With one it is the same path
-/// relative to `ctx` under `<ctx>/.ralphex/worktrees/<branch>/`, the branch
-/// taken verbatim, so a branch with `/` gives nested directories.
+/// relative to `top`, the checkout's top level, under
+/// `<top>/.ralphex/worktrees/<branch>/`, the branch taken verbatim, so a branch
+/// with `/` gives nested directories.
 ///
 /// # Examples
 ///
@@ -278,24 +279,24 @@ impl ProgressSender for FarmClient {
 /// use ralphex_macos_runner::progress::expected_plan;
 /// use ralphex_macos_runner::protocol::types::Branch;
 ///
-/// let ctx = Path::new("/src/nhop");
+/// let top = Path::new("/src/nhop");
 /// let plan = Path::new("/src/nhop/docs/plans/x.md");
 /// let branch = Branch("feature/x".to_string());
-/// assert_eq!(expected_plan(ctx, plan, &branch, Worktree::No), plan);
+/// assert_eq!(expected_plan(top, plan, &branch, Worktree::No), plan);
 /// assert_eq!(
-///     expected_plan(ctx, plan, &branch, Worktree::Yes),
+///     expected_plan(top, plan, &branch, Worktree::Yes),
 ///     Path::new("/src/nhop/.ralphex/worktrees/feature/x/docs/plans/x.md"),
 /// );
 /// ```
 #[must_use]
-pub fn expected_plan(ctx: &Path, plan: &Path, branch: &Branch, worktree: Worktree) -> PathBuf {
+pub fn expected_plan(top: &Path, plan: &Path, branch: &Branch, worktree: Worktree) -> PathBuf {
     match worktree {
         Worktree::No => plan.to_path_buf(),
         Worktree::Yes => {
-            let Ok(relative) = plan.strip_prefix(ctx) else {
+            let Ok(relative) = plan.strip_prefix(top) else {
                 return plan.to_path_buf();
             };
-            let mut expected = ctx.join(".ralphex").join("worktrees");
+            let mut expected = top.join(".ralphex").join("worktrees");
             for segment in branch.as_str().split('/') {
                 expected.push(segment);
             }

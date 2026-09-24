@@ -98,8 +98,9 @@ fi
 if [ -n "${FAKE_RALPHEX_TICK:-}" ]; then
   target="$plan"
   if [ -n "$worktree" ]; then
-    relative="${plan#"$(pwd -P)"/}"
-    target="$(pwd -P)/.ralphex/worktrees/$branch/$relative"
+    top="$(git rev-parse --show-toplevel)"
+    relative="${plan#"$top"/}"
+    target="$top/.ralphex/worktrees/$branch/$relative"
     mkdir -p "$(dirname "$target")"
     cp "$plan" "$target"
   fi
