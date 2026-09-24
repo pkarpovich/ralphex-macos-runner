@@ -342,11 +342,13 @@ Configured with the progress sender, the run id, the **expected** plan path, a d
 
 ### Task 9: Verify acceptance criteria
 
-- [ ] verify all three requirements from Overview: a local run carries its plan's title; snapshots follow the watcher and marker rules with `pr` and `failed` last; the pull request uses a valid finalize description with the footer and falls back otherwise
-- [ ] verify the non-goals held: no `gh pr edit` anywhere, no phase outside `setup | tasks | review | pr`, the two marker expressions unchanged, no write under any ralphex config directory
-- [ ] run the full gate: `mise run check`
-- [ ] run the code-quality greps from the gate over `src/` and `tests/` and confirm nothing new
-- [ ] confirm `Cargo.toml` gained exactly `notify` and `regex`
+- [x] verify all three requirements from Overview: a local run carries its plan's title; snapshots follow the watcher and marker rules with `pr` and `failed` last; the pull request uses a valid finalize description with the footer and falls back otherwise
+- [x] verify the non-goals held: no `gh pr edit` anywhere, no phase outside `setup | tasks | review | pr`, the two marker expressions unchanged, no write under any ralphex config directory
+- [x] run the full gate: `mise run check`
+- [x] run the code-quality greps from the gate over `src/` and `tests/` and confirm nothing new
+- [x] confirm `Cargo.toml` gained exactly `notify` and `regex`
+- ➕ the marker expressions spell `\d+` as `[0-9]+`: Rust's `\d` matches every Unicode decimal digit, Go's only ASCII, so `[0-9]` is the farm's expression unchanged in meaning
+- ⚠️ two tests older than this plan, on paths it does not touch, failed once each under the full gate and passed on every rerun: `no_run_inherits_the_terminal_opened_for_another_run` (`tests/job.rs`) saw a `LISTEN` socket, which is another test's fake farm bound while the children forked, because macOS sets `FD_CLOEXEC` on a new socket in a second step; `a_burst_larger_than_the_buffer_reaches_the_farm_whole_without_a_tick` (`tests/logstream.rs`) lost one chunk when its flusher fell 4 MiB behind under load. Left as they are: both are flaky tests, not regressions, and fixing them is outside this plan
 
 ### Task 10: [Final] Update documentation, bump the version and close the plan
 
