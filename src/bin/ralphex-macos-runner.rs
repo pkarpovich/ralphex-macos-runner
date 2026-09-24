@@ -97,8 +97,17 @@ async fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let farm_out = match paths::farm_out_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let options = AgentOptions {
         drain_timeout: config.drain_timeout,
+        farm_out: Some(farm_out),
         ..AgentOptions::default()
     };
     tracing::info!(

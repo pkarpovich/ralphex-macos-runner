@@ -190,6 +190,7 @@ pub fn options(record: &Path) -> AgentOptions {
         },
         plan_debounce: Duration::from_millis(20),
         plan_attach_retry: Duration::from_millis(50),
+        farm_out: Some(record.with_file_name("farm-out")),
     }
 }
 

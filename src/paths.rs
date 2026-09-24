@@ -140,6 +140,22 @@ pub fn socket_path() -> Result<PathBuf, PathError> {
     Ok(app_dir()?.join("daemon.sock"))
 }
 
+/// Returns the directory each run's finalize output directory is made under.
+///
+/// # Errors
+///
+/// Returns [`PathError::DataDir`] when the user's data directory is unknown.
+///
+/// # Examples
+///
+/// ```
+/// let path = ralphex_macos_runner::paths::farm_out_dir().unwrap();
+/// assert!(path.ends_with("farm-out"));
+/// ```
+pub fn farm_out_dir() -> Result<PathBuf, PathError> {
+    Ok(app_dir()?.join("farm-out"))
+}
+
 /// Returns the stable path of the daemon binary launchd runs.
 ///
 /// # Errors
@@ -290,6 +306,7 @@ mod tests {
         let dir = app_dir().unwrap();
         assert_eq!(config_path().unwrap(), dir.join("config.toml"));
         assert_eq!(socket_path().unwrap(), dir.join("daemon.sock"));
+        assert_eq!(farm_out_dir().unwrap(), dir.join("farm-out"));
         assert_eq!(
             daemon_binary_path().unwrap(),
             dir.join("bin").join(APP_NAME)

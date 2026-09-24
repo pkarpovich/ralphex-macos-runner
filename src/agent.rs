@@ -37,15 +37,16 @@ use crate::job::{self, JobError, JobSpec, LocalOptions, Review, RunningJob};
 use crate::logstream::{IntervalTicker, LogStream, Ticker};
 use crate::planfile::{self, Plan};
 use crate::pr::{PrSpec, PrTools, PrUrl, RunOrigin, open_pull_request};
+use crate::prdesc::{self, Description, OutputDir, PR_FILE_VAR};
 use crate::progress::{
     DEFAULT_ATTACH_RETRY, DEFAULT_DEBOUNCE, PlanWatcher, ProgressSender, StoppedWatcher,
     WatchTimings, expected_plan,
 };
 use crate::protocol::client::{FarmClient, FarmError, next_delay};
 use crate::protocol::types::{
-    ClaimRequest, CompleteRequest, CompleteStatus, CreatePr, HEARTBEAT_INTERVAL, HeartbeatAction,
-    HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest, Phase, RETRY_BASE_DELAY, RUNTIME,
-    RunId, RunnerName, STOP_GRACE, VERSION,
+    Branch, ClaimRequest, CompleteRequest, CompleteStatus, CreatePr, HEARTBEAT_INTERVAL,
+    HeartbeatAction, HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest, Phase,
+    RETRY_BASE_DELAY, RUNTIME, RunId, RunnerName, STOP_GRACE, VERSION,
 };
 
 const TERMINAL_CAPACITY: usize = 8;
@@ -265,6 +266,9 @@ pub struct AgentOptions {
     pub plan_debounce: Duration,
     /// The interval between attempts to watch plan directories that do not exist yet.
     pub plan_attach_retry: Duration,
+    /// The directory each run's finalize output directory is made under; without
+    /// one no run is told where to write its pull request description.
+    pub farm_out: Option<PathBuf>,
 }
 
 impl Default for AgentOptions {
@@ -278,6 +282,7 @@ impl Default for AgentOptions {
             pr_tools: PrTools::default(),
             plan_debounce: DEFAULT_DEBOUNCE,
             plan_attach_retry: DEFAULT_ATTACH_RETRY,
+            farm_out: None,
         }
     }
 }
@@ -301,7 +306,11 @@ enum Settled {
 
 struct PullRequest {
     ctx: PathBuf,
-    spec: PrSpec,
+    branch: Branch,
+    origin: RunOrigin,
+    plan: String,
+    run_id: RunId,
+    pr_file: Option<PathBuf>,
     create_pr: CreatePr,
 }
 
@@ -309,6 +318,7 @@ struct Finished {
     completion: Option<CompleteRequest>,
     outcome: RunOutcome,
     beats: Option<JoinHandle<()>>,
+    output: Option<OutputDir>,
 }
 
 /// The runner's claim loop and its single run slot.
@@ -580,6 +590,7 @@ impl Agent {
             completion,
             outcome,
             beats,
+            output,
         } = self.execute(job, local, shutdown, current).await;
         let ended = match completion {
             Some(completion) => self.report(&run_id, completion).await,
@@ -592,6 +603,12 @@ impl Agent {
         };
         if let Some(beats) = beats {
             beats.abort();
+        }
+        if let Some(output) = output {
+            let path = output.path().display().to_string();
+            if let Err(error) = output.remove() {
+                tracing::warn!("the output directory {path} could not be removed: {error}");
+            }
         }
         self.leave(current, ended);
         outcome
@@ -638,6 +655,7 @@ impl Agent {
                 )),
                 outcome: RunOutcome::Continue,
                 beats: Some(beats),
+                output: None,
             };
         }
 
@@ -658,7 +676,17 @@ impl Agent {
                 )),
                 outcome: RunOutcome::Continue,
                 beats: Some(beats),
+                output: None,
             };
+        }
+
+        let output = self.output_dir(&run_id);
+        let pr_file = output.as_ref().map(OutputDir::pr_file);
+        let mut spec = spec;
+        if let Some(pr_file) = &pr_file {
+            spec.local
+                .env
+                .push((PR_FILE_VAR.to_string(), pr_file.display().to_string()));
         }
 
         let log = current.log();
@@ -684,6 +712,7 @@ impl Agent {
                     )),
                     outcome: RunOutcome::Continue,
                     beats: Some(beats),
+                    output,
                 };
             }
         };
@@ -700,17 +729,20 @@ impl Agent {
                 }
                 running.drain_output(self.options.stop_grace).await;
                 log.close().await;
-                let finished = stopped(reason, &run_id, beats);
+                let finished = stopped(reason, &run_id, beats, output);
                 mark_failure(&timeline, finished.completion.as_ref()).await;
                 return finished;
             }
             Ended::Exited(exited) => exited,
         };
 
-        let origin = origin(identifier, issue_url, title);
         let pull_request = PullRequest {
             ctx: PathBuf::from(&ctx),
-            spec: PrSpec::describe(branch, &origin, &plan_path, &run_id),
+            branch,
+            origin: origin(identifier, issue_url, title),
+            plan: plan_path,
+            run_id: run_id.clone(),
+            pr_file,
             create_pr,
         };
         let mut finishing = Box::pin(finish(
@@ -745,11 +777,12 @@ impl Agent {
                 completion: Some(completion),
                 outcome: RunOutcome::Continue,
                 beats: Some(beats),
+                output,
             },
             Settled::Interrupted(reason) => {
                 drop(finishing);
                 log.close().await;
-                let finished = stopped(reason, &run_id, beats);
+                let finished = stopped(reason, &run_id, beats, output);
                 mark_failure(&timeline, finished.completion.as_ref()).await;
                 finished
             }
@@ -778,6 +811,20 @@ impl Agent {
             expected_plan(ctx, plan, branch, *worktree),
             timings,
         )
+    }
+
+    fn output_dir(&self, run_id: &RunId) -> Option<OutputDir> {
+        let Some(root) = &self.options.farm_out else {
+            tracing::warn!("run {run_id} has no output directory, none is configured");
+            return None;
+        };
+        match OutputDir::create(root, run_id) {
+            Ok(output) => Some(output),
+            Err(error) => {
+                tracing::warn!("run {run_id} has no output directory: {error}");
+                None
+            }
+        }
     }
 
     fn hold(&self, state: RunSlot) {
@@ -970,7 +1017,7 @@ async fn hurried(shutdown: &mut watch::Receiver<Shutdown>) -> Raised {
 
 fn origin(identifier: String, issue_url: String, title: String) -> RunOrigin {
     if identifier.is_empty() {
-        return RunOrigin::Local;
+        return RunOrigin::Local { title };
     }
     RunOrigin::Ticket {
         identifier,
@@ -1117,7 +1164,11 @@ async fn settle(
     };
     let PullRequest {
         ctx,
-        spec,
+        branch,
+        origin,
+        plan,
+        run_id,
+        pr_file,
         create_pr,
     } = pull_request;
     match status.success() {
@@ -1126,12 +1177,25 @@ async fn settle(
             CreatePr::No => done(String::new()),
             CreatePr::Yes => {
                 timeline.post_phase(Phase::Pr).await;
+                let written = written(&run_id, pr_file.as_deref());
+                let spec = PrSpec::describe(branch, &origin, &plan, &run_id, written);
                 match open_pull_request(&ctx, &spec, tools).await {
                     Ok(PrUrl(url)) => done(url),
                     Err(error) => failed(error.fail_reason(), error.to_string(), String::new()),
                 }
             }
         },
+    }
+}
+
+fn written(run_id: &RunId, pr_file: Option<&Path>) -> Option<Description> {
+    let pr_file = pr_file?;
+    match prdesc::read(pr_file) {
+        Ok(written) => Some(written),
+        Err(error) => {
+            tracing::warn!("the description of run {run_id} is unusable, it falls back: {error}");
+            None
+        }
     }
 }
 
@@ -1152,7 +1216,12 @@ async fn mark_failure(timeline: &StoppedWatcher, completion: Option<&CompleteReq
     }
 }
 
-fn stopped(reason: Terminal, run_id: &RunId, beats: JoinHandle<()>) -> Finished {
+fn stopped(
+    reason: Terminal,
+    run_id: &RunId,
+    beats: JoinHandle<()>,
+    output: Option<OutputDir>,
+) -> Finished {
     match reason {
         Terminal::Cancel => Finished {
             completion: Some(failed(
@@ -1162,6 +1231,7 @@ fn stopped(reason: Terminal, run_id: &RunId, beats: JoinHandle<()>) -> Finished 
             )),
             outcome: RunOutcome::Continue,
             beats: Some(beats),
+            output,
         },
         Terminal::Drain => Finished {
             completion: Some(failed(
@@ -1171,6 +1241,7 @@ fn stopped(reason: Terminal, run_id: &RunId, beats: JoinHandle<()>) -> Finished 
             )),
             outcome: RunOutcome::Continue,
             beats: Some(beats),
+            output,
         },
         Terminal::Gone => {
             tracing::warn!("run {run_id} is unknown to the farm and was stopped");
@@ -1178,12 +1249,14 @@ fn stopped(reason: Terminal, run_id: &RunId, beats: JoinHandle<()>) -> Finished 
                 completion: None,
                 outcome: RunOutcome::Continue,
                 beats: Some(beats),
+                output,
             }
         }
         Terminal::VersionMismatch { message } => Finished {
             completion: None,
             outcome: RunOutcome::VersionMismatch { message },
             beats: Some(beats),
+            output,
         },
     }
 }
@@ -1385,7 +1458,9 @@ mod tests {
     fn a_job_without_an_identifier_is_a_local_run() {
         assert_eq!(
             origin(String::new(), String::new(), String::new()),
-            RunOrigin::Local
+            RunOrigin::Local {
+                title: String::new()
+            }
         );
         assert_eq!(
             origin(
@@ -1412,6 +1487,7 @@ mod tests {
             pr_tools,
             plan_debounce,
             plan_attach_retry,
+            farm_out,
         } = AgentOptions::default();
         assert_eq!(heartbeat_interval, HEARTBEAT_INTERVAL);
         assert_eq!(drain_timeout, crate::config::DEFAULT_DRAIN_TIMEOUT);
@@ -1420,6 +1496,7 @@ mod tests {
         assert_eq!(pr_tools, PrTools::default());
         assert_eq!(plan_debounce, Duration::from_millis(300));
         assert_eq!(plan_attach_retry, Duration::from_secs(2));
+        assert_eq!(farm_out, None);
     }
 
     #[test]

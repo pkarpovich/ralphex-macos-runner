@@ -2,7 +2,7 @@
 
 mod support;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,6 +10,8 @@ use ralphex_macos_runner::agent::{Agent, AgentExit, AgentOptions, LocalStart, Ru
 use ralphex_macos_runner::config::Config;
 use ralphex_macos_runner::ipc::RunRequest;
 use ralphex_macos_runner::job::{LocalOptions, Worktree};
+use ralphex_macos_runner::pr::RunOrigin;
+use ralphex_macos_runner::prdesc::{self, PR_FILE_NAME, PR_FILE_VAR};
 use ralphex_macos_runner::protocol::client::FarmClient;
 use ralphex_macos_runner::protocol::types::{
     Branch, CompleteRequest, CompleteStatus, CreatePr, HeartbeatAction, Job, Phase,
@@ -164,6 +166,66 @@ async fn release_after(farm: &FakeFarm, release: &Path, seen: impl Fn(&[Progress
     .await;
     assert!(posted.is_some(), "{:?}", snapshots(farm));
     std::fs::write(release, "").unwrap();
+}
+
+fn output_dir(checkout: &Checkout, run_id: &str) -> PathBuf {
+    checkout.tools().with_file_name("farm-out").join(run_id)
+}
+
+async fn removed(path: &Path) -> bool {
+    let gone = wait_for(|| match path.exists() {
+        true => None,
+        false => Some(()),
+    })
+    .await;
+    gone.is_some()
+}
+
+fn ticket_footer(checkout: &Checkout) -> String {
+    let origin = RunOrigin::Ticket {
+        identifier: "FARM-12".to_string(),
+        issue_url: "https://linear.app/example/issue/FARM-12".to_string(),
+        title: "split farm and runner".to_string(),
+    };
+    prdesc::footer(
+        &origin,
+        &checkout.plan().display().to_string(),
+        &RunId("FARM-12-1753180800000".to_string()),
+    )
+}
+
+fn as_recorded(argument: &str) -> String {
+    argument.replace('\n', " ")
+}
+
+async fn opened_with(checkout: &Checkout, settings: &[(&str, &str)]) -> (String, String) {
+    let ralphex = checkout.ralphex(settings);
+    let farm = farm_with(ticket_job(
+        &checkout.path(),
+        &checkout.plan(),
+        CreatePr::Yes,
+    ))
+    .await;
+    let _running = start(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(checkout.tools()),
+    ));
+
+    let CompleteRequest {
+        status,
+        pr_url,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Done, "{fail_reason}");
+    assert_eq!(pr_url, "https://github.com/owner/repo/pull/7");
+    let runs = invocations(checkout.tools());
+    let created = &runs[3];
+    assert!(created.starts_with(&["pr", "create"]), "{created:?}");
+    (created.args[7].clone(), created.args[9].clone())
 }
 
 fn failures(snapshots: &[ProgressRequest]) -> usize {
@@ -1610,4 +1672,154 @@ async fn a_run_refused_at_validation_posts_no_snapshot() {
     assert_eq!(fail_reason, "ctx_invalid");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(snapshots(&farm).is_empty(), "{:?}", snapshots(&farm));
+}
+
+#[tokio::test]
+async fn a_run_is_told_where_finalize_writes_its_description() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_SLEEP", "120")]);
+    let farm = farm_with(ticket_job(&checkout.path(), &checkout.plan(), CreatePr::No)).await;
+    let _running = start(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(checkout.tools()),
+    ));
+
+    spawned(checkout.record()).await;
+    let output = output_dir(&checkout, "FARM-12-1753180800000");
+    let seen = wait_for(|| Record::read(checkout.record()).env_value(PR_FILE_VAR)).await;
+
+    assert_eq!(seen, Some(output.join(PR_FILE_NAME).display().to_string()));
+    assert!(output.is_dir(), "{} was not made", output.display());
+    farm.push_heartbeat(Reply::Beat(HeartbeatAction::Cancel));
+    let _completed = completion(&farm).await;
+}
+
+#[tokio::test]
+async fn a_written_description_opens_the_pull_request_with_the_footer_appended() {
+    let checkout = Checkout::new();
+
+    let (title, body) = opened_with(
+        &checkout,
+        &[(
+            "FAKE_RALPHEX_PR_DESCRIPTION",
+            "# Split the farm from its runner\n\nThe runner moves out.\n\n- one\n- two",
+        )],
+    )
+    .await;
+
+    assert_eq!(title, "Split the farm from its runner");
+    let expected = format!(
+        "The runner moves out.\n\n- one\n- two{}",
+        ticket_footer(&checkout)
+    );
+    assert_eq!(body, as_recorded(&expected));
+    assert!(
+        removed(&output_dir(&checkout, "FARM-12-1753180800000")).await,
+        "the output directory outlived a done run"
+    );
+}
+
+#[tokio::test]
+async fn a_run_without_a_description_opens_with_the_fallback_title_and_the_footer() {
+    let checkout = Checkout::new();
+
+    let (title, body) = opened_with(&checkout, &[]).await;
+
+    assert_eq!(title, "FARM-12: split farm and runner");
+    assert_eq!(body, as_recorded(&ticket_footer(&checkout)));
+}
+
+#[tokio::test]
+async fn an_invalid_description_opens_with_the_fallback_title_and_the_footer() {
+    let checkout = Checkout::new();
+
+    let (title, body) = opened_with(
+        &checkout,
+        &[("FAKE_RALPHEX_PR_DESCRIPTION", "# Only a title")],
+    )
+    .await;
+
+    assert_eq!(title, "FARM-12: split farm and runner");
+    assert_eq!(body, as_recorded(&ticket_footer(&checkout)));
+}
+
+#[tokio::test]
+async fn the_output_directory_is_gone_after_a_failed_run() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[
+        ("FAKE_RALPHEX_PR_DESCRIPTION", "# Title\n\nBody"),
+        ("FAKE_RALPHEX_EXIT", "3"),
+    ]);
+    let farm = farm_with(ticket_job(
+        &checkout.path(),
+        &checkout.plan(),
+        CreatePr::Yes,
+    ))
+    .await;
+    let _running = start(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(checkout.tools()),
+    ));
+
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Error);
+    assert_eq!(fail_reason, "nonzero_exit");
+    assert!(
+        removed(&output_dir(&checkout, "FARM-12-1753180800000")).await,
+        "the output directory outlived a failed run"
+    );
+}
+
+#[tokio::test]
+async fn the_output_directory_is_gone_after_a_canceled_run() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[
+        ("FAKE_RALPHEX_PR_DESCRIPTION", "# Title\n\nBody"),
+        ("FAKE_RALPHEX_SLEEP", "120"),
+    ]);
+    let farm = farm_with(ticket_job(
+        &checkout.path(),
+        &checkout.plan(),
+        CreatePr::Yes,
+    ))
+    .await;
+    let _running = start(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(checkout.tools()),
+    ));
+
+    spawned(checkout.record()).await;
+    let output = output_dir(&checkout, "FARM-12-1753180800000");
+    let written = wait_for(|| match output.join(PR_FILE_NAME).is_file() {
+        true => Some(()),
+        false => None,
+    })
+    .await;
+    assert!(written.is_some(), "the description was never written");
+    farm.push_heartbeat(Reply::Beat(HeartbeatAction::Cancel));
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Error);
+    assert_eq!(fail_reason, "canceled");
+    assert!(
+        removed(&output).await,
+        "the output directory outlived a canceled run"
+    );
+    assert!(invocations(checkout.tools()).is_empty());
 }

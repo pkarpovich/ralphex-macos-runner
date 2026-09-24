@@ -316,15 +316,19 @@ Configured with the progress sender, the run id, the **expected** plan path, a d
 - Modify: `tests/agent_e2e.rs`
 - Modify: `tests/pr.rs`
 
-- [ ] create `src/prdesc.rs` with the output-directory handling, the reader, the parser, the fallback title and the footer exactly as specified under "Pull request description"; the parser, the fallback title and the footer are pure and doctested
-- [ ] add the `farm-out` root to `src/paths.rs` and pass it from the daemon binary into `AgentOptions`
-- [ ] in `Agent::execute`, create the run's output directory and add `FARM_PR_FILE` to the child's environment before spawn, read the description after `pr` is posted and before the push, build the pull request's title and body from it plus the footer, and remove the directory once the run is completed on every path
-- [ ] replace the title and body `PrSpec::describe` builds in `src/pr.rs` with the ones from `src/prdesc.rs`, leaving the push, the existing-pull-request check and `gh pr create` untouched; update its doctests
-- [ ] extend `tests/support/fake-ralphex.sh` with a variable whose value it writes to `$FARM_PR_FILE`
-- [ ] write parser tests: a valid file; a leading `# ` on the title; blank lines before the title; `\r\n`; a NUL byte, no title, a title of only `#`, no body, a 257-character title, a body over 60000 characters and one over 100000 bytes are each rejected
-- [ ] write reader tests: a missing file, a symlink, a directory and a file over 1 MiB are rejected; the footer for a ticket with a URL, a ticket without one and a local run; the fallback title for a ticket, a local run and an over-long title
-- [ ] write `tests/agent_e2e.rs` tests: the child sees `FARM_PR_FILE`; a written description reaches `gh pr create` with the footer appended; no file or an invalid file opens with the fallback title and a footer-only body; the output directory is gone after a done, a failed and a canceled run
-- [ ] run `mise run check` - must pass before task 8
+- [x] create `src/prdesc.rs` with the output-directory handling, the reader, the parser, the fallback title and the footer exactly as specified under "Pull request description"; the parser, the fallback title and the footer are pure and doctested
+- [x] add the `farm-out` root to `src/paths.rs` and pass it from the daemon binary into `AgentOptions`
+- [x] in `Agent::execute`, create the run's output directory and add `FARM_PR_FILE` to the child's environment before spawn, read the description after `pr` is posted and before the push, build the pull request's title and body from it plus the footer, and remove the directory once the run is completed on every path
+- [x] replace the title and body `PrSpec::describe` builds in `src/pr.rs` with the ones from `src/prdesc.rs`, leaving the push, the existing-pull-request check and `gh pr create` untouched; update its doctests
+- [x] extend `tests/support/fake-ralphex.sh` with a variable whose value it writes to `$FARM_PR_FILE`
+- [x] write parser tests: a valid file; a leading `# ` on the title; blank lines before the title; `\r\n`; a NUL byte, no title, a title of only `#`, no body, a 257-character title, a body over 60000 characters and one over 100000 bytes are each rejected
+- [x] write reader tests: a missing file, a symlink, a directory and a file over 1 MiB are rejected; the footer for a ticket with a URL, a ticket without one and a local run; the fallback title for a ticket, a local run and an over-long title
+- [x] write `tests/agent_e2e.rs` tests: the child sees `FARM_PR_FILE`; a written description reaches `gh pr create` with the footer appended; no file or an invalid file opens with the fallback title and a footer-only body; the output directory is gone after a done, a failed and a canceled run
+- [x] run `mise run check` - must pass before task 8
+- ➕ `RunOrigin::Local` carries the name the farm gave the run (`Job.title`), which the fallback title needs; `PrSpec::describe` takes the parsed description as an `Option<Description>`, and the plan-stem title and the old three-line body are gone
+- ➕ `AgentOptions.farm_out` is an `Option<PathBuf>`, `None` by default (every run then falls back, with a warning); the daemon binary passes `paths::farm_out_dir()`
+- ➕ an empty run id is refused as a path segment along with `.`, `..` and ids holding `/` or `\`, because `root.join("")` would name the whole `farm-out` root and its removal would take every other run's directory with it
+- ➕ `tests/daemon_process.rs` starts the daemon with `HOME` pointed at a temporary directory, so its `farm-out` never lands in the operator's application directory, and checks the run's directory is gone after the shutdown drain
 
 ### Task 8: Budget the progress post in the shutdown timeout
 

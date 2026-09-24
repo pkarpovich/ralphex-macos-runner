@@ -19,6 +19,7 @@ pub mod logstream;
 pub mod paths;
 pub mod planfile;
 pub mod pr;
+pub mod prdesc;
 pub mod progress;
 pub mod protocol;
 pub mod service;

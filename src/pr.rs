@@ -4,8 +4,9 @@
 //! `gh` for an open pull request on the branch, pushes the branch, resolves the
 //! base branch and calls `gh pr create`. A branch that already has a pull
 //! request is only pushed, and the existing URL is reported. [`PrSpec::describe`]
-//! builds the title and the body a run gets, for a ticket job and for a local
-//! run alike. Every step is bounded by [`PrTools::step_timeout`], because the
+//! builds the title and the body a run gets from the description finalize
+//! wrote, or from [`prdesc::fallback_title`] without one, and appends
+//! [`prdesc::footer`], for a ticket job and for a local run alike. Every step is bounded by [`PrTools::step_timeout`], because the
 //! sequence runs after the terminal channel stops being read and while the run
 //! slot is still held: a `git push` that hangs on the wire would otherwise wedge
 //! the daemon until it is restarted by hand.
@@ -16,6 +17,7 @@ use std::time::Duration;
 
 use tokio::process::Command;
 
+use crate::prdesc::{self, Description};
 use crate::protocol::types::{Branch, PR_STEP_TIMEOUT, RunId};
 
 /// The URL of a pull request.
@@ -58,7 +60,10 @@ pub enum RunOrigin {
         title: String,
     },
     /// A local `rxd` invocation opened the run.
-    Local,
+    Local {
+        /// The name the farm gave the run.
+        title: String,
+    },
 }
 
 /// The programs the pull-request sequence runs and the environment they see.
@@ -99,12 +104,17 @@ pub struct PrSpec {
 impl PrSpec {
     /// Returns the title and the body a run of `origin` gets.
     ///
+    /// A description finalize `written` supplies both; without one the title is
+    /// [`prdesc::fallback_title`] and the body is empty. The farm's
+    /// [`prdesc::footer`] is appended to the body either way.
+    ///
     /// # Examples
     ///
-    /// A ticket job is titled after its ticket and resolves it:
+    /// A written description is used as it is:
     ///
     /// ```
     /// use ralphex_macos_runner::pr::{PrSpec, RunOrigin};
+    /// use ralphex_macos_runner::prdesc::Description;
     /// use ralphex_macos_runner::protocol::types::{Branch, RunId};
     ///
     /// let origin = RunOrigin::Ticket {
@@ -112,65 +122,63 @@ impl PrSpec {
     ///     issue_url: "https://linear.app/example/issue/FARM-12".to_string(),
     ///     title: "split farm and runner".to_string(),
     /// };
+    /// let written = Description {
+    ///     title: "Split the farm from its runner".to_string(),
+    ///     body: "The runner moves out.".to_string(),
+    /// };
     /// let spec = PrSpec::describe(
     ///     Branch("x".to_string()),
     ///     &origin,
     ///     "/abs/checkout/docs/plans/x.md",
     ///     &RunId("FARM-12-1".to_string()),
+    ///     Some(written),
     /// );
-    /// assert_eq!(spec.title, "FARM-12: split farm and runner");
+    /// assert_eq!(spec.title, "Split the farm from its runner");
     /// assert_eq!(
     ///     spec.body,
-    ///     "Plan: /abs/checkout/docs/plans/x.md\n\nRun: FARM-12-1\n\nResolves FARM-12 (https://linear.app/example/issue/FARM-12)\n\nAutomated by ralphex-macos-runner."
+    ///     "The runner moves out.\n\n---\n\n[FARM-12](https://linear.app/example/issue/FARM-12) - plan: `/abs/checkout/docs/plans/x.md` - run `FARM-12-1`\n\nOpened automatically by ralphex-farm."
     /// );
     /// ```
     ///
-    /// A local run is titled after its plan and resolves nothing:
+    /// Without one a local run is titled after its name and carries only the footer:
     ///
     /// ```
     /// use ralphex_macos_runner::pr::{PrSpec, RunOrigin};
     /// use ralphex_macos_runner::protocol::types::{Branch, RunId};
     ///
+    /// let origin = RunOrigin::Local {
+    ///     title: "Require dials".to_string(),
+    /// };
     /// let spec = PrSpec::describe(
     ///     Branch("x".to_string()),
-    ///     &RunOrigin::Local,
+    ///     &origin,
     ///     "/abs/checkout/docs/plans/20260902-x.md",
     ///     &RunId("local-1".to_string()),
+    ///     None,
     /// );
-    /// assert_eq!(spec.title, "20260902-x");
+    /// assert_eq!(spec.title, "Require dials");
     /// assert_eq!(
     ///     spec.body,
-    ///     "Plan: /abs/checkout/docs/plans/20260902-x.md\n\nRun: local-1\n\nAutomated by ralphex-macos-runner."
+    ///     "\n\n---\n\nplan: `/abs/checkout/docs/plans/20260902-x.md` - run `local-1`\n\nOpened automatically by ralphex-farm."
     /// );
     /// ```
     #[must_use]
-    pub fn describe(branch: Branch, origin: &RunOrigin, plan: &str, run_id: &RunId) -> PrSpec {
-        let (title, resolves) = match origin {
-            RunOrigin::Ticket {
-                identifier,
-                issue_url,
-                title,
-            } => {
-                let resolves = if issue_url.is_empty() {
-                    format!("Resolves {identifier}")
-                } else {
-                    format!("Resolves {identifier} ({issue_url})")
-                };
-                (format!("{identifier}: {title}"), resolves)
-            }
-            RunOrigin::Local => (plan_stem(plan), String::new()),
+    pub fn describe(
+        branch: Branch,
+        origin: &RunOrigin,
+        plan: &str,
+        run_id: &RunId,
+        written: Option<Description>,
+    ) -> PrSpec {
+        let (title, body) = match written {
+            Some(Description { title, body }) => (title, body),
+            None => (prdesc::fallback_title(origin), String::new()),
         };
-        let mut paragraphs = Vec::new();
-        paragraphs.push(format!("Plan: {plan}"));
-        paragraphs.push(format!("Run: {run_id}"));
-        if !resolves.is_empty() {
-            paragraphs.push(resolves);
-        }
-        paragraphs.push("Automated by ralphex-macos-runner.".to_string());
+        let footer = prdesc::footer(origin, plan, run_id);
         PrSpec {
             branch,
             title,
-            body: paragraphs.join("\n\n"),
+            body: format!("{body}{footer}"),
         }
     }
 }
@@ -442,13 +450,6 @@ fn label(program: &str, args: &[&str]) -> String {
     label
 }
 
-fn plan_stem(plan: &str) -> String {
-    let Some(stem) = Path::new(plan).file_stem() else {
-        return plan.to_string();
-    };
-    stem.to_string_lossy().into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -462,7 +463,11 @@ mod tests {
     }
 
     #[test]
-    fn a_ticket_job_is_titled_after_its_ticket() {
+    fn a_written_description_titles_the_pull_request_and_leads_its_body() {
+        let written = Description {
+            title: "Split the farm from its runner".to_string(),
+            body: "The runner moves out.".to_string(),
+        };
         let PrSpec {
             branch,
             title,
@@ -472,72 +477,69 @@ mod tests {
             &ticket(),
             "/abs/checkout/docs/plans/x.md",
             &RunId("FARM-12-1753180800000".to_string()),
+            Some(written),
         );
         assert_eq!(branch, Branch("farm-runner".to_string()));
-        assert_eq!(title, "FARM-12: split farm and runner");
+        assert_eq!(title, "Split the farm from its runner");
         assert_eq!(
             body,
             concat!(
-                "Plan: /abs/checkout/docs/plans/x.md\n",
+                "The runner moves out.\n",
                 "\n",
-                "Run: FARM-12-1753180800000\n",
+                "---\n",
                 "\n",
-                "Resolves FARM-12 (https://linear.app/example/issue/FARM-12)\n",
+                "[FARM-12](https://linear.app/example/issue/FARM-12) - plan: `/abs/checkout/docs/plans/x.md` - run `FARM-12-1753180800000`\n",
                 "\n",
-                "Automated by ralphex-macos-runner.",
+                "Opened automatically by ralphex-farm.",
             )
         );
     }
 
     #[test]
-    fn a_ticket_without_a_url_resolves_the_bare_identifier() {
-        let origin = RunOrigin::Ticket {
-            identifier: "FARM-12".to_string(),
-            issue_url: String::new(),
-            title: "split farm and runner".to_string(),
-        };
-        let PrSpec {
-            branch: _,
-            title: _,
-            body,
-        } = PrSpec::describe(
-            Branch("x".to_string()),
-            &origin,
-            "/abs/plan.md",
-            &RunId("FARM-12-1".to_string()),
-        );
-        assert!(body.contains("\nResolves FARM-12\n"));
-    }
-
-    #[test]
-    fn a_local_run_is_titled_after_its_plan_and_resolves_nothing() {
+    fn a_ticket_job_without_a_description_is_titled_after_its_ticket() {
         let PrSpec {
             branch: _,
             title,
             body,
         } = PrSpec::describe(
             Branch("x".to_string()),
-            &RunOrigin::Local,
-            "/abs/checkout/docs/plans/20260902-ralphex-macos-runner.md",
-            &RunId("local-1753180800000".to_string()),
+            &ticket(),
+            "/abs/plan.md",
+            &RunId("FARM-12-1".to_string()),
+            None,
         );
-        assert_eq!(title, "20260902-ralphex-macos-runner");
+        assert_eq!(title, "FARM-12: split farm and runner");
         assert_eq!(
             body,
-            concat!(
-                "Plan: /abs/checkout/docs/plans/20260902-ralphex-macos-runner.md\n",
-                "\n",
-                "Run: local-1753180800000\n",
-                "\n",
-                "Automated by ralphex-macos-runner.",
-            )
+            prdesc::footer(&ticket(), "/abs/plan.md", &RunId("FARM-12-1".to_string()))
         );
     }
 
     #[test]
-    fn a_plan_without_a_stem_titles_the_run_with_the_path() {
-        assert_eq!(plan_stem("/"), "/");
-        assert_eq!(plan_stem("plan.md"), "plan");
+    fn a_local_run_without_a_description_is_titled_after_its_name() {
+        let origin = RunOrigin::Local {
+            title: "Require dials".to_string(),
+        };
+        let PrSpec {
+            branch: _,
+            title,
+            body,
+        } = PrSpec::describe(
+            Branch("x".to_string()),
+            &origin,
+            "/abs/checkout/docs/plans/20260902-ralphex-macos-runner.md",
+            &RunId("local-1753180800000".to_string()),
+            None,
+        );
+        assert_eq!(title, "Require dials");
+        assert_eq!(
+            body,
+            concat!(
+                "\n\n---\n\n",
+                "plan: `/abs/checkout/docs/plans/20260902-ralphex-macos-runner.md` - run `local-1753180800000`",
+                "\n\nOpened automatically by ralphex-farm.",
+            )
+        );
     }
 
     #[test]

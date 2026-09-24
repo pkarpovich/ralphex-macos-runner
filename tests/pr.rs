@@ -32,9 +32,12 @@ fn with(tools: &mut PrTools, key: &str, value: &str) {
 fn spec() -> PrSpec {
     PrSpec::describe(
         Branch("farm-runner".to_string()),
-        &RunOrigin::Local,
+        &RunOrigin::Local {
+            title: "farm-runner".to_string(),
+        },
         "/abs/checkout/docs/plans/farm-runner.md",
         &RunId("local-1".to_string()),
+        None,
     )
 }
 
@@ -122,8 +125,9 @@ async fn a_branch_without_a_pull_request_is_pushed_and_opened() {
         "farm-runner",
         "--body",
     ]));
-    assert!(created.args[9].contains("Plan: /abs/checkout/docs/plans/farm-runner.md"));
-    assert!(created.args[9].contains("Run: local-1"));
+    assert!(
+        created.args[9].contains("plan: `/abs/checkout/docs/plans/farm-runner.md` - run `local-1`")
+    );
 }
 
 #[tokio::test]
@@ -132,9 +136,12 @@ async fn a_branch_that_looks_like_an_option_stays_an_argument_of_the_push() {
     let tools = tools(&record);
     let spec = PrSpec::describe(
         Branch("--receive-pack=/usr/bin/touch /tmp/pwned".to_string()),
-        &RunOrigin::Local,
+        &RunOrigin::Local {
+            title: "farm-runner".to_string(),
+        },
         "/abs/checkout/docs/plans/farm-runner.md",
         &RunId("local-1".to_string()),
+        None,
     );
 
     open_pull_request(dir.path(), &spec, &tools).await.unwrap();
@@ -424,6 +431,7 @@ async fn a_ticket_run_carries_its_ticket_into_the_title_and_the_body() {
         &origin,
         "/abs/checkout/docs/plans/x.md",
         &RunId("FARM-12-1".to_string()),
+        None,
     );
 
     open_pull_request(dir.path(), &spec, &tools).await.unwrap();
@@ -433,7 +441,7 @@ async fn a_ticket_run_carries_its_ticket_into_the_title_and_the_body() {
     assert!(created.starts_with(&["pr", "create"]));
     assert_eq!(created.args[7], "FARM-12: split farm and runner");
     assert!(
-        created.args[9].contains("Resolves FARM-12 (https://linear.app/example/issue/FARM-12)")
+        created.args[9].contains("[FARM-12](https://linear.app/example/issue/FARM-12) - plan:")
     );
-    assert!(created.args[9].contains("Automated by ralphex-macos-runner."));
+    assert!(created.args[9].contains("Opened automatically by ralphex-farm."));
 }

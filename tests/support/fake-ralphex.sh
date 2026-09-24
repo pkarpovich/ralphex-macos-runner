@@ -113,6 +113,10 @@ if [ -n "${FAKE_RALPHEX_COMPLETE:-}" ]; then
   mv "$plan" "$completed/"
 fi
 
+if [ -n "${FAKE_RALPHEX_PR_DESCRIPTION:-}" ]; then
+  printf '%s\n' "$FAKE_RALPHEX_PR_DESCRIPTION" >"$FARM_PR_FILE"
+fi
+
 if [ -n "${FAKE_RALPHEX_HOLD:-}" ]; then
   sleep "$FAKE_RALPHEX_HOLD" &
 fi
