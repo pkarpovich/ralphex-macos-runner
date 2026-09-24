@@ -22,7 +22,7 @@ A native runner for ralphex-farm: it claims jobs from the farm over HTTP and run
 
 ### Two Binaries
 
-- **ralphex-macos-runner** (`src/bin/ralphex-macos-runner.rs`): the daemon. Loads the config, builds the farm client, spawns the signal task, serves the Unix socket and runs the agent. Exits 2 on a protocol version mismatch.
+- **ralphex-macos-runner** (`src/bin/ralphex-macos-runner.rs`): the daemon. Loads the config, builds the farm client, spawns the signal task, serves the Unix socket and runs the agent. Exits 2 on a protocol version mismatch. The runtime is shut down in the background once the agent returns, so a blocking plan read abandoned on an unresponsive mount cannot hold the exit.
 - **rxd** (`src/bin/rxd.rs`): the client. `rxd <plan>`, `rxd attach`, `rxd install`, `rxd uninstall`. Both binaries take `--socket <path>`, which is how the suite drives a real `rxd` against an in-process daemon.
 
 ### Module Structure
