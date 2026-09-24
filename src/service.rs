@@ -21,7 +21,7 @@ use crate::ipc;
 use crate::paths::{self, APP_NAME, PathError};
 use crate::protocol::types::{
     COMPLETE_BUDGET, LOG_CLOSE_TIMEOUT, PR_BUDGET, PROGRESS_POST_TIMEOUT, REQUEST_TIMEOUT,
-    RETRY_MAX_DELAY, RunId, STOP_GRACE, VALIDATE_TIMEOUT,
+    RETRY_MAX_DELAY, RunId, STOP_GRACE, VALIDATE_TIMEOUT, WATCH_START_TIMEOUT,
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -216,7 +216,9 @@ impl std::fmt::Display for Uninstalled {
 /// to finalise a finished run `runner_lost`. The sum walks every await the
 /// daemon makes after the signal: [`VALIDATE_TIMEOUT`] for the checkout
 /// inspection a run started just before the signal still runs outside the
-/// drain, `drain_timeout` for the run to finish, [`STOP_GRACE`] to stop the
+/// drain, [`WATCH_START_TIMEOUT`] for the plan watcher's first directories,
+/// which hold back the drain's terminal until they answer, `drain_timeout` for
+/// the run to finish, [`STOP_GRACE`] to stop the
 /// process group, another [`STOP_GRACE`] for the pipe drain,
 /// [`LOG_CLOSE_TIMEOUT`] for the log stream's last flush, [`PR_BUDGET`] for a
 /// pull-request sequence a run that exited `0` still owes, two
@@ -235,12 +237,13 @@ impl std::fmt::Display for Uninstalled {
 ///
 /// assert_eq!(
 ///     service::exit_timeout(Duration::from_secs(120)),
-///     Duration::from_secs(30 + 120 + 10 + 10 + 30 + 600 + 10 + 10 + 180 + 30 + 30)
+///     Duration::from_secs(30 + 10 + 120 + 10 + 10 + 30 + 600 + 10 + 10 + 180 + 30 + 30)
 /// );
 /// ```
 #[must_use]
 pub fn exit_timeout(drain_timeout: Duration) -> Duration {
     VALIDATE_TIMEOUT
+        + WATCH_START_TIMEOUT
         + drain_timeout
         + STOP_GRACE
         + STOP_GRACE
@@ -784,6 +787,7 @@ mod tests {
     #[test]
     fn the_exit_timeout_covers_every_await_the_shutdown_makes() {
         let validation = VALIDATE_TIMEOUT;
+        let watch_start = WATCH_START_TIMEOUT;
         let drain_timeout = DEFAULT_DRAIN_TIMEOUT;
         let stop = STOP_GRACE;
         let pipes = STOP_GRACE;
@@ -793,7 +797,15 @@ mod tests {
         let completion = COMPLETE_BUDGET + RETRY_MAX_DELAY + REQUEST_TIMEOUT;
         assert_eq!(
             exit_timeout(drain_timeout),
-            validation + drain_timeout + stop + pipes + logs + pull_request + timeline + completion
+            validation
+                + watch_start
+                + drain_timeout
+                + stop
+                + pipes
+                + logs
+                + pull_request
+                + timeline
+                + completion
         );
     }
 
@@ -807,7 +819,7 @@ mod tests {
             Path::new("/logs"),
             exit_timeout(drain_timeout),
         );
-        assert!(plist.contains("<integer>1540</integer>"), "{plist}");
+        assert!(plist.contains("<integer>1550</integer>"), "{plist}");
     }
 
     #[test]

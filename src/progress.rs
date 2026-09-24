@@ -27,6 +27,7 @@ use crate::planfile::{self, Checkbox, Plan, Task};
 use crate::protocol::client::{FarmClient, FarmError};
 use crate::protocol::types::{
     Branch, PROGRESS_POST_TIMEOUT, Phase, ProgressCheckbox, ProgressRequest, ProgressTask, RunId,
+    WATCH_START_TIMEOUT,
 };
 
 /// The quiet period after the last change to the plan before a snapshot is requested.
@@ -454,7 +455,9 @@ impl PlanWatcher {
     /// directory attaches, its nearest existing ancestor is watched instead. A
     /// change to a file named like the plan requests a snapshot once
     /// `timings.debounce` has passed without another. The first directories are
-    /// handed to the watcher on the blocking pool, and this returns once they are.
+    /// handed to the watcher on the blocking pool, and this returns once they
+    /// are, or after [`WATCH_START_TIMEOUT`] without a watcher: the snapshots
+    /// the markers request are still posted.
     ///
     /// # Panics
     ///
@@ -468,14 +471,10 @@ impl PlanWatcher {
         let tracker = Arc::new(PhaseTracker::new());
         let (sink, events) = mpsc::unbounded_channel();
         let watched = expected.clone();
-        let watches =
-            match tokio::task::spawn_blocking(move || Watches::start(&watched, sink)).await {
-                Ok(watches) => watches,
-                Err(error) => {
-                    tracing::warn!("the plan {} cannot be watched: {error}", expected.display());
-                    None
-                }
-            };
+        let watches = start_within(WATCH_START_TIMEOUT, &expected, move || {
+            Watches::start(&watched, sink)
+        })
+        .await;
         let name = match expected.file_name() {
             Some(name) => name.to_os_string(),
             None => OsString::new(),
@@ -780,6 +779,28 @@ async fn follow_events(
     }
 }
 
+async fn start_within<T: Send + 'static>(
+    budget: Duration,
+    expected: &Path,
+    start: impl FnOnce() -> Option<T> + Send + 'static,
+) -> Option<T> {
+    let starting = tokio::task::spawn_blocking(start);
+    match tokio::time::timeout(budget, starting).await {
+        Err(_elapsed) => {
+            tracing::warn!(
+                "the plan {} cannot be watched: its directories did not answer within {budget:?}",
+                expected.display()
+            );
+            None
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("the plan {} cannot be watched: {error}", expected.display());
+            None
+        }
+        Ok(Ok(watches)) => watches,
+    }
+}
+
 async fn reattach(watches: Watches, tracker: &PhaseTracker) -> Option<Watches> {
     let attaching = tokio::task::spawn_blocking(move || {
         let mut watches = watches;
@@ -811,6 +832,28 @@ mod tests {
 
     fn event(kind: EventKind, path: &str) -> Event {
         Event::new(kind).add_path(PathBuf::from(path))
+    }
+
+    #[tokio::test]
+    async fn a_plan_directory_that_does_not_answer_in_time_is_not_watched() {
+        let (release, stalled) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+
+        let watches = start_within(Duration::from_millis(50), Path::new("x.md"), move || {
+            stalled.recv().ok()
+        })
+        .await;
+
+        assert_eq!(watches, None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(release);
+    }
+
+    #[tokio::test]
+    async fn a_plan_directory_that_answers_in_time_is_watched() {
+        let watches = start_within(Duration::from_secs(5), Path::new("x.md"), || Some(())).await;
+
+        assert_eq!(watches, Some(()));
     }
 
     #[test]

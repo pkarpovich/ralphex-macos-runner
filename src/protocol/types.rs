@@ -73,6 +73,9 @@ pub const STOP_GRACE: Duration = Duration::from_secs(10);
 /// The time one plan-progress snapshot may take to reach the farm.
 pub const PROGRESS_POST_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The time the plan watcher may take to watch its first directories.
+pub const WATCH_START_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// The time the git that inspects a checkout may take before it is killed.
 pub const VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
 
