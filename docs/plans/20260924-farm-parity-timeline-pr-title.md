@@ -292,12 +292,16 @@ Configured with the progress sender, the run id, the **expected** plan path, a d
 - Modify: `tests/support/mod.rs`
 - Modify: `tests/agent_e2e.rs`
 
-- [ ] in `Agent::execute`, start the watcher after validation and before spawn with the expected path from "Plan watcher" (worktree-aware), register its tracker on the run's log stream, and apply every rule under "Where the agent drives the watcher"; the posting uses the agent's `FarmClient`
-- [ ] add debounce and attach-retry fields to `AgentOptions`, defaulting to 300 ms and 2 s, so tests shorten them
-- [ ] extend `tests/support/fake-ralphex.sh` with variables that: print a given marker line; tick every checkbox of the plan it was given (in place); move the plan into `completed/`; with `--worktree`, copy the plan to `<cwd>/.ralphex/worktrees/<branch>/<same relative path>` and tick it there
-- [ ] write `tests/agent_e2e.rs` tests: a clean run with a pull request posts `setup` first, then tasks after the fake ticks the plan, then `tasks`/`review` phases from the markers, and `pr` as its last snapshot before the push; a `--no-pr` run posts no `pr`; a worktree run posts the tasks read from the worktree copy
-- [ ] write tests for failures: a nonzero exit posts a last snapshot with `failed: true` before the completion; a canceled run does too; a run refused at validation posts nothing
-- [ ] run `mise run check` - must pass before task 7
+- [x] in `Agent::execute`, start the watcher after validation and before spawn with the expected path from "Plan watcher" (worktree-aware), register its tracker on the run's log stream, and apply every rule under "Where the agent drives the watcher"; the posting uses the agent's `FarmClient`
+- [x] add debounce and attach-retry fields to `AgentOptions`, defaulting to 300 ms and 2 s, so tests shorten them
+- [x] extend `tests/support/fake-ralphex.sh` with variables that: print a given marker line; tick every checkbox of the plan it was given (in place); move the plan into `completed/`; with `--worktree`, copy the plan to `<cwd>/.ralphex/worktrees/<branch>/<same relative path>` and tick it there
+- [x] write `tests/agent_e2e.rs` tests: a clean run with a pull request posts `setup` first, then tasks after the fake ticks the plan, then `tasks`/`review` phases from the markers, and `pr` as its last snapshot before the push; a `--no-pr` run posts no `pr`; a worktree run posts the tasks read from the worktree copy
+- [x] write tests for failures: a nonzero exit posts a last snapshot with `failed: true` before the completion; a canceled run does too; a run refused at validation posts nothing
+- [x] run `mise run check` - must pass before task 7
+- ➕ re-attaching a watch runs on the blocking pool: an FSEvents `watch` restarts the stream and took up to 2.4 s under load, which blocked the runtime thread the events task ran on (on a current-thread runtime the posting task with it). `PlanWatcher::stop` returns at once even then; the watcher and its thread end when that attach finishes
+- ➕ `tests/support/fake-ralphex.sh` also takes `FAKE_RALPHEX_WAIT_FOR`, a file it waits for before exiting, so the e2e tests release the run only once the snapshots they check were posted; `src/job.rs` needed no change (`JobSpec` and `LocalOptions` already expose the worktree)
+- ⚠️ a spawn failure happens after the watcher started, so its initial `setup` snapshot may already be out; the watcher is stopped without a `failed` snapshot
+- ⚠️ a pull-request failure posts `pr` and then `failed`, as the rules above ask, so a run finishing during the drain can post twice: Task 8 has to budget two `PROGRESS_POST_TIMEOUT`s, not one
 
 ### Task 7: Use the description finalize wrote
 

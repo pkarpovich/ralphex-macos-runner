@@ -37,11 +37,15 @@ use crate::job::{self, JobError, JobSpec, LocalOptions, Review, RunningJob};
 use crate::logstream::{IntervalTicker, LogStream, Ticker};
 use crate::planfile::{self, Plan};
 use crate::pr::{PrSpec, PrTools, PrUrl, RunOrigin, open_pull_request};
+use crate::progress::{
+    DEFAULT_ATTACH_RETRY, DEFAULT_DEBOUNCE, PlanWatcher, ProgressSender, StoppedWatcher,
+    WatchTimings, expected_plan,
+};
 use crate::protocol::client::{FarmClient, FarmError, next_delay};
 use crate::protocol::types::{
     ClaimRequest, CompleteRequest, CompleteStatus, CreatePr, HEARTBEAT_INTERVAL, HeartbeatAction,
-    HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest, RETRY_BASE_DELAY, RUNTIME, RunId,
-    RunnerName, STOP_GRACE, VERSION,
+    HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest, Phase, RETRY_BASE_DELAY, RUNTIME,
+    RunId, RunnerName, STOP_GRACE, VERSION,
 };
 
 const TERMINAL_CAPACITY: usize = 8;
@@ -257,6 +261,10 @@ pub struct AgentOptions {
     pub ticker: Arc<dyn Ticker>,
     /// The programs the pull-request sequence runs.
     pub pr_tools: PrTools,
+    /// The quiet period after the last change to the plan before its snapshot is posted.
+    pub plan_debounce: Duration,
+    /// The interval between attempts to watch plan directories that do not exist yet.
+    pub plan_attach_retry: Duration,
 }
 
 impl Default for AgentOptions {
@@ -268,6 +276,8 @@ impl Default for AgentOptions {
             claim_retry_delay: RETRY_BASE_DELAY,
             ticker: Arc::new(IntervalTicker),
             pr_tools: PrTools::default(),
+            plan_debounce: DEFAULT_DEBOUNCE,
+            plan_attach_retry: DEFAULT_ATTACH_RETRY,
         }
     }
 }
@@ -657,11 +667,14 @@ impl Agent {
             self.options.drain_timeout,
             terminals.clone(),
         ));
+        let watcher = self.watch_plan(&spec, &run_id);
+        log.track(watcher.tracker());
 
         let mut running = match job::spawn(&spec, Arc::clone(&log)) {
             Ok(running) => running,
             Err(error) => {
                 drain.abort();
+                let _stopped = watcher.stop().await;
                 log.close().await;
                 return Finished {
                     completion: Some(failed(
@@ -678,6 +691,7 @@ impl Agent {
 
         let ended = ended(running.wait(), &mut terminal).await;
         drain.abort();
+        let timeline = watcher.stop().await;
 
         let exited = match ended {
             Ended::Terminal(reason) => {
@@ -686,7 +700,9 @@ impl Agent {
                 }
                 running.drain_output(self.options.stop_grace).await;
                 log.close().await;
-                return stopped(reason, &run_id, beats);
+                let finished = stopped(reason, &run_id, beats);
+                mark_failure(&timeline, finished.completion.as_ref()).await;
+                return finished;
             }
             Ended::Exited(exited) => exited,
         };
@@ -704,6 +720,7 @@ impl Agent {
             exited,
             pull_request,
             &self.options.pr_tools,
+            &timeline,
         ));
         let settled = loop {
             let interrupt = tokio::select! {
@@ -732,9 +749,35 @@ impl Agent {
             Settled::Interrupted(reason) => {
                 drop(finishing);
                 log.close().await;
-                stopped(reason, &run_id, beats)
+                let finished = stopped(reason, &run_id, beats);
+                mark_failure(&timeline, finished.completion.as_ref()).await;
+                finished
             }
         }
+    }
+
+    fn watch_plan(&self, spec: &JobSpec, run_id: &RunId) -> PlanWatcher {
+        let JobSpec {
+            ctx,
+            plan,
+            branch,
+            review: _,
+            local,
+            ralphex_bin: _,
+        } = spec;
+        let LocalOptions { worktree, env: _ } = local;
+        let client = Arc::clone(&self.client);
+        let sender: Arc<dyn ProgressSender> = client;
+        let timings = WatchTimings {
+            debounce: self.options.plan_debounce,
+            attach_retry: self.options.plan_attach_retry,
+        };
+        PlanWatcher::start(
+            sender,
+            run_id.clone(),
+            expected_plan(ctx, plan, branch, *worktree),
+            timings,
+        )
     }
 
     fn hold(&self, state: RunSlot) {
@@ -1052,9 +1095,22 @@ async fn finish(
     exited: Result<ExitStatus, JobError>,
     pull_request: PullRequest,
     tools: &PrTools,
+    timeline: &StoppedWatcher,
 ) -> CompleteRequest {
     running.drain_output(stop_grace).await;
     log.close().await;
+    let completion = settle(log, exited, pull_request, tools, timeline).await;
+    mark_failure(timeline, Some(&completion)).await;
+    completion
+}
+
+async fn settle(
+    log: &LogStream,
+    exited: Result<ExitStatus, JobError>,
+    pull_request: PullRequest,
+    tools: &PrTools,
+    timeline: &StoppedWatcher,
+) -> CompleteRequest {
     let status = match exited {
         Err(error) => return failed(error.fail_reason(), error.to_string(), String::new()),
         Ok(status) => status,
@@ -1068,11 +1124,31 @@ async fn finish(
         false => failed("nonzero_exit", exit_message(status), log.tail()),
         true => match create_pr {
             CreatePr::No => done(String::new()),
-            CreatePr::Yes => match open_pull_request(&ctx, &spec, tools).await {
-                Ok(PrUrl(url)) => done(url),
-                Err(error) => failed(error.fail_reason(), error.to_string(), String::new()),
-            },
+            CreatePr::Yes => {
+                timeline.post_phase(Phase::Pr).await;
+                match open_pull_request(&ctx, &spec, tools).await {
+                    Ok(PrUrl(url)) => done(url),
+                    Err(error) => failed(error.fail_reason(), error.to_string(), String::new()),
+                }
+            }
         },
+    }
+}
+
+async fn mark_failure(timeline: &StoppedWatcher, completion: Option<&CompleteRequest>) {
+    let Some(CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason: _,
+        message: _,
+        log_tail: _,
+    }) = completion
+    else {
+        return;
+    };
+    match status {
+        CompleteStatus::Error => timeline.post_failure().await,
+        CompleteStatus::Done => {}
     }
 }
 
@@ -1334,12 +1410,16 @@ mod tests {
             claim_retry_delay,
             ticker: _,
             pr_tools,
+            plan_debounce,
+            plan_attach_retry,
         } = AgentOptions::default();
         assert_eq!(heartbeat_interval, HEARTBEAT_INTERVAL);
         assert_eq!(drain_timeout, crate::config::DEFAULT_DRAIN_TIMEOUT);
         assert_eq!(stop_grace, STOP_GRACE);
         assert_eq!(claim_retry_delay, RETRY_BASE_DELAY);
         assert_eq!(pr_tools, PrTools::default());
+        assert_eq!(plan_debounce, Duration::from_millis(300));
+        assert_eq!(plan_attach_retry, Duration::from_secs(2));
     }
 
     #[test]

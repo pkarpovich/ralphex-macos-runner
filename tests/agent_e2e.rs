@@ -9,20 +9,33 @@ use std::time::{Duration, Instant};
 use ralphex_macos_runner::agent::{Agent, AgentExit, AgentOptions, LocalStart, RunSlot, Shutdown};
 use ralphex_macos_runner::config::Config;
 use ralphex_macos_runner::ipc::RunRequest;
-use ralphex_macos_runner::job::Worktree;
+use ralphex_macos_runner::job::{LocalOptions, Worktree};
 use ralphex_macos_runner::protocol::client::FarmClient;
 use ralphex_macos_runner::protocol::types::{
-    Branch, CompleteRequest, CompleteStatus, CreatePr, HeartbeatAction, Job, RunId, RunnerName,
+    Branch, CompleteRequest, CompleteStatus, CreatePr, HeartbeatAction, Job, Phase,
+    ProgressRequest, ProgressTask, RunId, RunnerName,
 };
 use support::fake_farm::{FakeFarm, Reply};
 use support::{
-    Checkout, Record, TestSleeper, completion, dead, invocations, options, spawned, ticket_job,
-    wait_for,
+    Checkout, Record, TestSleeper, completion, dead, invocations, options, snapshots, spawned,
+    ticket_job, wait_for,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 const MISMATCH: &str = r#"{"error":"the runner speaks 1, the farm speaks 2"}"#;
+
+const TIMELINE_PLAN: &str = "# Wire the timeline
+
+### Task 1: Add it
+- [ ] write it
+- [ ] test it
+
+### Task 2: Ship it
+- [ ] ship it
+";
+
+const MARKERS: &str = "--- task iteration 1 ---\n--- claude review 0: all findings ---";
 
 async fn farm_with(job: Job) -> FakeFarm {
     let farm = FakeFarm::start().await;
@@ -91,6 +104,76 @@ fn last_index(farm: &FakeFarm, suffix: &str) -> Option<usize> {
         }
     }
     last
+}
+
+fn ticked(snapshot: &ProgressRequest) -> bool {
+    let ProgressRequest {
+        phase: _,
+        failed: _,
+        tasks,
+    } = snapshot;
+    let Some(tasks) = tasks else {
+        return false;
+    };
+    if tasks.is_empty() {
+        return false;
+    }
+    for ProgressTask {
+        number: _,
+        ord: _,
+        title: _,
+        status: _,
+        checkboxes,
+    } in tasks
+    {
+        for checkbox in checkboxes {
+            if !checkbox.checked {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn first_in_phase(snapshots: &[ProgressRequest], wanted: Phase) -> Option<usize> {
+    for (index, snapshot) in snapshots.iter().enumerate() {
+        if snapshot.phase == wanted {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn any_ticked(snapshots: &[ProgressRequest]) -> bool {
+    for snapshot in snapshots {
+        if ticked(snapshot) {
+            return true;
+        }
+    }
+    false
+}
+
+async fn release_after(farm: &FakeFarm, release: &Path, seen: impl Fn(&[ProgressRequest]) -> bool) {
+    let posted = wait_for(|| {
+        let posted = snapshots(farm);
+        match seen(&posted) {
+            true => Some(()),
+            false => None,
+        }
+    })
+    .await;
+    assert!(posted.is_some(), "{:?}", snapshots(farm));
+    std::fs::write(release, "").unwrap();
+}
+
+fn failures(snapshots: &[ProgressRequest]) -> usize {
+    let mut failures = 0;
+    for snapshot in snapshots {
+        if snapshot.failed {
+            failures += 1;
+        }
+    }
+    failures
 }
 
 #[tokio::test]
@@ -1267,4 +1350,264 @@ async fn every_call_carries_the_bearer_token_and_the_runner_name() {
     let beats = farm.requests_ending("/heartbeat");
     assert!(beats[0].text().contains(r#""runner":"mbp-native""#));
     assert!(beats[0].text().contains(r#""runtime":"native""#));
+}
+
+#[tokio::test]
+async fn a_finished_run_posts_its_timeline_and_the_pr_phase_last_before_the_push() {
+    let checkout = Checkout::new();
+    checkout.write_plan(TIMELINE_PLAN);
+    let release = checkout.dir().join("release").display().to_string();
+    let ralphex = checkout.ralphex(&[
+        ("FAKE_RALPHEX_MARKERS", MARKERS),
+        ("FAKE_RALPHEX_TICK", "1"),
+        ("FAKE_RALPHEX_COMPLETE", "1"),
+        ("FAKE_RALPHEX_WAIT_FOR", &release),
+    ]);
+    let farm = farm_with(ticket_job(
+        &checkout.path(),
+        &checkout.plan(),
+        CreatePr::Yes,
+    ))
+    .await;
+    let mut options = options(checkout.tools());
+    options
+        .pr_tools
+        .env
+        .push(("FAKE_DELAY".to_string(), "0.3".to_string()));
+    let _running = start(agent(&farm, config(&farm, &ralphex), options));
+    release_after(&farm, Path::new(&release), |posted| {
+        first_in_phase(posted, Phase::Review).is_some() && any_ticked(posted)
+    })
+    .await;
+
+    let pushing = wait_for(|| {
+        for run in invocations(checkout.tools()) {
+            if run.starts_with(&["push"]) {
+                return Some(snapshots(&farm));
+            }
+        }
+        None
+    })
+    .await;
+    let Some(before_push) = pushing else {
+        panic!("the branch was never pushed");
+    };
+    let Some(last) = before_push.last() else {
+        panic!("nothing was posted before the push");
+    };
+    assert_eq!(last.phase, Phase::Pr, "{before_push:?}");
+
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason: _,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+    assert_eq!(status, CompleteStatus::Done);
+
+    let posted = snapshots(&farm);
+    assert_eq!(
+        posted.len(),
+        before_push.len(),
+        "a snapshot followed the pr phase"
+    );
+    assert_eq!(posted[0].phase, Phase::Setup, "{posted:?}");
+    let tasks = first_in_phase(&posted, Phase::Tasks);
+    let review = first_in_phase(&posted, Phase::Review);
+    assert!(tasks.is_some(), "no tasks phase: {posted:?}");
+    assert!(review.is_some(), "no review phase: {posted:?}");
+    assert!(tasks < review, "{posted:?}");
+    assert!(
+        any_ticked(&posted[..posted.len() - 1]),
+        "the ticks were never posted: {posted:?}"
+    );
+    let Some(last) = posted.last() else {
+        panic!("nothing was posted");
+    };
+    assert_eq!(last.phase, Phase::Pr);
+    assert!(!last.failed);
+    assert!(
+        ticked(last),
+        "the pr snapshot lost the completed plan: {last:?}"
+    );
+    assert_eq!(failures(&posted), 0, "{posted:?}");
+    assert!(last_index(&farm, "/progress") < first_index(&farm, "/complete"));
+}
+
+#[tokio::test]
+async fn a_run_without_a_pull_request_posts_no_pr_phase() {
+    let checkout = Checkout::new();
+    checkout.write_plan(TIMELINE_PLAN);
+    let release = checkout.dir().join("release").display().to_string();
+    let ralphex = checkout.ralphex(&[
+        ("FAKE_RALPHEX_MARKERS", MARKERS),
+        ("FAKE_RALPHEX_TICK", "1"),
+        ("FAKE_RALPHEX_WAIT_FOR", &release),
+    ]);
+    let farm = farm_with(ticket_job(&checkout.path(), &checkout.plan(), CreatePr::No)).await;
+    let _running = start(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(checkout.tools()),
+    ));
+    release_after(&farm, Path::new(&release), |posted| {
+        first_in_phase(posted, Phase::Review).is_some() && any_ticked(posted)
+    })
+    .await;
+
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason: _,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Done);
+    let posted = snapshots(&farm);
+    assert_eq!(posted[0].phase, Phase::Setup, "{posted:?}");
+    assert!(
+        first_in_phase(&posted, Phase::Review).is_some(),
+        "{posted:?}"
+    );
+    assert_eq!(first_in_phase(&posted, Phase::Pr), None, "{posted:?}");
+    assert_eq!(failures(&posted), 0, "{posted:?}");
+}
+
+#[tokio::test]
+async fn a_worktree_run_posts_the_tasks_of_the_worktree_copy() {
+    let checkout = Checkout::new();
+    checkout.write_plan(TIMELINE_PLAN);
+    let release = checkout.dir().join("release").display().to_string();
+    let ralphex = checkout.ralphex(&[
+        ("FAKE_RALPHEX_TICK", "1"),
+        ("FAKE_RALPHEX_WAIT_FOR", &release),
+    ]);
+    let farm = FakeFarm::start().await;
+    let agent = agent(&farm, config(&farm, &ralphex), options(checkout.tools()));
+    let (_raise, shutdown) = watch::channel(Shutdown::Running);
+    let local = LocalOptions {
+        worktree: Worktree::Yes,
+        env: Vec::new(),
+    };
+    let job = ticket_job(&checkout.path(), &checkout.plan(), CreatePr::No);
+    let running = tokio::spawn(async move { agent.run_job(job, local, shutdown).await });
+
+    release_after(&farm, Path::new(&release), any_ticked).await;
+    running.await.unwrap();
+
+    let copy = checkout
+        .path()
+        .join(".ralphex/worktrees/x")
+        .join(checkout.plan().file_name().unwrap());
+    assert!(copy.is_file(), "the fake never wrote the worktree copy");
+    let original = std::fs::read_to_string(checkout.plan()).unwrap();
+    assert!(original.contains("- [ ]"), "{original}");
+}
+
+#[tokio::test]
+async fn a_nonzero_exit_posts_a_failed_snapshot_before_its_completion() {
+    let checkout = Checkout::new();
+    checkout.write_plan(TIMELINE_PLAN);
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_TICK", "1"), ("FAKE_RALPHEX_EXIT", "3")]);
+    let farm = farm_with(ticket_job(
+        &checkout.path(),
+        &checkout.plan(),
+        CreatePr::Yes,
+    ))
+    .await;
+    let _running = start(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(checkout.tools()),
+    ));
+
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Error);
+    assert_eq!(fail_reason, "nonzero_exit");
+    let posted = snapshots(&farm);
+    let Some(last) = posted.last() else {
+        panic!("nothing was posted");
+    };
+    assert!(last.failed, "{posted:?}");
+    assert!(
+        ticked(last),
+        "the failed snapshot did not re-read the plan: {last:?}"
+    );
+    assert_eq!(failures(&posted), 1, "{posted:?}");
+    assert_eq!(first_in_phase(&posted, Phase::Pr), None, "{posted:?}");
+    assert!(last_index(&farm, "/progress") < first_index(&farm, "/complete"));
+}
+
+#[tokio::test]
+async fn a_canceled_run_posts_a_failed_snapshot_before_its_completion() {
+    let checkout = Checkout::new();
+    checkout.write_plan(TIMELINE_PLAN);
+    let ralphex = checkout.ralphex(&[
+        ("FAKE_RALPHEX_MARKERS", "--- task iteration 1 ---"),
+        ("FAKE_RALPHEX_SLEEP", "120"),
+    ]);
+    let farm = farm_with(ticket_job(&checkout.path(), &checkout.plan(), CreatePr::No)).await;
+    let _running = start(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(checkout.tools()),
+    ));
+
+    spawned(checkout.record()).await;
+    let started = wait_for(|| first_in_phase(&snapshots(&farm), Phase::Tasks)).await;
+    assert!(started.is_some(), "the task iteration was never posted");
+    farm.push_heartbeat(Reply::Beat(HeartbeatAction::Cancel));
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Error);
+    assert_eq!(fail_reason, "canceled");
+    let posted = snapshots(&farm);
+    let Some(last) = posted.last() else {
+        panic!("nothing was posted");
+    };
+    assert!(last.failed, "{posted:?}");
+    assert_eq!(last.phase, Phase::Tasks, "{posted:?}");
+    assert_eq!(failures(&posted), 1, "{posted:?}");
+    assert!(last_index(&farm, "/progress") < first_index(&farm, "/complete"));
+}
+
+#[tokio::test]
+async fn a_run_refused_at_validation_posts_no_snapshot() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let absent = checkout.path().join("absent");
+    let farm = farm_with(ticket_job(&absent, &checkout.plan(), CreatePr::No)).await;
+    let _running = start(agent(
+        &farm,
+        config(&farm, &ralphex),
+        options(checkout.tools()),
+    ));
+
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Error);
+    assert_eq!(fail_reason, "ctx_invalid");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(snapshots(&farm).is_empty(), "{:?}", snapshots(&farm));
 }

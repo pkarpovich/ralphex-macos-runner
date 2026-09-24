@@ -500,8 +500,9 @@ impl PlanWatcher {
 
     /// Stops watching and posting, and returns what can still post the run's last snapshots.
     ///
-    /// A post in flight is abandoned, and the file-system watcher and its
-    /// thread end before this returns.
+    /// A post in flight is abandoned. The file-system watcher and its thread
+    /// end before this returns, unless an attempt to watch another directory is
+    /// in progress on the blocking pool: they then end as soon as it finishes.
     pub async fn stop(self) -> StoppedWatcher {
         let PlanWatcher {
             poster,
@@ -750,23 +751,44 @@ async fn follow_events(
                     Err(error) => tracing::debug!("the plan watcher reported: {error}"),
                 }
                 if detached {
-                    reattach(&mut watches, &tracker);
+                    let Some(attached) = reattach(watches, &tracker).await else {
+                        return;
+                    };
+                    watches = attached;
                 }
             }
             () = quiet(deadline) => {
                 deadline = None;
                 tracker.request();
             }
-            _ = retry.tick(), if detached => reattach(&mut watches, &tracker),
+            _ = retry.tick(), if detached => {
+                let Some(attached) = reattach(watches, &tracker).await else {
+                    return;
+                };
+                watches = attached;
+            }
         }
     }
 }
 
-fn reattach(watches: &mut Watches, tracker: &PhaseTracker) {
-    match watches.attach() {
+async fn reattach(watches: Watches, tracker: &PhaseTracker) -> Option<Watches> {
+    let attaching = tokio::task::spawn_blocking(move || {
+        let mut watches = watches;
+        let attached = watches.attach();
+        (watches, attached)
+    });
+    let (watches, attached) = match attaching.await {
+        Ok(attaching) => attaching,
+        Err(error) => {
+            tracing::warn!("the plan watcher stopped attaching directories: {error}");
+            return None;
+        }
+    };
+    match attached {
         Attachment::Attached => tracker.request(),
         Attachment::Detached => {}
     }
+    Some(watches)
 }
 
 #[cfg(test)]

@@ -73,6 +73,46 @@ if [ "$long" -gt 0 ]; then
   printf '\n'
 fi
 
+branch=""
+worktree=""
+plan=""
+previous=""
+for arg in "$@"; do
+  case "$previous" in
+    --branch) branch="$arg" ;;
+  esac
+  case "$arg" in
+    --worktree) worktree="yes" ;;
+  esac
+  previous="$arg"
+  plan="$arg"
+done
+
+if [ -n "${FAKE_RALPHEX_MARKERS:-}" ]; then
+  printf '%s\n' "$FAKE_RALPHEX_MARKERS" | while IFS= read -r marker; do
+    echo "$marker"
+    sleep 0.2
+  done
+fi
+
+if [ -n "${FAKE_RALPHEX_TICK:-}" ]; then
+  target="$plan"
+  if [ -n "$worktree" ]; then
+    relative="${plan#"$(pwd -P)"/}"
+    target="$(pwd -P)/.ralphex/worktrees/$branch/$relative"
+    mkdir -p "$(dirname "$target")"
+    cp "$plan" "$target"
+  fi
+  ticked="$(sed 's/\[ \]/[x]/' "$target")"
+  printf '%s\n' "$ticked" >"$target"
+fi
+
+if [ -n "${FAKE_RALPHEX_COMPLETE:-}" ]; then
+  completed="$(dirname "$plan")/completed"
+  mkdir -p "$completed"
+  mv "$plan" "$completed/"
+fi
+
 if [ -n "${FAKE_RALPHEX_HOLD:-}" ]; then
   sleep "$FAKE_RALPHEX_HOLD" &
 fi
@@ -105,6 +145,12 @@ fi
 
 if [ -n "$ignore_term" ]; then
   while :; do
+    sleep 0.05
+  done
+fi
+
+if [ -n "${FAKE_RALPHEX_WAIT_FOR:-}" ]; then
+  while [ ! -e "$FAKE_RALPHEX_WAIT_FOR" ]; do
     sleep 0.05
   done
 fi

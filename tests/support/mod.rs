@@ -24,7 +24,9 @@ use ralphex_macos_runner::agent::AgentOptions;
 use ralphex_macos_runner::logstream::Ticker;
 use ralphex_macos_runner::pr::PrTools;
 use ralphex_macos_runner::protocol::client::Sleeper;
-use ralphex_macos_runner::protocol::types::{Branch, CompleteRequest, CreatePr, Job, RunId};
+use ralphex_macos_runner::protocol::types::{
+    Branch, CompleteRequest, CreatePr, Job, ProgressRequest, RunId,
+};
 use tempfile::TempDir;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Mutex as AsyncMutex;
@@ -92,6 +94,15 @@ impl Checkout {
     #[must_use]
     pub fn plan(&self) -> PathBuf {
         self.plan.canonicalize().unwrap()
+    }
+
+    /// Replaces the plan's content with `content`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the plan cannot be written.
+    pub fn write_plan(&self, content: &str) {
+        std::fs::write(&self.plan, content).unwrap();
     }
 
     /// Returns the file the fake ralphex records its invocation to.
@@ -177,6 +188,8 @@ pub fn options(record: &Path) -> AgentOptions {
             env: vec![("FAKE_RECORD".to_string(), record.display().to_string())],
             step_timeout: Duration::from_secs(30),
         },
+        plan_debounce: Duration::from_millis(20),
+        plan_attach_retry: Duration::from_millis(50),
     }
 }
 
@@ -222,6 +235,20 @@ pub async fn completion(farm: &FakeFarm) -> CompleteRequest {
         panic!("no completion arrived");
     };
     serde_json::from_slice(&recorded.body).unwrap()
+}
+
+/// Returns every plan-progress snapshot the fake farm received, in order.
+///
+/// # Panics
+///
+/// Panics when a snapshot is not valid JSON.
+#[must_use]
+pub fn snapshots(farm: &FakeFarm) -> Vec<ProgressRequest> {
+    let mut snapshots = Vec::new();
+    for recorded in farm.requests_ending("/progress") {
+        snapshots.push(serde_json::from_slice(&recorded.body).unwrap());
+    }
+    snapshots
 }
 
 /// Returns whether the process `pid` still exists.
