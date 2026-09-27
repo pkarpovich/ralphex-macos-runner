@@ -15,7 +15,14 @@ fi
 key=""
 case "${1:-}" in
   push) key="push" ;;
-  symbolic-ref) key="symbolic-ref" ;;
+  symbolic-ref)
+    key="symbolic-ref"
+    for arg in "$@"; do
+      if [ "$arg" = "HEAD" ]; then
+        key="head"
+      fi
+    done
+    ;;
 esac
 
 for want in ${FAKE_FAIL:-}; do
@@ -31,6 +38,13 @@ fi
 
 case "$key" in
   symbolic-ref) echo "${FAKE_ORIGIN_HEAD-origin/main}" ;;
+  head)
+    if [ -z "${FAKE_HEAD:-}" ]; then
+      echo "fatal: ref HEAD is not a symbolic ref" >&2
+      exit 128
+    fi
+    echo "$FAKE_HEAD"
+    ;;
 esac
 
 exit 0

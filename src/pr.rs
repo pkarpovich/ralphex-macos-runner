@@ -222,6 +222,37 @@ impl PrError {
     }
 }
 
+/// Returns the branch the checkout at `ctx` has checked out, if it has one.
+///
+/// A run that works in the checkout itself commits to whatever branch ralphex
+/// left checked out, which is the branch to push. `None` means `HEAD` is
+/// detached or git could not answer within [`PrTools::step_timeout`], and the
+/// caller keeps the branch the run was opened with.
+pub async fn checked_out(ctx: &Path, tools: &PrTools) -> Option<Branch> {
+    let PrTools {
+        git,
+        gh: _,
+        env,
+        step_timeout,
+    } = tools;
+    let Ok(branch) = step(
+        ctx,
+        git,
+        &["symbolic-ref", "--short", "HEAD"],
+        env,
+        *step_timeout,
+    )
+    .await
+    else {
+        return None;
+    };
+    let branch = branch.trim();
+    match branch.is_empty() {
+        true => None,
+        false => Some(Branch(branch.to_string())),
+    }
+}
+
 /// Pushes the branch of a finished run and reports its pull request.
 ///
 /// A branch that already has an open pull request is pushed to update it and

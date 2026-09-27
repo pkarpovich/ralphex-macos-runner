@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand};
 use ralphex_macos_runner::ansi;
+use ralphex_macos_runner::branch;
 use ralphex_macos_runner::ipc::{self, IpcError, Response, RunRequest};
 use ralphex_macos_runner::job::Worktree;
 use ralphex_macos_runner::paths;
@@ -99,7 +100,9 @@ struct RunArgs {
     #[arg(value_name = "plan")]
     plan: Option<PathBuf>,
 
-    /// Branch ralphex works on; defaults to the plan file's stem.
+    /// Branch ralphex creates from the default branch; defaults to the plan
+    /// file's stem. Off the default branch the run works on the checked-out
+    /// branch, and naming a different one is refused.
     #[arg(long, value_name = "name")]
     branch: Option<String>,
 
@@ -387,10 +390,6 @@ fn describe(run: RunArgs) -> Result<RunRequest, String> {
         Ok(plan) => plan,
         Err(error) => return Err(format!("{}: {error}", plan.display())),
     };
-    let branch = match branch {
-        Some(branch) => branch,
-        None => plan_stem(&plan),
-    };
     let create_pr = match no_pr {
         true => CreatePr::No,
         false => CreatePr::Yes,
@@ -398,6 +397,21 @@ fn describe(run: RunArgs) -> Result<RunRequest, String> {
     let worktree = match worktree {
         true => Worktree::Yes,
         false => Worktree::No,
+    };
+    let head = match branch::head(&ctx) {
+        Ok(head) => head,
+        Err(error) => return Err(error.to_string()),
+    };
+    let default = branch::default_branch(&ctx);
+    let branch = match branch::choose(
+        &head,
+        &default,
+        branch.as_deref(),
+        &plan_stem(&plan),
+        worktree,
+    ) {
+        Ok(branch) => branch,
+        Err(error) => return Err(error.to_string()),
     };
     let env = forwarded(std::env::vars_os());
     Ok(RunRequest {

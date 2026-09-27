@@ -239,7 +239,7 @@ impl std::fmt::Display for Uninstalled {
 ///
 /// assert_eq!(
 ///     service::exit_timeout(Duration::from_secs(120)),
-///     Duration::from_secs(30 + 10 + 120 + 10 + 10 + 30 + 600 + 10 + 10 + 10 + 180 + 30 + 30 + 10)
+///     Duration::from_secs(30 + 10 + 120 + 10 + 10 + 30 + 720 + 10 + 10 + 10 + 180 + 30 + 30 + 10)
 /// );
 /// ```
 #[must_use]
@@ -825,7 +825,7 @@ mod tests {
             Path::new("/logs"),
             exit_timeout(drain_timeout),
         );
-        assert!(plist.contains("<integer>1570</integer>"), "{plist}");
+        assert!(plist.contains("<integer>1690</integer>"), "{plist}");
     }
 
     #[test]

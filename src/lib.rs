@@ -12,6 +12,7 @@
 
 pub mod agent;
 pub mod ansi;
+pub mod branch;
 pub mod config;
 pub mod ipc;
 pub mod job;

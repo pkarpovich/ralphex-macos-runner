@@ -86,7 +86,7 @@ pub const VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
 pub const PR_STEP_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// The number of steps the longest pull-request sequence runs.
-pub const PR_STEPS: u64 = 5;
+pub const PR_STEPS: u64 = 6;
 
 /// The time the whole pull-request sequence may take.
 pub const PR_BUDGET: Duration = Duration::from_secs(PR_STEP_TIMEOUT.as_secs() * PR_STEPS);

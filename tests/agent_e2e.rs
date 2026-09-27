@@ -223,7 +223,7 @@ async fn opened_with(checkout: &Checkout, settings: &[(&str, &str)]) -> (String,
     assert_eq!(status, CompleteStatus::Done, "{fail_reason}");
     assert_eq!(pr_url, "https://github.com/owner/repo/pull/7");
     let runs = invocations(checkout.tools());
-    let created = &runs[3];
+    let created = &runs[4];
     assert!(created.starts_with(&["pr", "create"]), "{created:?}");
     (created.args[7].clone(), created.args[9].clone())
 }
@@ -1087,6 +1087,38 @@ async fn a_shutdown_that_lands_while_the_farm_mints_a_local_run_completes_it_uns
 }
 
 #[tokio::test]
+async fn a_run_pushes_the_branch_ralphex_left_checked_out() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = farm_with(ticket_job(
+        &checkout.path(),
+        &checkout.plan(),
+        CreatePr::Yes,
+    ))
+    .await;
+    let mut options = options(checkout.tools());
+    options
+        .pr_tools
+        .env
+        .push(("FAKE_HEAD".to_string(), "feat/heap-app".to_string()));
+    let _running = start(agent(&farm, config(&farm, &ralphex), options));
+
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message: _,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Done, "{fail_reason}");
+    let runs = invocations(checkout.tools());
+    assert!(runs[1].starts_with(&["pr", "list", "--head", "feat/heap-app"]));
+    assert!(runs[2].starts_with(&["push", "-u", "--", "origin", "feat/heap-app"]));
+    assert!(runs[4].starts_with(&["pr", "create", "--head", "feat/heap-app"]));
+}
+
+#[tokio::test]
 async fn a_finished_run_opens_a_pull_request() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
@@ -1114,12 +1146,13 @@ async fn a_finished_run_opens_a_pull_request() {
     assert!(fail_reason.is_empty());
     assert_eq!(pr_url, "https://github.com/owner/repo/pull/7");
     let runs = invocations(checkout.tools());
-    assert!(runs[0].starts_with(&["pr", "list", "--head", "x"]));
-    assert!(runs[1].starts_with(&["push", "-u", "--", "origin", "x"]));
-    assert!(runs[2].starts_with(&["symbolic-ref"]));
-    assert!(runs[3].starts_with(&["pr", "create", "--head", "x", "--base", "main"]));
+    assert!(runs[0].starts_with(&["symbolic-ref", "--short", "HEAD"]));
+    assert!(runs[1].starts_with(&["pr", "list", "--head", "x"]));
+    assert!(runs[2].starts_with(&["push", "-u", "--", "origin", "x"]));
+    assert!(runs[3].starts_with(&["symbolic-ref"]));
+    assert!(runs[4].starts_with(&["pr", "create", "--head", "x", "--base", "main"]));
     assert!(
-        runs[3]
+        runs[4]
             .args
             .contains(&"FARM-12: split farm and runner".to_string())
     );

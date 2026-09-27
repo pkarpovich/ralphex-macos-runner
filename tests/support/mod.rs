@@ -53,13 +53,21 @@ impl Checkout {
         let dir = tempfile::tempdir().unwrap();
         let plan = dir.path().join("plan.md");
         std::fs::write(&plan, "# plan\n").unwrap();
-        let status = std::process::Command::new("git")
-            .arg("init")
-            .arg("--quiet")
-            .current_dir(dir.path())
-            .status()
-            .unwrap();
-        assert!(status.success());
+        git_in(dir.path(), &["init", "--quiet", "--initial-branch", "main"]);
+        git_in(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--message",
+                "init",
+            ],
+        );
         let record = dir.path().join("ralphex-record");
         let tools = dir.path().join("tools-record");
         Checkout {
@@ -68,6 +76,15 @@ impl Checkout {
             record,
             tools,
         }
+    }
+
+    /// Creates `branch` from the current commit and checks it out.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `git checkout` fails.
+    pub fn switch_to(&self, branch: &str) {
+        git_in(self.dir.path(), &["checkout", "--quiet", "-b", branch]);
     }
 
     /// Returns the checkout's directory as the temporary root named it.
@@ -273,6 +290,15 @@ pub async fn gone_within(pid: i32, budget: Duration) -> bool {
 /// Waits for the process `pid` to be gone and returns whether it went.
 pub async fn dead(pid: i32) -> bool {
     gone_within(pid, Duration::from_secs(10)).await
+}
+
+fn git_in(dir: &Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
 }
 
 /// Removes from `command` what the test process would otherwise hand `rxd`: the
