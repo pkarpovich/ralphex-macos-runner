@@ -5,7 +5,9 @@ mod support;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use ralphex_macos_runner::pr::{PrError, PrSpec, PrTools, PrUrl, RunOrigin, open_pull_request};
+use ralphex_macos_runner::pr::{
+    PrError, PrSpec, PrTools, PrUrl, RunOrigin, checked_out, open_pull_request,
+};
 use ralphex_macos_runner::protocol::types::{Branch, RunId};
 use support::{Invocation, fake_gh, fake_git, invocations};
 use tempfile::TempDir;
@@ -444,4 +446,27 @@ async fn a_ticket_run_carries_its_ticket_into_the_title_and_the_body() {
         created.args[9].contains("[FARM-12](https://linear.app/example/issue/FARM-12) - plan:")
     );
     assert!(created.args[9].contains("Opened automatically by ralphex-farm."));
+}
+
+#[tokio::test]
+async fn the_checked_out_branch_is_read_from_head() {
+    let (dir, record) = checkout();
+    let mut tools = tools(&record);
+    with(&mut tools, "FAKE_HEAD", "feat/heap-app");
+
+    let branch = checked_out(dir.path(), &tools).await;
+
+    assert_eq!(branch, Some(Branch("feat/heap-app".to_string())));
+    let runs = invocations(&record);
+    assert!(runs[0].starts_with(&["symbolic-ref", "--short", "HEAD"]));
+}
+
+#[tokio::test]
+async fn a_detached_head_names_no_branch() {
+    let (dir, record) = checkout();
+    let tools = tools(&record);
+
+    let branch = checked_out(dir.path(), &tools).await;
+
+    assert_eq!(branch, None);
 }

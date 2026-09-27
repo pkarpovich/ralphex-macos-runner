@@ -33,10 +33,10 @@ use tokio::task::JoinHandle;
 
 use crate::config::Config;
 use crate::ipc::RunRequest;
-use crate::job::{self, JobError, JobSpec, LocalOptions, Review, RunningJob};
+use crate::job::{self, JobError, JobSpec, LocalOptions, Review, RunningJob, Worktree};
 use crate::logstream::{IntervalTicker, LogStream, Ticker};
 use crate::planfile::{self, Plan};
-use crate::pr::{PrSpec, PrTools, PrUrl, RunOrigin, open_pull_request};
+use crate::pr::{PrSpec, PrTools, PrUrl, RunOrigin, checked_out, open_pull_request};
 use crate::prdesc::{self, Description, OutputDir, PR_FILE_VAR};
 use crate::progress::{
     DEFAULT_ATTACH_RETRY, DEFAULT_DEBOUNCE, PlanWatcher, ProgressSender, StoppedWatcher,
@@ -308,6 +308,7 @@ enum Settled {
 struct PullRequest {
     ctx: PathBuf,
     branch: Branch,
+    worktree: Worktree,
     origin: RunOrigin,
     plan: String,
     run_id: RunId,
@@ -657,12 +658,13 @@ impl Agent {
             };
         }
 
+        let LocalOptions { worktree, env } = local;
         let spec = JobSpec {
             ctx: PathBuf::from(&ctx),
             plan: PathBuf::from(&plan_path),
             branch: branch.clone(),
             review: Review::from_mode(&mode),
-            local,
+            local: LocalOptions { worktree, env },
             ralphex_bin: self.config.ralphex_bin.clone(),
         };
         let top = match job::validate(&spec).await {
@@ -740,6 +742,7 @@ impl Agent {
         let pull_request = PullRequest {
             ctx: PathBuf::from(&ctx),
             branch,
+            worktree,
             origin: origin(identifier, issue_url, title),
             plan: plan_path,
             run_id: run_id.clone(),
@@ -1223,6 +1226,7 @@ async fn settle(
     let PullRequest {
         ctx,
         branch,
+        worktree,
         origin,
         plan,
         run_id,
@@ -1235,6 +1239,7 @@ async fn settle(
             CreatePr::No => done(String::new()),
             CreatePr::Yes => {
                 timeline.post_phase(Phase::Pr).await;
+                let branch = pushed_branch(&ctx, branch, worktree, &run_id, tools).await;
                 let written = written(&run_id, pr_file.as_deref());
                 let spec = PrSpec::describe(branch, &origin, &plan, &run_id, written);
                 match open_pull_request(&ctx, &spec, tools).await {
@@ -1244,6 +1249,30 @@ async fn settle(
             }
         },
     }
+}
+
+async fn pushed_branch(
+    ctx: &Path,
+    opened: Branch,
+    worktree: Worktree,
+    run_id: &RunId,
+    tools: &PrTools,
+) -> Branch {
+    match worktree {
+        Worktree::Yes => return opened,
+        Worktree::No => {}
+    }
+    let Some(actual) = checked_out(ctx, tools).await else {
+        return opened;
+    };
+    if actual != opened {
+        let Branch(actual_name) = &actual;
+        let Branch(opened_name) = &opened;
+        tracing::warn!(
+            "run {run_id} was opened on {opened_name} but ralphex left {actual_name} checked out; pushing {actual_name}"
+        );
+    }
+    actual
 }
 
 fn written(run_id: &RunId, pr_file: Option<&Path>) -> Option<Description> {

@@ -56,7 +56,8 @@ rxd install [--force]
 rxd uninstall
 ```
 
-- The checkout is the current directory, the plan is made absolute against it, and the branch defaults to the plan file's stem. A pull request is opened unless `--no-pr`.
+- The checkout is the current directory and the plan is made absolute against it. A pull request is opened unless `--no-pr`.
+- The branch follows ralphex. On the default branch, ralphex creates the branch it is given: `--branch`, or the plan file's stem without it. On any other branch ralphex keeps working where it is, so the run uses the checked-out branch, and `--branch` naming a different one is refused before the run opens instead of failing at the push hours later. A detached `HEAD` is refused, and so is `--worktree` off the default branch, which ralphex refuses too. After the run the daemon pushes the branch the checkout has checked out.
 - `--worktree` is passed straight to ralphex, which then works in a git worktree of the checkout instead of the checkout itself. A claimed job never gets it.
 - `rxd` prints `run <run_id>` and the dashboard URL before the first output line, so you can leave immediately.
 - Ctrl-C prints `detached; the run continues` and exits 0. Before the run id has arrived it says so instead and still exits 0 - the daemon may go on to start the run, which `rxd attach` then reaches. `rxd attach` reconnects, replays what has already been printed and then follows live; several terminals may attach at once.

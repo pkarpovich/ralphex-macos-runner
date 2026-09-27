@@ -490,10 +490,10 @@ async fn a_local_run_that_asks_for_one_opens_a_pull_request() {
     let opened = farm.requests_ending("/runs");
     assert!(opened[0].text().contains(r#""create_pr":true"#));
     let runs = invocations(checkout.tools());
-    assert!(runs[0].starts_with(&["pr", "list", "--head", "plan"]));
-    assert!(runs[1].starts_with(&["push", "-u", "--", "origin", "plan"]));
-    assert!(runs[3].starts_with(&["pr", "create", "--head", "plan", "--base", "main"]));
-    assert!(runs[3].args.contains(&"plan".to_string()));
+    assert!(runs[1].starts_with(&["pr", "list", "--head", "plan"]));
+    assert!(runs[2].starts_with(&["push", "-u", "--", "origin", "plan"]));
+    assert!(runs[4].starts_with(&["pr", "create", "--head", "plan", "--base", "main"]));
+    assert!(runs[4].args.contains(&"plan".to_string()));
     let CompleteRequest {
         status,
         pr_url,
@@ -525,6 +525,52 @@ async fn a_branch_the_client_names_reaches_the_farm() {
     assert!(output.status.success(), "{}", text(&output));
     let opened = farm.requests_ending("/runs");
     assert!(opened[0].text().contains(r#""branch":"other""#));
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_checkout_on_its_own_branch_runs_on_that_branch() {
+    let checkout = Checkout::new();
+    checkout.switch_to("feat/heap-app");
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(local_job(&checkout, "local-own"))));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let output = client.wait_with_output().await.unwrap();
+
+    assert!(output.status.success(), "{}", text(&output));
+    let opened = farm.requests_ending("/runs");
+    assert!(
+        opened[0].text().contains(r#""branch":"feat/heap-app""#),
+        "{}",
+        opened[0].text()
+    );
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_branch_ralphex_would_ignore_is_refused_before_a_run_opens() {
+    let checkout = Checkout::new();
+    checkout.switch_to("feat/heap-app");
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = FakeFarm::start().await;
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(
+        &daemon.socket,
+        &checkout,
+        &["plan.md", "--no-pr", "--branch", "other"],
+        &[],
+    );
+    let output = client.wait_with_output().await.unwrap();
+
+    assert!(!output.status.success());
+    let said = text(&output);
+    assert!(said.contains("the checkout is on feat/heap-app"), "{said}");
+    assert!(said.contains("--branch other"), "{said}");
+    assert!(farm.requests_ending("/runs").is_empty());
     drop(daemon.raise);
 }
 
