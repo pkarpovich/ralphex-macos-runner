@@ -53,9 +53,54 @@ pub enum BranchError {
         /// The checkout's default branch.
         default: String,
     },
+    /// The branch a pull request would target does not exist on `origin`.
+    #[error(
+        "the base branch {base} is not on origin, so no pull request could be opened into it; push it first (git push -u origin {base}) and run again"
+    )]
+    BaseMissing {
+        /// The checkout's default branch, the pull request's base.
+        base: String,
+    },
     /// The checkout could not be inspected.
     #[error("{0}")]
     Git(String),
+}
+
+/// Checks that `origin` of the checkout at `ctx` has the branch `base`.
+///
+/// A pull request is opened into the checkout's default branch; when that
+/// branch was never pushed, the feature branch the run pushes becomes the
+/// repository's only branch, GitHub makes it the default, and the pull request
+/// into itself fails after the whole run. `base` may be given as `origin/<name>`.
+///
+/// # Errors
+///
+/// Returns [`BranchError::BaseMissing`] when `origin` has no such branch and
+/// [`BranchError::Git`] when `origin` cannot be asked.
+pub fn require_remote_base(ctx: &Path, base: &str) -> Result<(), BranchError> {
+    let base = match base.strip_prefix("origin/") {
+        Some(base) => base,
+        None => base,
+    };
+    let reference = format!("refs/heads/{base}");
+    let Output {
+        status,
+        stdout,
+        stderr,
+    } = git(ctx, &["ls-remote", "--heads", "origin", &reference])?;
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
+        return Err(BranchError::Git(format!(
+            "origin could not be asked for {base}: {}",
+            stderr.trim()
+        )));
+    }
+    match String::from_utf8_lossy(&stdout).trim().is_empty() {
+        true => Err(BranchError::BaseMissing {
+            base: base.to_string(),
+        }),
+        false => Ok(()),
+    }
 }
 
 /// Returns the branch a run of `plan_stem` works on, given where the checkout is.
@@ -213,8 +258,92 @@ fn git(ctx: &Path, args: &[&str]) -> Result<Output, BranchError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BranchError, Head, choose};
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::{BranchError, Head, choose, require_remote_base};
     use crate::job::Worktree;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn pushed_checkout() -> (tempfile::TempDir, tempfile::TempDir) {
+        let origin = tempfile::tempdir().unwrap();
+        git(origin.path(), &["init", "--quiet", "--bare"]);
+        let checkout = tempfile::tempdir().unwrap();
+        git(
+            checkout.path(),
+            &["init", "--quiet", "--initial-branch", "main"],
+        );
+        git(
+            checkout.path(),
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "--quiet",
+                "--allow-empty",
+                "--message",
+                "init",
+            ],
+        );
+        let origin_path = origin.path().display().to_string();
+        git(checkout.path(), &["remote", "add", "origin", &origin_path]);
+        git(checkout.path(), &["push", "--quiet", "origin", "main"]);
+        (checkout, origin)
+    }
+
+    #[test]
+    fn a_base_origin_has_is_accepted_bare_or_as_a_remote_name() {
+        let (checkout, _origin) = pushed_checkout();
+
+        assert_eq!(require_remote_base(checkout.path(), "main"), Ok(()));
+        assert_eq!(require_remote_base(checkout.path(), "origin/main"), Ok(()));
+    }
+
+    #[test]
+    fn a_base_origin_lacks_is_refused() {
+        let (checkout, _origin) = pushed_checkout();
+
+        assert_eq!(
+            require_remote_base(checkout.path(), "master"),
+            Err(BranchError::BaseMissing {
+                base: "master".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn a_checkout_without_an_origin_is_a_git_error() {
+        let (checkout, _origin) = pushed_checkout();
+        git(checkout.path(), &["remote", "remove", "origin"]);
+
+        let refused = require_remote_base(checkout.path(), "main");
+
+        assert!(
+            matches_git_error(&refused),
+            "expected a git error, got {refused:?}"
+        );
+    }
+
+    fn matches_git_error(result: &Result<(), BranchError>) -> bool {
+        match result {
+            Err(BranchError::Git(_)) => true,
+            Ok(())
+            | Err(BranchError::Detached)
+            | Err(BranchError::WorktreeOffDefault { .. })
+            | Err(BranchError::Ignored { .. })
+            | Err(BranchError::BaseMissing { .. }) => false,
+        }
+    }
 
     fn on(branch: &str) -> Head {
         Head::Branch(branch.to_string())

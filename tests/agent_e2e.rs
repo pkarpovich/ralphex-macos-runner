@@ -1393,7 +1393,46 @@ async fn a_pull_request_that_fails_completes_as_a_creation_failure() {
     assert_eq!(status, CompleteStatus::Error);
     assert_eq!(fail_reason, "pr_create");
     assert!(message.contains("gh pr create"), "{message}");
+    assert!(!message.contains("kept at"), "{message}");
     assert_pr_then_failed(&farm);
+}
+
+#[tokio::test]
+async fn a_failed_pull_request_keeps_the_description_finalize_wrote() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_PR_DESCRIPTION", "# Title\n\nBody")]);
+    let farm = farm_with(ticket_job(
+        &checkout.path(),
+        &checkout.plan(),
+        CreatePr::Yes,
+    ))
+    .await;
+    let mut options = options(checkout.tools());
+    options
+        .pr_tools
+        .env
+        .push(("FAKE_FAIL".to_string(), "create".to_string()));
+    let _running = start(agent(&farm, config(&farm, &ralphex), options));
+
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message,
+        log_tail: _,
+    } = completion(&farm).await;
+
+    assert_eq!(status, CompleteStatus::Error);
+    assert_eq!(fail_reason, "pr_create");
+    let kept = output_dir(&checkout, "FARM-12-1753180800000").join("pr.md");
+    assert!(
+        message.contains(&format!(
+            "the description finalize wrote is kept at {}",
+            kept.display()
+        )),
+        "{message}"
+    );
+    assert_eq!(std::fs::read_to_string(&kept).unwrap(), "# Title\n\nBody\n");
 }
 
 #[tokio::test]

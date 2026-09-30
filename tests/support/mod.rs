@@ -37,6 +37,7 @@ use fake_farm::FakeFarm;
 /// A git checkout with a plan in it and the paths the fakes record to.
 pub struct Checkout {
     dir: TempDir,
+    origin: TempDir,
     plan: PathBuf,
     record: PathBuf,
     tools: PathBuf,
@@ -68,14 +69,37 @@ impl Checkout {
                 "init",
             ],
         );
+        let origin = tempfile::tempdir().unwrap();
+        git_in(origin.path(), &["init", "--quiet", "--bare"]);
+        let origin_path = origin.path().display().to_string();
+        git_in(dir.path(), &["remote", "add", "origin", &origin_path]);
+        git_in(dir.path(), &["push", "--quiet", "origin", "main"]);
         let record = dir.path().join("ralphex-record");
         let tools = dir.path().join("tools-record");
         Checkout {
             dir,
+            origin,
             plan,
             record,
             tools,
         }
+    }
+
+    /// Deletes the default branch from the checkout's bare `origin`, the state
+    /// of a repository whose default branch was never pushed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `git push --delete` fails.
+    pub fn unpush_default_branch(&self) {
+        git_in(
+            self.origin.path(),
+            &["symbolic-ref", "HEAD", "refs/heads/unborn"],
+        );
+        git_in(
+            self.dir.path(),
+            &["push", "--quiet", "origin", "--delete", "main"],
+        );
     }
 
     /// Creates `branch` from the current commit and checks it out.

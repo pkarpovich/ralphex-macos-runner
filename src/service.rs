@@ -477,6 +477,7 @@ async fn attached(socket: &Path) -> Daemon {
             status: _,
             pr_url: _,
             fail_reason: _,
+            message: _,
         } => Daemon::Unclear {
             message: "a run that had just ended".to_string(),
         },

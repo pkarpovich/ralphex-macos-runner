@@ -245,7 +245,49 @@ async fn a_failed_local_run_ends_the_client_with_a_failure() {
 
     let printed = text(&output);
     assert!(!output.status.success(), "{printed}");
-    assert!(printed.contains("nonzero_exit"), "{printed}");
+    assert!(
+        printed.contains("the run failed: nonzero_exit: ralphex exited with code 3"),
+        "{printed}"
+    );
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_pull_request_run_into_a_base_origin_lacks_is_refused_before_a_run_opens() {
+    let checkout = Checkout::new();
+    checkout.unpush_default_branch();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = FakeFarm::start().await;
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md"], &[]);
+    let output = client.wait_with_output().await.unwrap();
+
+    assert!(!output.status.success());
+    let said = text(&output);
+    assert!(
+        said.contains("the base branch main is not on origin"),
+        "{said}"
+    );
+    assert!(said.contains("git push -u origin main"), "{said}");
+    assert!(farm.requests_ending("/runs").is_empty());
+    assert!(!checkout.record().exists(), "ralphex was started");
+    drop(daemon.raise);
+}
+
+#[tokio::test]
+async fn a_run_without_a_pull_request_does_not_need_the_base_on_origin() {
+    let checkout = Checkout::new();
+    checkout.unpush_default_branch();
+    let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
+    let farm = FakeFarm::start().await;
+    farm.push_runs(Reply::Job(Box::new(local_job(&checkout, "local-nobase"))));
+    let daemon = daemon(&farm, &checkout, &ralphex, Claiming::No).await;
+
+    let client = rxd(&daemon.socket, &checkout, &["plan.md", "--no-pr"], &[]);
+    let output = client.wait_with_output().await.unwrap();
+
+    assert!(output.status.success(), "{}", text(&output));
     drop(daemon.raise);
 }
 

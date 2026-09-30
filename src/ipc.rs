@@ -105,6 +105,9 @@ pub enum Response {
         pr_url: String,
         /// The machine-readable reason a failed run failed.
         fail_reason: String,
+        /// What went wrong, in words, empty for a run that succeeded.
+        #[serde(default)]
+        message: String,
     },
     /// Another run holds the daemon's only slot.
     Busy {
@@ -476,7 +479,7 @@ async fn follow(stream: &mut UnixStream, current: &CurrentRun) -> Result<(), Ipc
                 status,
                 pr_url,
                 fail_reason,
-                message: _,
+                message,
                 log_tail: _,
             } = completion;
             send(
@@ -485,6 +488,7 @@ async fn follow(stream: &mut UnixStream, current: &CurrentRun) -> Result<(), Ipc
                     status,
                     pr_url,
                     fail_reason,
+                    message,
                 },
             )
             .await
@@ -527,6 +531,36 @@ fn skipped(missed: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ended_run_carries_its_message() {
+        let ended = Response::Ended {
+            status: CompleteStatus::Error,
+            pr_url: String::new(),
+            fail_reason: "pr_create".to_string(),
+            message: "gh pr create exited with 1".to_string(),
+        };
+        let encoded = serde_json::to_string(&ended).unwrap();
+        let decoded: Response = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, ended);
+    }
+
+    #[test]
+    fn an_ended_run_from_an_older_daemon_decodes_without_a_message() {
+        let older = r#"{"Ended":{"status":"error","pr_url":"","fail_reason":"pr_create"}}"#;
+
+        let decoded: Response = serde_json::from_str(older).unwrap();
+
+        assert_eq!(
+            decoded,
+            Response::Ended {
+                status: CompleteStatus::Error,
+                pr_url: String::new(),
+                fail_reason: "pr_create".to_string(),
+                message: String::new(),
+            }
+        );
+    }
 
     fn socket_of_length(root: &Path, length: usize) -> PathBuf {
         let name = "daemon.sock";
