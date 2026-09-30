@@ -286,7 +286,8 @@ fn show(response: Response, palette: Palette) -> Option<ExitCode> {
             status,
             pr_url,
             fail_reason,
-        } => Some(report(status, &pr_url, &fail_reason)),
+            message,
+        } => Some(report(status, &pr_url, &fail_reason, &message)),
         Response::Busy { run_id } => {
             eprintln!("rxd: the daemon is running {run_id}");
             Some(ExitCode::FAILURE)
@@ -332,7 +333,7 @@ async fn follow(
     }
 }
 
-fn report(status: CompleteStatus, pr_url: &str, fail_reason: &str) -> ExitCode {
+fn report(status: CompleteStatus, pr_url: &str, fail_reason: &str, message: &str) -> ExitCode {
     if !pr_url.is_empty() {
         println!("{pr_url}");
     }
@@ -342,7 +343,10 @@ fn report(status: CompleteStatus, pr_url: &str, fail_reason: &str) -> ExitCode {
             ExitCode::SUCCESS
         }
         CompleteStatus::Error => {
-            eprintln!("rxd: the run failed: {fail_reason}");
+            match message.is_empty() {
+                true => eprintln!("rxd: the run failed: {fail_reason}"),
+                false => eprintln!("rxd: the run failed: {fail_reason}: {message}"),
+            }
             ExitCode::FAILURE
         }
     }
@@ -413,6 +417,14 @@ fn describe(run: RunArgs) -> Result<RunRequest, String> {
         Ok(branch) => branch,
         Err(error) => return Err(error.to_string()),
     };
+    match create_pr {
+        CreatePr::Yes => {
+            if let Err(error) = branch::require_remote_base(&ctx, &default) {
+                return Err(error.to_string());
+            }
+        }
+        CreatePr::No => {}
+    }
     let env = forwarded(std::env::vars_os());
     Ok(RunRequest {
         ctx: ctx.display().to_string(),

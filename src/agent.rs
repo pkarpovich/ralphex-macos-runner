@@ -36,7 +36,7 @@ use crate::ipc::RunRequest;
 use crate::job::{self, JobError, JobSpec, LocalOptions, Review, RunningJob, Worktree};
 use crate::logstream::{IntervalTicker, LogStream, Ticker};
 use crate::planfile::{self, Plan};
-use crate::pr::{PrSpec, PrTools, PrUrl, RunOrigin, checked_out, open_pull_request};
+use crate::pr::{PrError, PrSpec, PrTools, PrUrl, RunOrigin, checked_out, open_pull_request};
 use crate::prdesc::{self, Description, OutputDir, PR_FILE_VAR};
 use crate::progress::{
     DEFAULT_ATTACH_RETRY, DEFAULT_DEBOUNCE, PlanWatcher, ProgressSender, StoppedWatcher,
@@ -301,8 +301,18 @@ enum Ended {
 }
 
 enum Settled {
-    Finished(CompleteRequest),
+    Finished(Closed),
     Interrupted(Terminal),
+}
+
+struct Closed {
+    completion: CompleteRequest,
+    output: OutputFate,
+}
+
+enum OutputFate {
+    Remove,
+    Keep,
 }
 
 struct PullRequest {
@@ -777,11 +787,17 @@ impl Agent {
             }
         };
         match settled {
-            Settled::Finished(completion) => Finished {
+            Settled::Finished(Closed {
+                completion,
+                output: fate,
+            }) => Finished {
                 completion: Some(completion),
                 outcome: RunOutcome::Continue,
                 beats: Some(beats),
-                output,
+                output: match fate {
+                    OutputFate::Remove => output,
+                    OutputFate::Keep => None,
+                },
             },
             Settled::Interrupted(reason) => {
                 drop(finishing);
@@ -890,6 +906,7 @@ impl Agent {
     }
 
     async fn report(&self, run_id: &RunId, completion: CompleteRequest) -> RunEnd {
+        log_failure(run_id, &completion);
         let Err(error) = self.client.complete(run_id, &completion).await else {
             return RunEnd::Reported(completion);
         };
@@ -1087,6 +1104,22 @@ fn origin(identifier: String, issue_url: String, title: String) -> RunOrigin {
     }
 }
 
+fn log_failure(run_id: &RunId, completion: &CompleteRequest) {
+    let CompleteRequest {
+        status,
+        pr_url: _,
+        fail_reason,
+        message,
+        log_tail: _,
+    } = completion;
+    match status {
+        CompleteStatus::Done => {}
+        CompleteStatus::Error => {
+            tracing::warn!("run {run_id} failed: {fail_reason}: {message}");
+        }
+    }
+}
+
 fn exit_message(status: ExitStatus) -> String {
     let Some(code) = status.code() else {
         return "ralphex was killed by a signal".to_string();
@@ -1204,12 +1237,23 @@ async fn finish(
     pull_request: PullRequest,
     tools: &PrTools,
     timeline: &StoppedWatcher,
-) -> CompleteRequest {
+) -> Closed {
     running.drain_output(stop_grace).await;
     log.close().await;
-    let completion = settle(log, exited, pull_request, tools, timeline).await;
-    mark_failure(timeline, Some(&completion)).await;
-    completion
+    let closed = settle(log, exited, pull_request, tools, timeline).await;
+    let Closed {
+        completion,
+        output: _,
+    } = &closed;
+    mark_failure(timeline, Some(completion)).await;
+    closed
+}
+
+fn removed(completion: CompleteRequest) -> Closed {
+    Closed {
+        completion,
+        output: OutputFate::Remove,
+    }
 }
 
 async fn settle(
@@ -1218,9 +1262,15 @@ async fn settle(
     pull_request: PullRequest,
     tools: &PrTools,
     timeline: &StoppedWatcher,
-) -> CompleteRequest {
+) -> Closed {
     let status = match exited {
-        Err(error) => return failed(error.fail_reason(), error.to_string(), String::new()),
+        Err(error) => {
+            return removed(failed(
+                error.fail_reason(),
+                error.to_string(),
+                String::new(),
+            ));
+        }
         Ok(status) => status,
     };
     let PullRequest {
@@ -1234,17 +1284,21 @@ async fn settle(
         create_pr,
     } = pull_request;
     match status.success() {
-        false => failed("nonzero_exit", exit_message(status), log.tail()),
+        false => removed(failed("nonzero_exit", exit_message(status), log.tail())),
         true => match create_pr {
-            CreatePr::No => done(String::new()),
+            CreatePr::No => removed(done(String::new())),
             CreatePr::Yes => {
                 timeline.post_phase(Phase::Pr).await;
                 let branch = pushed_branch(&ctx, branch, worktree, &run_id, tools).await;
                 let written = written(&run_id, pr_file.as_deref());
+                let kept = match (&written, &pr_file) {
+                    (Some(_description), Some(pr_file)) => Some(pr_file.clone()),
+                    (Some(_), None) | (None, Some(_)) | (None, None) => None,
+                };
                 let spec = PrSpec::describe(branch, &origin, &plan, &run_id, written);
                 match open_pull_request(&ctx, &spec, tools).await {
-                    Ok(PrUrl(url)) => done(url),
-                    Err(error) => failed(error.fail_reason(), error.to_string(), String::new()),
+                    Ok(PrUrl(url)) => removed(done(url)),
+                    Err(error) => pull_request_failed(&error, kept),
                 }
             }
         },
@@ -1273,6 +1327,27 @@ async fn pushed_branch(
         );
     }
     actual
+}
+
+fn pull_request_failed(error: &PrError, kept: Option<PathBuf>) -> Closed {
+    let Some(kept) = kept else {
+        return removed(failed(
+            error.fail_reason(),
+            error.to_string(),
+            String::new(),
+        ));
+    };
+    Closed {
+        completion: failed(
+            error.fail_reason(),
+            format!(
+                "{error}; the description finalize wrote is kept at {}",
+                kept.display()
+            ),
+            String::new(),
+        ),
+        output: OutputFate::Keep,
+    }
 }
 
 fn written(run_id: &RunId, pr_file: Option<&Path>) -> Option<Description> {
