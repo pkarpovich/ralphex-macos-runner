@@ -35,13 +35,11 @@ Create the key in the application directory, readable by you only:
 ```fish
 set dir ~/Library/Application\ Support/ralphex-macos-runner
 mkdir -p $dir
-touch $dir/runner.pem
-chmod 600 $dir/runner.pem
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out $dir/runner.pem
+sh -c 'umask 077 && exec openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$0"' $dir/runner.pem
 openssl pkey -in $dir/runner.pem -pubout -out $dir/runner.pub.pem
 ```
 
-`runner.pem` is the private key: an RSA key in PEM, PKCS#8 (`BEGIN PRIVATE KEY`) or PKCS#1 (`BEGIN RSA PRIVATE KEY`). It stays on this Mac - never in a repository, an environment variable or a log. The daemon refuses to start when the group or others can read it. `runner.pub.pem` is the public key: register it at the authorization server for the runner's client, under the key id the configuration names as `key_id`. A debug build uses `~/Library/Application Support/ralphex-macos-runner-dev/` instead.
+The `umask` is set in a child `sh` so the key is created with mode `0600` and your shell keeps its own. `runner.pem` is the private key: an RSA key in PEM, PKCS#8 (`BEGIN PRIVATE KEY`) or PKCS#1 (`BEGIN RSA PRIVATE KEY`). It stays on this Mac - never in a repository, an environment variable or a log. The daemon refuses to start when the group or others can read it. `runner.pub.pem` is the public key: register it at the authorization server for the runner's client, under the key id the configuration names as `key_id`. A debug build uses `~/Library/Application Support/ralphex-macos-runner-dev/` instead.
 
 ### config.toml
 

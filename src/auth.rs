@@ -6,7 +6,10 @@
 //! [`SigningKey`] each time, keeps the token in memory and asks for a new one
 //! [`TOKEN_RENEW_MARGIN`] before it expires. No error this module returns
 //! carries the token, the assertion or key material: a refusal names the HTTP
-//! status and the OAuth `error` code only.
+//! status and the OAuth `error` code only, and the code only when it is at most
+//! 64 characters of the set RFC 6749 allows, so a server cannot write a line
+//! break or a page of text into the log. A redirect from the token endpoint is
+//! never followed: it is a refusal with its status.
 
 use std::fmt;
 use std::os::unix::fs::PermissionsExt;
@@ -39,6 +42,7 @@ pub const ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jw
 pub const ASSERTION_LIFETIME: Duration = Duration::from_secs(60);
 
 const JTI_BYTES: usize = 16;
+const MAX_ERROR_CODE_CHARS: usize = 64;
 const MAX_TOKEN_BODY_BYTES: usize = 65536;
 
 /// Who the runner is at the authorization server and what it asks a token for.
@@ -421,6 +425,11 @@ fn answer(status: u16, body: &[u8]) -> Result<(AccessToken, Duration), AuthError
             Ok(ErrorBody { error }) => error,
             Err(_undecodable) => None,
         };
+        let code = match code {
+            Some(code) if is_error_code(&code) => Some(code),
+            Some(_unprintable) => None,
+            None => None,
+        };
         return Err(AuthError::Refused { status, code });
     }
     let Ok(TokenBody {
@@ -437,6 +446,22 @@ fn answer(status: u16, body: &[u8]) -> Result<(AccessToken, Duration), AuthError
         return Err(AuthError::Unusable);
     }
     Ok((AccessToken(access_token), Duration::from_secs(expires_in)))
+}
+
+fn is_error_code(code: &str) -> bool {
+    if code.is_empty() || code.chars().count() > MAX_ERROR_CODE_CHARS {
+        return false;
+    }
+    for character in code.chars() {
+        let allowed = character == ' '
+            || character == '!'
+            || ('#'..='[').contains(&character)
+            || (']'..='~').contains(&character);
+        if !allowed {
+            return false;
+        }
+    }
+    true
 }
 
 fn transport(error: &reqwest::Error) -> AuthError {
@@ -716,6 +741,51 @@ pub(crate) mod tests {
         );
         let refused = answer(502, b"<html>bad gateway</html>").unwrap_err();
         assert_eq!(refused.to_string(), "the token endpoint answered 502");
+    }
+
+    #[test]
+    fn an_error_code_outside_the_oauth_charset_or_too_long_is_dropped() {
+        for code in [
+            "invalid_client\nforged log line".to_string(),
+            "invalid_client\r".to_string(),
+            "quote\"inside".to_string(),
+            "back\\slash".to_string(),
+            "tab\tinside".to_string(),
+            "caf\u{e9}".to_string(),
+            "x".repeat(MAX_ERROR_CODE_CHARS + 1),
+            String::new(),
+        ] {
+            let body = serde_json::json!({ "error": code }).to_string();
+            let refused = answer(400, body.as_bytes()).unwrap_err();
+            assert_eq!(
+                refused,
+                AuthError::Refused {
+                    status: 400,
+                    code: None,
+                },
+                "{code:?}"
+            );
+            assert_eq!(refused.to_string(), "the token endpoint answered 400");
+        }
+    }
+
+    #[test]
+    fn an_error_code_of_the_oauth_charset_up_to_the_limit_is_kept() {
+        for code in [
+            "invalid_client".to_string(),
+            "a b!#[]~".to_string(),
+            "x".repeat(MAX_ERROR_CODE_CHARS),
+        ] {
+            let body = serde_json::json!({ "error": code }).to_string();
+            let refused = answer(400, body.as_bytes()).unwrap_err();
+            assert_eq!(
+                refused,
+                AuthError::Refused {
+                    status: 400,
+                    code: Some(code),
+                }
+            );
+        }
     }
 
     #[test]

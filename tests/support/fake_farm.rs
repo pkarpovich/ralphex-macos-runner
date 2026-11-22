@@ -49,6 +49,8 @@ pub enum Reply {
     Beat(HeartbeatAction),
     /// An arbitrary status and body.
     Status(u16, String),
+    /// `307` with this `Location`, which keeps the method and the body.
+    Redirect(String),
     /// Hold the request open until the test releases it.
     Hold,
 }
@@ -66,6 +68,8 @@ pub enum Grant {
     Token(u64),
     /// An arbitrary status and body, with no token minted.
     Status(u16, String),
+    /// `307` with this `Location`, with no token minted.
+    Redirect(String),
 }
 
 /// One token request the fake endpoint received.
@@ -183,6 +187,7 @@ impl FakeFarm {
             .route("/external/runner/jobs/{id}/heartbeat", post(heartbeat))
             .route("/external/runner/jobs/{id}/complete", post(complete))
             .route("/external/runner/jobs/{id}/progress", post(progress))
+            .fallback(elsewhere)
             .with_state(Arc::clone(&shared));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -441,6 +446,7 @@ fn respond(reply: Reply) -> Response {
             let status = StatusCode::from_u16(code).unwrap();
             (status, body).into_response()
         }
+        Reply::Redirect(location) => redirect(&location),
         Reply::Hold => StatusCode::NO_CONTENT.into_response(),
     }
 }
@@ -452,6 +458,7 @@ fn accepts(reply: &Reply) -> bool {
         Reply::Accepted => true,
         Reply::Beat(_) => true,
         Reply::Hold => true,
+        Reply::Redirect(_) => false,
         Reply::Status(code, _) => (200..300).contains(code),
     }
 }
@@ -474,9 +481,12 @@ async fn claim(
             shared.release.notified().await;
             take(&shared, RouteName::Claim, Reply::NoJob)
         }
-        Reply::Job(_) | Reply::NoJob | Reply::Accepted | Reply::Beat(_) | Reply::Status(..) => {
-            reply
-        }
+        Reply::Job(_)
+        | Reply::NoJob
+        | Reply::Accepted
+        | Reply::Beat(_)
+        | Reply::Status(..)
+        | Reply::Redirect(_) => reply,
     };
     handed_out(&shared, &reply, &caller);
     respond(reply)
@@ -501,9 +511,12 @@ async fn runs(
             shared.release.notified().await;
             take(&shared, RouteName::Runs, unscripted)
         }
-        Reply::Job(_) | Reply::NoJob | Reply::Accepted | Reply::Beat(_) | Reply::Status(..) => {
-            reply
-        }
+        Reply::Job(_)
+        | Reply::NoJob
+        | Reply::Accepted
+        | Reply::Beat(_)
+        | Reply::Status(..)
+        | Reply::Redirect(_) => reply,
     };
     handed_out(&shared, &reply, &caller);
     respond(reply)
@@ -569,6 +582,24 @@ async fn log(
         return respond(reply);
     };
     accepted()
+}
+
+fn redirect(location: &str) -> Response {
+    (
+        StatusCode::TEMPORARY_REDIRECT,
+        [(axum::http::header::LOCATION, location.to_string())],
+    )
+        .into_response()
+}
+
+async fn elsewhere(
+    State(shared): State<Arc<Shared>>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    record(&shared, &uri, &headers, &body);
+    StatusCode::NOT_FOUND.into_response()
 }
 
 fn accepted() -> Response {
@@ -639,9 +670,12 @@ async fn progress(
             shared.release.notified().await;
             take(&shared, RouteName::Progress, Reply::Accepted)
         }
-        Reply::Job(_) | Reply::NoJob | Reply::Accepted | Reply::Beat(_) | Reply::Status(..) => {
-            reply
-        }
+        Reply::Job(_)
+        | Reply::NoJob
+        | Reply::Accepted
+        | Reply::Beat(_)
+        | Reply::Status(..)
+        | Reply::Redirect(_) => reply,
     };
     let Reply::Accepted = reply else {
         return respond(reply);
@@ -722,6 +756,7 @@ async fn token(
             (StatusCode::OK, Json(body)).into_response()
         }
         Grant::Status(code, body) => (StatusCode::from_u16(code).unwrap(), body).into_response(),
+        Grant::Redirect(location) => redirect(&location),
     }
 }
 

@@ -434,3 +434,66 @@ async fn a_farm_request_never_reaches_the_token_endpoint_path() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_redirect_from_the_token_endpoint_is_not_followed() {
+    let farm = FakeFarm::start().await;
+    farm.push_grant(Grant::Redirect("/elsewhere/token".to_string()));
+    let tokens = token_source(credentials(&farm), Arc::new(TestSleeper::new()));
+
+    let refused = tokens.token().await.unwrap_err();
+
+    assert_eq!(
+        refused,
+        AuthError::Refused {
+            status: 307,
+            code: None,
+        }
+    );
+    assert_eq!(farm.token_requests().len(), 1);
+    assert!(
+        farm.requests_ending("/elsewhere/token").is_empty(),
+        "the assertion followed the redirect"
+    );
+}
+
+#[tokio::test]
+async fn a_redirected_token_request_fails_the_farm_call_as_a_token_failure() {
+    let farm = FakeFarm::start().await;
+    farm.push_grant(Grant::Redirect("/elsewhere/token".to_string()));
+    let client = farm_client(&farm, Arc::new(TestSleeper::new()));
+
+    let error = client
+        .claim(&ralphex_macos_runner::protocol::types::ClaimRequest::native())
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error,
+        FarmError::Transport("no access token: the token endpoint answered 307".to_string())
+    );
+    assert!(farm.requests().is_empty(), "{:?}", farm.requests());
+}
+
+#[tokio::test]
+async fn a_redirect_from_a_runner_route_is_the_attempts_answer_and_is_not_followed() {
+    let farm = FakeFarm::start().await;
+    farm.push_heartbeat(Reply::Redirect("/elsewhere/heartbeat".to_string()));
+    let sleeper = Arc::new(TestSleeper::new());
+    let client = farm_client(&farm, sleeper.clone());
+
+    let error = client
+        .heartbeat(&run_id(), &HeartbeatRequest::native())
+        .await
+        .unwrap_err();
+
+    let FarmError::Rejected(307, _) = error else {
+        panic!("a redirect is an unexpected status: {error:?}");
+    };
+    assert_eq!(farm.requests_ending("/heartbeat").len(), 1);
+    assert!(
+        farm.requests_ending("/elsewhere/heartbeat").is_empty(),
+        "the bearer followed the redirect"
+    );
+    assert!(sleeper.slept().is_empty(), "a redirect was retried");
+}

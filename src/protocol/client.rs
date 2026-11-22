@@ -5,7 +5,9 @@
 //! attempt carries a token from the [`TokenSource`]: a `401` drops that token
 //! and repeats the attempt once with a new one, and a token that cannot be had
 //! fails the attempt as [`FarmError::Transport`] before anything reaches the
-//! farm, so each call's own retry policy covers it. Delays and
+//! farm, so each call's own retry policy covers it. A redirect is never
+//! followed, because the bearer would go with it: a `3xx` is the attempt's
+//! answer like any other status the call does not accept. Delays and
 //! the passage of time arrive through the [`Sleeper`] trait, so a test drives
 //! the whole retry table without waiting on a clock.
 
@@ -107,7 +109,10 @@ impl FarmClient {
         tokens: Arc<TokenSource>,
         sleeper: Arc<dyn Sleeper>,
     ) -> Result<Self, FarmError> {
-        let http = match reqwest::Client::builder().build() {
+        let built = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build();
+        let http = match built {
             Ok(http) => http,
             Err(error) => return Err(FarmError::Transport(error.to_string())),
         };
