@@ -35,9 +35,9 @@ Create the key in the application directory, readable by you only:
 ```fish
 set dir ~/Library/Application\ Support/ralphex-macos-runner
 mkdir -p $dir
-umask 077
-openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out $dir/runner.pem
+touch $dir/runner.pem
 chmod 600 $dir/runner.pem
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out $dir/runner.pem
 openssl pkey -in $dir/runner.pem -pubout -out $dir/runner.pub.pem
 ```
 
