@@ -2,7 +2,7 @@
 
 mod support;
 
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -10,20 +10,28 @@ use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use ralphex_macos_runner::prdesc::PR_FILE_VAR;
 use ralphex_macos_runner::protocol::types::{CompleteRequest, CompleteStatus};
-use support::fake_farm::{FakeFarm, Reply};
-use support::{Checkout, Record, completion, dead, local_job, spawned, wait_for};
+use support::fake_farm::{FakeFarm, Reply, TOKEN_PATH};
+use support::{
+    CLIENT_ID, Checkout, KEY_ID, RESOURCE, Record, completion, dead, local_job, spawned, wait_for,
+    write_key,
+};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 const MISMATCH: &str = r#"{"error":"the runner speaks 1, the farm speaks 2"}"#;
 
+fn config_text(checkout: &Checkout, farm: &FakeFarm, ralphex: &Path) -> String {
+    let key = write_key(checkout.dir());
+    format!(
+        "farm_url = \"{farm}\"\nissuer = \"{farm}\"\ntoken_endpoint = \"{farm}{TOKEN_PATH}\"\nclient_id = \"{CLIENT_ID}\"\nkey_id = \"{KEY_ID}\"\nkey_file = \"{}\"\nresource = \"{RESOURCE}\"\ndrain_timeout = \"1s\"\nralphex_bin = \"{}\"\n",
+        key.display(),
+        ralphex.display(),
+        farm = farm.url(),
+    )
+}
+
 fn config_file(checkout: &Checkout, farm: &FakeFarm, ralphex: &Path) -> PathBuf {
     let path = checkout.dir().join("config.toml");
-    let contents = format!(
-        "farm_url = \"{}\"\ntoken = \"secret-token\"\nname = \"mbp-native\"\ndrain_timeout = \"1s\"\nralphex_bin = \"{}\"\n",
-        farm.url(),
-        ralphex.display()
-    );
-    std::fs::write(&path, contents).unwrap();
+    std::fs::write(&path, config_text(checkout, farm, ralphex)).unwrap();
     path
 }
 
@@ -99,6 +107,75 @@ async fn a_protocol_mismatch_exits_with_the_status_launchd_restarts_on() {
     let printed = logged(&output);
     assert!(printed.contains("the farm speaks another"), "{printed}");
     assert!(!socket.exists(), "the socket outlived the daemon");
+}
+
+#[tokio::test]
+async fn the_daemon_authenticates_as_its_client_and_claims_with_the_token() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    farm.always_claim(Reply::Status(409, MISMATCH.to_string()));
+    let config = config_file(&checkout, &farm, &ralphex);
+    let socket = checkout.dir().join("daemon.sock");
+
+    let daemon = daemon(&config, &socket, &home(&checkout));
+    let output = daemon.wait_with_output().await.unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let tokens = farm.token_requests();
+    assert_eq!(tokens.len(), 1);
+    assert_eq!(tokens[0].refusal, "");
+    assert_eq!(tokens[0].form["client_id"], CLIENT_ID);
+    let claims = farm.requests_ending("/claim");
+    assert_eq!(claims[0].authorization, "Bearer token-1");
+    let printed = logged(&output);
+    assert!(!printed.contains("token-1"), "{printed}");
+    assert!(!printed.contains("BEGIN PRIVATE KEY"), "{printed}");
+}
+
+#[tokio::test]
+async fn a_key_others_can_read_stops_the_daemon_before_it_asks_for_a_token() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    let config = config_file(&checkout, &farm, &ralphex);
+    let key = checkout.dir().join("runner.pem");
+    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let socket = checkout.dir().join("daemon.sock");
+
+    let daemon = daemon(&config, &socket, &home(&checkout));
+    let output = daemon.wait_with_output().await.unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let printed = logged(&output);
+    assert!(printed.contains("readable by others"), "{printed}");
+    assert!(farm.token_requests().is_empty());
+    assert!(farm.requests().is_empty());
+}
+
+#[tokio::test]
+async fn a_configuration_that_still_holds_a_token_is_refused_with_its_replacement() {
+    let checkout = Checkout::new();
+    let ralphex = checkout.ralphex(&[]);
+    let farm = FakeFarm::start().await;
+    let path = checkout.dir().join("config.toml");
+    let mut contents = config_text(&checkout, &farm, &ralphex);
+    contents.push_str("token = \"left-over\"\n");
+    std::fs::write(&path, contents).unwrap();
+    let socket = checkout.dir().join("daemon.sock");
+
+    let daemon = daemon(&path, &socket, &home(&checkout));
+    let output = daemon.wait_with_output().await.unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    let printed = logged(&output);
+    assert!(
+        printed.contains("token is no longer a setting"),
+        "{printed}"
+    );
+    assert!(printed.contains("key_file"), "{printed}");
+    assert!(!printed.contains("left-over"), "{printed}");
+    assert!(farm.token_requests().is_empty());
 }
 
 #[tokio::test]

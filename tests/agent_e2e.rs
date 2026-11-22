@@ -12,15 +12,14 @@ use ralphex_macos_runner::ipc::RunRequest;
 use ralphex_macos_runner::job::{LocalOptions, Worktree};
 use ralphex_macos_runner::pr::RunOrigin;
 use ralphex_macos_runner::prdesc::{self, PR_FILE_NAME, PR_FILE_VAR};
-use ralphex_macos_runner::protocol::client::FarmClient;
 use ralphex_macos_runner::protocol::types::{
     Branch, CompleteRequest, CompleteStatus, CreatePr, HeartbeatAction, Job, Phase,
-    ProgressRequest, ProgressTask, RunId, RunnerName,
+    ProgressRequest, ProgressTask, RunId,
 };
 use support::fake_farm::{FakeFarm, Reply};
 use support::{
-    Checkout, Record, TestSleeper, completion, dead, gone_within, invocations, options, snapshots,
-    spawned, ticket_job, wait_for,
+    CLIENT_ID, Checkout, Record, TestSleeper, completion, credentials, dead, farm_client,
+    gone_within, invocations, options, snapshots, spawned, ticket_job, wait_for,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -49,17 +48,15 @@ async fn farm_with(job: Job) -> FakeFarm {
 fn config(farm: &FakeFarm, ralphex: &Path) -> Config {
     Config {
         farm_url: farm.url().to_string(),
-        token: "secret-token".to_string(),
-        name: RunnerName("mbp-native".to_string()),
+        credentials: credentials(farm),
+        key_file: PathBuf::from("runner.pem"),
         drain_timeout: Duration::from_millis(50),
         ralphex_bin: ralphex.display().to_string(),
     }
 }
 
 fn agent(farm: &FakeFarm, config: Config, options: AgentOptions) -> Agent {
-    let client = Arc::new(
-        FarmClient::new(farm.url(), "secret-token", Arc::new(TestSleeper::new())).unwrap(),
-    );
+    let client = Arc::new(farm_client(farm, Arc::new(TestSleeper::new())));
     Agent::new(config, client, options)
 }
 
@@ -800,7 +797,7 @@ async fn a_claim_the_farm_refuses_is_paced_on_a_growing_delay() {
     let running = start(agent(&farm, config(&farm, &ralphex), options));
 
     let started = Instant::now();
-    let polled = wait_for(|| match farm.requests_ending("/claim").len() >= 4 {
+    let polled = wait_for(|| match farm.requests_ending("/claim").len() >= 8 {
         true => Some(()),
         false => None,
     })
@@ -810,7 +807,7 @@ async fn a_claim_the_farm_refuses_is_paced_on_a_growing_delay() {
     assert!(polled.is_some(), "the loop stopped polling");
     assert!(
         elapsed >= Duration::from_millis(300),
-        "a refused claim was retried on a flat delay: four polls in {elapsed:?}"
+        "a refused claim was retried on a flat delay: four polls and their repeats in {elapsed:?}"
     );
     running.raise.send_replace(Shutdown::Draining);
     assert_eq!(running.handle.await.unwrap(), AgentExit::Shutdown);
@@ -1553,7 +1550,7 @@ async fn a_plan_outside_the_checkout_completes_as_a_missing_plan() {
 }
 
 #[tokio::test]
-async fn every_call_carries_the_bearer_token_and_the_runner_name() {
+async fn every_call_carries_a_minted_bearer_token_and_no_runner_name() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[("FAKE_RALPHEX_LINES", "1")]);
     let farm = farm_with(ticket_job(&checkout.path(), &checkout.plan(), CreatePr::No)).await;
@@ -1566,14 +1563,18 @@ async fn every_call_carries_the_bearer_token_and_the_runner_name() {
     completion(&farm).await;
 
     for request in farm.requests() {
-        assert_eq!(request.authorization, "Bearer secret-token");
+        assert_eq!(request.authorization, "Bearer token-1", "{}", request.path);
+        assert!(!request.text().contains("\"runner\""), "{}", request.text());
     }
+    let tokens = farm.token_requests();
+    assert_eq!(tokens.len(), 1, "one token served the whole run");
+    assert_eq!(tokens[0].form["client_id"], CLIENT_ID);
     let claims = farm.requests_ending("/claim");
-    assert!(claims[0].text().contains(r#""runner":"mbp-native""#));
+    assert!(claims[0].text().contains(r#""version":"2""#));
     assert!(claims[0].text().contains(r#""runtime":"native""#));
     assert!(claims[0].text().contains(r#""slots":1"#));
     let beats = farm.requests_ending("/heartbeat");
-    assert!(beats[0].text().contains(r#""runner":"mbp-native""#));
+    assert!(beats[0].text().contains(r#""version":"2""#));
     assert!(beats[0].text().contains(r#""runtime":"native""#));
 }
 

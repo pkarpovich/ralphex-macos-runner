@@ -1,8 +1,9 @@
 //! Golden JSON round-trips for every body of the farm protocol.
 //!
-//! Each vector is transcribed verbatim from the plan's "Conformance vectors"
-//! section, deserialized into this crate's type and re-serialized; the two JSON
-//! values must be equal. The vectors added for the run title and the progress
+//! Each vector is transcribed from the plan's "Conformance vectors" section
+//! with the two changes protocol version 2 makes to the bodies - `version` is
+//! `"2"` and no request carries `runner` - deserialized into this crate's type
+//! and re-serialized; the two JSON values must be equal. The vectors added for the run title and the progress
 //! snapshots are also compared byte for byte, because they mirror the farm's
 //! own goldens.
 
@@ -41,14 +42,14 @@ fn repo_capability() {
 #[test]
 fn claim_request_full() {
     round_trip::<ClaimRequest>(
-        r#"{"runner":"mac-1","version":"1","runtime":"native","repos":[{"slug":"owner/one","default_branch":"main"},{"slug":"owner/two","default_branch":"master"}],"ready":["owner/two"],"slots":2}"#,
+        r#"{"version":"2","runtime":"native","repos":[{"slug":"owner/one","default_branch":"main"},{"slug":"owner/two","default_branch":"master"}],"ready":["owner/two"],"slots":2}"#,
     );
 }
 
 #[test]
 fn claim_request_empty() {
     round_trip::<ClaimRequest>(
-        r#"{"runner":"","version":"","runtime":"","repos":null,"ready":null,"slots":0}"#,
+        r#"{"version":"","runtime":"","repos":null,"ready":null,"slots":0}"#,
     );
 }
 
@@ -69,14 +70,14 @@ fn job_empty() {
 #[test]
 fn heartbeat_request_full() {
     round_trip::<HeartbeatRequest>(
-        r#"{"runner":"mac-1","image":"ghcr.io/pkarpovich/ralphex:latest","version":"1","runtime":"native","repos":[{"slug":"owner/one","default_branch":"main"}],"slots":2}"#,
+        r#"{"image":"ghcr.io/pkarpovich/ralphex:latest","version":"2","runtime":"native","repos":[{"slug":"owner/one","default_branch":"main"}],"slots":2}"#,
     );
 }
 
 #[test]
 fn heartbeat_request_empty() {
     round_trip::<HeartbeatRequest>(
-        r#"{"runner":"","image":"","version":"","runtime":"","repos":null,"slots":0}"#,
+        r#"{"image":"","version":"","runtime":"","repos":null,"slots":0}"#,
     );
 }
 
@@ -93,28 +94,28 @@ fn heartbeat_response_none() {
 #[test]
 fn open_run_request_full() {
     round_trip::<OpenRunRequest>(
-        r#"{"runner":"mbp","version":"1","runtime":"native","repo":"ralphex-farm","ctx":"/abs/checkout","plan":"/abs/checkout/docs/plans/x.md","branch":"x","create_pr":true}"#,
+        r#"{"version":"2","runtime":"native","repo":"ralphex-farm","ctx":"/abs/checkout","plan":"/abs/checkout/docs/plans/x.md","branch":"x","create_pr":true}"#,
     );
 }
 
 #[test]
 fn open_run_request_empty() {
     round_trip::<OpenRunRequest>(
-        r#"{"runner":"","version":"","runtime":"","repo":"","ctx":"","plan":"","branch":"","create_pr":false}"#,
+        r#"{"version":"","runtime":"","repo":"","ctx":"","plan":"","branch":"","create_pr":false}"#,
     );
 }
 
 #[test]
 fn open_run_request_with_a_title() {
     byte_exact::<OpenRunRequest>(
-        r#"{"runner":"mbp","version":"1","runtime":"native","repo":"nhop","ctx":"/Users/op/Projects/nhop","plan":"/Users/op/Projects/nhop/docs/plans/20260907-require-dials.md","branch":"20260907-require-dials","create_pr":false,"title":"Require dials through degradation"}"#,
+        r#"{"version":"2","runtime":"native","repo":"nhop","ctx":"/Users/op/Projects/nhop","plan":"/Users/op/Projects/nhop/docs/plans/20260907-require-dials.md","branch":"20260907-require-dials","create_pr":false,"title":"Require dials through degradation"}"#,
     );
 }
 
 #[test]
 fn open_run_request_without_a_title_stays_unchanged() {
     byte_exact::<OpenRunRequest>(
-        r#"{"runner":"mbp","version":"1","runtime":"native","repo":"ralphex-farm","ctx":"/abs/checkout","plan":"/abs/checkout/docs/plans/x.md","branch":"x","create_pr":true}"#,
+        r#"{"version":"2","runtime":"native","repo":"ralphex-farm","ctx":"/abs/checkout","plan":"/abs/checkout/docs/plans/x.md","branch":"x","create_pr":true}"#,
     );
 }
 

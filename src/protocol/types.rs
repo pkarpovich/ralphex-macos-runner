@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 /// The protocol version this runner speaks.
-pub const VERSION: &str = "1";
+pub const VERSION: &str = "2";
 
 /// The runtime class this runner serves.
 pub const RUNTIME: &str = "native";
@@ -60,6 +60,12 @@ pub const RETRY_MAX_ATTEMPTS: u32 = 6;
 
 /// The time a single request to the farm may take, the claim poll aside.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The time one token request to the authorization server may take.
+pub const TOKEN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The time before its expiry at which a cached access token is replaced.
+pub const TOKEN_RENEW_MARGIN: Duration = Duration::from_secs(60);
 
 /// The time a completion keeps retrying before the lease would expire.
 pub const COMPLETE_BUDGET: Duration = LEASE_TTL;
@@ -118,7 +124,7 @@ impl fmt::Display for RunId {
     }
 }
 
-/// The name this runner registers under.
+/// The name this runner is known by: its client id at the authorization server.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RunnerName(pub String);
@@ -277,8 +283,6 @@ pub struct RepoCapability {
 /// The body of a claim long-poll.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClaimRequest {
-    /// The name this runner registers under.
-    pub runner: RunnerName,
     /// The protocol version the runner speaks.
     pub version: String,
     /// The runtime class the runner serves.
@@ -294,22 +298,21 @@ pub struct ClaimRequest {
 }
 
 impl ClaimRequest {
-    /// Returns the claim a native runner named `runner` sends when it is idle.
+    /// Returns the claim a native runner sends when it is idle.
     ///
     /// # Examples
     ///
     /// ```
-    /// use ralphex_macos_runner::protocol::types::{ClaimRequest, RunnerName};
+    /// use ralphex_macos_runner::protocol::types::ClaimRequest;
     ///
-    /// let request = ClaimRequest::native(RunnerName("mbp-native".to_string()));
+    /// let request = ClaimRequest::native();
     /// let encoded = serde_json::to_string(&request).unwrap();
     /// assert!(encoded.contains(r#""repos":[]"#));
     /// assert!(encoded.contains(r#""runtime":"native""#));
     /// ```
     #[must_use]
-    pub fn native(runner: RunnerName) -> Self {
+    pub fn native() -> Self {
         ClaimRequest {
-            runner,
             version: VERSION.to_string(),
             runtime: RUNTIME.to_string(),
             repos: Some(Vec::new()),
@@ -322,8 +325,6 @@ impl ClaimRequest {
 /// The body of a heartbeat for a running job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeartbeatRequest {
-    /// The name this runner registers under.
-    pub runner: RunnerName,
     /// The container image the run uses, empty for a native run.
     pub image: String,
     /// The protocol version the runner speaks.
@@ -338,22 +339,21 @@ pub struct HeartbeatRequest {
 }
 
 impl HeartbeatRequest {
-    /// Returns the heartbeat a native runner named `runner` sends for a running job.
+    /// Returns the heartbeat a native runner sends for a running job.
     ///
     /// # Examples
     ///
     /// ```
-    /// use ralphex_macos_runner::protocol::types::{HeartbeatRequest, RunnerName};
+    /// use ralphex_macos_runner::protocol::types::HeartbeatRequest;
     ///
-    /// let request = HeartbeatRequest::native(RunnerName("mbp-native".to_string()));
+    /// let request = HeartbeatRequest::native();
     /// let encoded = serde_json::to_string(&request).unwrap();
     /// assert!(encoded.contains(r#""image":"""#));
     /// assert!(encoded.contains(r#""slots":1"#));
     /// ```
     #[must_use]
-    pub fn native(runner: RunnerName) -> Self {
+    pub fn native() -> Self {
         HeartbeatRequest {
-            runner,
             image: String::new(),
             version: VERSION.to_string(),
             runtime: RUNTIME.to_string(),
@@ -373,8 +373,6 @@ pub struct HeartbeatResponse {
 /// The body that opens a run without a Linear ticket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenRunRequest {
-    /// The name of the runner that will execute the run.
-    pub runner: RunnerName,
     /// The protocol version the runner speaks.
     pub version: String,
     /// The runtime class the run needs.
@@ -526,13 +524,12 @@ mod tests {
 
     #[test]
     fn native_claim_sends_empty_slices() {
-        let request = ClaimRequest::native(RunnerName("mbp-native".to_string()));
+        let request = ClaimRequest::native();
         let encoded = serde_json::to_value(&request).unwrap();
         assert_eq!(
             encoded,
             json!({
-                "runner": "mbp-native",
-                "version": "1",
+                "version": "2",
                 "runtime": "native",
                 "repos": [],
                 "ready": [],
@@ -543,14 +540,13 @@ mod tests {
 
     #[test]
     fn native_heartbeat_sends_empty_repos_and_no_image() {
-        let request = HeartbeatRequest::native(RunnerName("mbp-native".to_string()));
+        let request = HeartbeatRequest::native();
         let encoded = serde_json::to_value(&request).unwrap();
         assert_eq!(
             encoded,
             json!({
-                "runner": "mbp-native",
                 "image": "",
-                "version": "1",
+                "version": "2",
                 "runtime": "native",
                 "repos": [],
                 "slots": 1,
@@ -561,8 +557,7 @@ mod tests {
     #[test]
     fn null_slices_decode_to_none() {
         let request: ClaimRequest = serde_json::from_value(json!({
-            "runner": "mbp-native",
-            "version": "1",
+            "version": "2",
             "runtime": "native",
             "repos": null,
             "ready": null,
@@ -570,7 +565,6 @@ mod tests {
         }))
         .unwrap();
         let ClaimRequest {
-            runner: _,
             version: _,
             runtime: _,
             repos,
@@ -584,14 +578,12 @@ mod tests {
     #[test]
     fn missing_slices_decode_to_none() {
         let request: ClaimRequest = serde_json::from_value(json!({
-            "runner": "mbp-native",
-            "version": "1",
+            "version": "2",
             "runtime": "native",
             "slots": 1,
         }))
         .unwrap();
         let ClaimRequest {
-            runner: _,
             version: _,
             runtime: _,
             repos,
@@ -605,16 +597,14 @@ mod tests {
     #[test]
     fn empty_slices_decode_to_an_empty_vector() {
         let request: HeartbeatRequest = serde_json::from_value(json!({
-            "runner": "mbp-native",
             "image": "",
-            "version": "1",
+            "version": "2",
             "runtime": "native",
             "repos": [],
             "slots": 1,
         }))
         .unwrap();
         let HeartbeatRequest {
-            runner: _,
             image: _,
             version: _,
             runtime: _,
@@ -751,7 +741,6 @@ mod tests {
     #[test]
     fn an_open_run_without_a_title_leaves_the_key_out() {
         let request = OpenRunRequest {
-            runner: RunnerName("mbp".to_string()),
             version: VERSION.to_string(),
             runtime: RUNTIME.to_string(),
             repo: "nhop".to_string(),
@@ -767,7 +756,8 @@ mod tests {
 
     #[test]
     fn constants_match_the_wire_contract() {
-        assert_eq!(VERSION, "1");
+        assert_eq!(VERSION, "2");
+        assert_eq!(TOKEN_RENEW_MARGIN, Duration::from_secs(60));
         assert_eq!(RUNTIME, "native");
         assert_eq!(SLOTS, 1);
         assert_eq!(COMPLETE_BUDGET, LEASE_TTL);

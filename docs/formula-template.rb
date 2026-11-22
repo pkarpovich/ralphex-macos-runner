@@ -24,6 +24,9 @@ class RalphexMacosRunner < Formula
       The daemon reads its configuration from:
 
         ~/Library/Application Support/ralphex-macos-runner/config.toml
+
+      It signs in to the authorization server with its own RSA key. Set
+      key_file to that key and keep it readable by you only (chmod 600).
     CAVEATS
   end
 

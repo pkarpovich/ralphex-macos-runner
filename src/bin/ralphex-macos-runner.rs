@@ -13,7 +13,8 @@ use std::future::Future;
 
 use clap::Parser;
 use ralphex_macos_runner::agent::{Agent, AgentExit, AgentOptions, Shutdown, hasten};
-use ralphex_macos_runner::config::{Config, Loaded};
+use ralphex_macos_runner::auth::{SigningKey, TokenSource};
+use ralphex_macos_runner::config::Config;
 use ralphex_macos_runner::ipc;
 use ralphex_macos_runner::paths;
 use ralphex_macos_runner::protocol::client::{FarmClient, TokioSleeper};
@@ -78,22 +79,32 @@ async fn serve(cli: Cli) -> ExitCode {
             }
         },
     };
-    let loaded = match Config::load(&config) {
-        Ok(loaded) => loaded,
+    let config = match Config::load(&config) {
+        Ok(config) => config,
         Err(error) => {
             tracing::error!("{error}");
             return ExitCode::FAILURE;
         }
     };
-    let Loaded { config, warnings } = loaded;
-    for warning in warnings {
-        tracing::warn!("{warning}");
-    }
     if let Some(drift) = service::installed_drift(config.drain_timeout) {
         tracing::warn!("{drift}");
     }
 
-    let client = FarmClient::new(&config.farm_url, &config.token, Arc::new(TokioSleeper));
+    let key = match SigningKey::load(&config.key_file) {
+        Ok(key) => key,
+        Err(error) => {
+            tracing::error!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let tokens = match TokenSource::new(config.credentials.clone(), key, Arc::new(TokioSleeper)) {
+        Ok(tokens) => Arc::new(tokens),
+        Err(error) => {
+            tracing::error!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let client = FarmClient::new(&config.farm_url, tokens, Arc::new(TokioSleeper));
     let client = match client {
         Ok(client) => Arc::new(client),
         Err(error) => {
@@ -133,7 +144,7 @@ async fn serve(cli: Cli) -> ExitCode {
     };
     tracing::info!(
         "runner {} serving {} for {}",
-        config.name,
+        config.credentials.client_id,
         config.ralphex_bin,
         config.farm_url
     );

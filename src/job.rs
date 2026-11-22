@@ -674,7 +674,7 @@ mod tests {
         let client = Arc::new(
             crate::protocol::client::FarmClient::new(
                 "http://127.0.0.1:1",
-                "t",
+                Arc::new(crate::auth::tests::token_source("http://127.0.0.1:1")),
                 Arc::new(crate::protocol::client::TokioSleeper),
             )
             .unwrap(),

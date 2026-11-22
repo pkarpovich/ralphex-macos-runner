@@ -12,14 +12,14 @@ use ralphex_macos_runner::protocol::types::{
     HISTORY_LINES, LOG_BUFFER_BYTES, LOG_TAIL_LINES, MAX_LOG_CHUNK, Phase, RunId, Seq,
 };
 use support::fake_farm::{FakeFarm, Reply};
-use support::{TestSleeper, TickHandle, manual_ticker};
+use support::{TestSleeper, TickHandle, farm_client, manual_ticker};
 
 fn run_id() -> RunId {
     RunId("local-1".to_string())
 }
 
 fn client(farm: &FakeFarm) -> Arc<FarmClient> {
-    Arc::new(FarmClient::new(farm.url(), "secret-token", Arc::new(TestSleeper::new())).unwrap())
+    Arc::new(farm_client(farm, Arc::new(TestSleeper::new())))
 }
 
 fn stream(farm: &FakeFarm) -> (LogStream, TickHandle) {
