@@ -9,26 +9,25 @@ use ralphex_macos_runner::protocol::client::{FarmClient, FarmError};
 use ralphex_macos_runner::protocol::types::{
     Branch, COMPLETE_BUDGET, ClaimRequest, CompleteRequest, CompleteStatus, CreatePr,
     HeartbeatAction, HeartbeatRequest, HeartbeatResponse, Job, OpenRunRequest, Phase,
-    ProgressRequest, RunId, RunnerName, Seq, VERSION,
+    ProgressRequest, RunId, Seq, VERSION,
 };
-use support::TestSleeper;
 use support::fake_farm::{FakeFarm, Reply, job_reply};
+use support::{TestSleeper, credentials, farm_client, token_source};
 
 fn client(farm: &FakeFarm, sleeper: Arc<TestSleeper>) -> FarmClient {
-    FarmClient::new(farm.url(), "secret-token", sleeper).unwrap()
+    farm_client(farm, sleeper)
 }
 
 fn claim_request() -> ClaimRequest {
-    ClaimRequest::native(RunnerName("mbp-native".to_string()))
+    ClaimRequest::native()
 }
 
 fn heartbeat_request() -> HeartbeatRequest {
-    HeartbeatRequest::native(RunnerName("mbp-native".to_string()))
+    HeartbeatRequest::native()
 }
 
 fn open_run_request() -> OpenRunRequest {
     OpenRunRequest {
-        runner: RunnerName("mbp-native".to_string()),
         version: VERSION.to_string(),
         runtime: "native".to_string(),
         repo: "ralphex-farm".to_string(),
@@ -86,8 +85,9 @@ async fn every_call_carries_the_bearer_token() {
     let requests = farm.requests();
     assert_eq!(requests.len(), 5);
     for request in &requests {
-        assert_eq!(request.authorization, "Bearer secret-token");
+        assert_eq!(request.authorization, "Bearer token-1");
     }
+    assert_eq!(farm.token_requests().len(), 1);
 }
 
 #[tokio::test]
@@ -377,7 +377,9 @@ async fn an_opened_run_decodes_and_carries_the_request_body() {
     let requests = farm.requests_ending("/runs");
     let body: serde_json::Value = serde_json::from_str(&requests[0].text()).unwrap();
     assert_eq!(body["runtime"], "native");
+    assert_eq!(body["version"], "2");
     assert_eq!(body["create_pr"], true);
+    assert_eq!(body.get("runner"), None);
     assert_eq!(requests[0].content_type, "application/json");
 }
 
@@ -414,12 +416,10 @@ async fn an_opened_run_that_speaks_another_version_is_refused_with_a_mismatch() 
 
 #[tokio::test]
 async fn a_claim_that_cannot_reach_the_farm_reports_transport() {
-    let client = FarmClient::new(
-        "http://127.0.0.1:1",
-        "secret-token",
-        Arc::new(TestSleeper::new()),
-    )
-    .unwrap();
+    let farm = FakeFarm::start().await;
+    let sleeper = Arc::new(TestSleeper::new());
+    let tokens = token_source(credentials(&farm), sleeper.clone());
+    let client = FarmClient::new("http://127.0.0.1:1", Arc::new(tokens), sleeper).unwrap();
 
     let error = client.claim(&claim_request()).await.unwrap_err();
 
@@ -441,8 +441,8 @@ async fn a_progress_snapshot_answered_204_succeeds() {
 
     let requests = farm.requests_ending("/progress");
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].path, "/api/runner/jobs/local-1/progress");
-    assert_eq!(requests[0].authorization, "Bearer secret-token");
+    assert_eq!(requests[0].path, "/external/runner/jobs/local-1/progress");
+    assert_eq!(requests[0].authorization, "Bearer token-1");
     assert_eq!(requests[0].content_type, "application/json");
     assert_eq!(
         requests[0].text(),
@@ -492,6 +492,6 @@ async fn a_progress_snapshot_answered_410_latches_only_that_run_as_gone() {
     assert_eq!(second, FarmError::Gone);
     let requests = farm.requests_ending("/progress");
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].path, "/api/runner/jobs/local-1/progress");
-    assert_eq!(requests[1].path, "/api/runner/jobs/local-2/progress");
+    assert_eq!(requests[0].path, "/external/runner/jobs/local-1/progress");
+    assert_eq!(requests[1].path, "/external/runner/jobs/local-2/progress");
 }

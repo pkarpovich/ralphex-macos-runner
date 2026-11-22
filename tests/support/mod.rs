@@ -12,27 +12,131 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use aws_lc_rs::encoding::AsDer;
+use aws_lc_rs::rsa::{KeyPair, KeySize};
+use aws_lc_rs::signature::KeyPair as _;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
 use nix::pty::{OpenptyResult, Winsize, openpty};
 use nix::sys::signal::kill;
 use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
 use nix::unistd::Pid;
 use ralphex_macos_runner::agent::AgentOptions;
+use ralphex_macos_runner::auth::{Credentials, SigningKey, TokenSource};
 use ralphex_macos_runner::logstream::Ticker;
 use ralphex_macos_runner::pr::PrTools;
-use ralphex_macos_runner::protocol::client::Sleeper;
+use ralphex_macos_runner::protocol::client::{FarmClient, Sleeper};
 use ralphex_macos_runner::protocol::types::{
-    Branch, CompleteRequest, CreatePr, Job, ProgressRequest, RunId,
+    Branch, CompleteRequest, CreatePr, Job, ProgressRequest, RunId, RunnerName,
 };
 use tempfile::TempDir;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 
-use fake_farm::FakeFarm;
+use fake_farm::{FakeFarm, TOKEN_PATH};
+
+/// The client id the suite's runner authenticates as.
+pub const CLIENT_ID: &str = "farm-runner-native";
+
+/// The `kid` the suite's key is registered under at the fake token endpoint.
+pub const KEY_ID: &str = "farm-runner-native-1";
+
+/// The farm's identifier the suite's runner asks its tokens for.
+pub const RESOURCE: &str = "https://ralphex-farm.example.com/api";
+
+/// The RSA key pair the whole suite signs its client assertions with.
+pub struct TestKey {
+    /// The private key in PKCS#8 PEM.
+    pub pem: String,
+    /// The public key as the verifier takes it.
+    pub public: Vec<u8>,
+}
+
+/// Returns the suite's key, generated once per test binary.
+pub fn test_key() -> &'static TestKey {
+    static KEY: OnceLock<TestKey> = OnceLock::new();
+    KEY.get_or_init(|| {
+        let pair = KeyPair::generate(KeySize::Rsa2048).unwrap();
+        let der = pair.as_der().unwrap();
+        TestKey {
+            pem: pem("PRIVATE KEY", der.as_ref()),
+            public: pair.public_key().as_ref().to_vec(),
+        }
+    })
+}
+
+/// Returns `der` as a PEM block under `label`.
+#[must_use]
+pub fn pem(label: &str, der: &[u8]) -> String {
+    let encoded = STANDARD.encode(der);
+    let mut text = format!("-----BEGIN {label}-----\n");
+    let mut line = String::new();
+    for character in encoded.chars() {
+        line.push(character);
+        if line.len() == 64 {
+            text.push_str(&line);
+            text.push('\n');
+            line.clear();
+        }
+    }
+    if !line.is_empty() {
+        text.push_str(&line);
+        text.push('\n');
+    }
+    text.push_str(&format!("-----END {label}-----\n"));
+    text
+}
+
+/// Writes the suite's key to `dir` with mode `0600` and returns its path.
+pub fn write_key(dir: &Path) -> PathBuf {
+    let path = dir.join("runner.pem");
+    std::fs::write(&path, &test_key().pem).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    path
+}
+
+/// Returns the credentials of a runner named `client_id` at `farm`'s token endpoint.
+#[must_use]
+pub fn credentials_for(farm: &FakeFarm, client_id: &str) -> Credentials {
+    Credentials {
+        issuer: farm.url().to_string(),
+        token_endpoint: format!("{}{TOKEN_PATH}", farm.url()),
+        client_id: RunnerName(client_id.to_string()),
+        key_id: KEY_ID.to_string(),
+        resource: RESOURCE.to_string(),
+    }
+}
+
+/// Returns the credentials of the suite's runner at `farm`'s token endpoint.
+#[must_use]
+pub fn credentials(farm: &FakeFarm) -> Credentials {
+    credentials_for(farm, CLIENT_ID)
+}
+
+/// Returns a token source for `credentials` that signs with the suite's key.
+#[must_use]
+pub fn token_source(credentials: Credentials, sleeper: Arc<dyn Sleeper>) -> TokenSource {
+    let key = SigningKey::from_pem(test_key().pem.as_bytes()).unwrap();
+    TokenSource::new(credentials, key, sleeper).unwrap()
+}
+
+/// Returns a farm client that authenticates at `farm` as the suite's runner.
+#[must_use]
+pub fn farm_client(farm: &FakeFarm, sleeper: Arc<dyn Sleeper>) -> FarmClient {
+    farm_client_as(farm, CLIENT_ID, sleeper)
+}
+
+/// Returns a farm client that authenticates at `farm` as `client_id`.
+#[must_use]
+pub fn farm_client_as(farm: &FakeFarm, client_id: &str, sleeper: Arc<dyn Sleeper>) -> FarmClient {
+    let tokens = token_source(credentials_for(farm, client_id), Arc::clone(&sleeper));
+    FarmClient::new(farm.url(), Arc::new(tokens), sleeper).unwrap()
+}
 
 /// A git checkout with a plan in it and the paths the fakes record to.
 pub struct Checkout {

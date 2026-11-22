@@ -26,17 +26,58 @@ Apple silicon only; there is no Intel build and no Linux build (the container ru
 
 ## Configure
 
+The runner is a client of the farm's authorization server of its own. It signs in with the `client_credentials` grant and a client assertion signed by its own RSA key (`private_key_jwt`), asks for the scope `farm:run` and the farm as the token's `resource`, keeps the access token in memory and gets a new one 60 s before it expires. The farm takes the runner's name from the token's `client_id`; no request body carries a name. Each runner on each machine is its own client with its own key, never shared with another runner.
+
+### The key
+
+Create the key in the application directory, readable by you only:
+
+```fish
+set dir ~/Library/Application\ Support/ralphex-macos-runner
+mkdir -p $dir
+sh -c 'umask 077 && exec openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$0"' $dir/runner.pem
+openssl pkey -in $dir/runner.pem -pubout -out $dir/runner.pub.pem
+```
+
+The `umask` is set in a child `sh` so the key is created with mode `0600` and your shell keeps its own. `runner.pem` is the private key: an RSA key in PEM, PKCS#8 (`BEGIN PRIVATE KEY`) or PKCS#1 (`BEGIN RSA PRIVATE KEY`). It stays on this Mac - never in a repository, an environment variable or a log. The daemon refuses to start when the group or others can read it. `runner.pub.pem` is the public key: register it at the authorization server for the runner's client, under the key id the configuration names as `key_id`. A debug build uses `~/Library/Application Support/ralphex-macos-runner-dev/` instead.
+
+### config.toml
+
 The daemon refuses to start without `~/Library/Application Support/ralphex-macos-runner/config.toml`:
 
 ```toml
-farm_url      = "http://farm.example:7077"
-token         = "..."
-name          = "mbp-native"
-drain_timeout = "2m"       # default
-ralphex_bin   = "ralphex"  # default
+farm_url       = "https://ralphex-farm.example.com"
+issuer         = "https://auth.example.com"
+token_endpoint = "https://auth.example.com/api/oidc/token"
+client_id      = "farm-runner-native"
+key_id         = "farm-runner-native-1"
+key_file       = "/Users/me/Library/Application Support/ralphex-macos-runner/runner.pem"
+resource       = "https://ralphex-farm.example.com/api"
+drain_timeout  = "2m"       # default
+ralphex_bin    = "ralphex"  # default
 ```
 
-`farm_url`, `token` and `name` are required; an unknown key is refused rather than ignored. There is no slot count - this runner takes **one job at a time**, because two ralphex processes in one checkout would write over each other. Keep the file at mode `0600`: it holds the runner token, and the daemon warns when anyone else can read it.
+- `farm_url` - the farm the runner claims jobs from.
+- `issuer` - the authorization server's issuer, the audience of every client assertion.
+- `token_endpoint` - where the token request goes.
+- `client_id` - the runner's client at the authorization server, which is also its name on the dashboard.
+- `key_id` - the `kid` the public key is registered under.
+- `key_file` - the absolute path of the private key.
+- `resource` - the farm's identifier, the audience the farm checks on every token.
+
+Every setting but the last two is required; an unknown key is refused rather than ignored. `farm_url`, `issuer` and `token_endpoint` must be `https`; plain `http` is accepted for `127.0.0.1`, `[::1]` and `localhost` only, so no token or assertion leaves the machine unencrypted. There is no slot count - this runner takes **one job at a time**, because two ralphex processes in one checkout would write over each other. The file holds no secret.
+
+A configuration that still has `token` or `name` from protocol version 1 is refused with a message that names what replaced them: the token is now obtained from the authorization server, and the name is now `client_id`.
+
+A failed token request sends nothing to the farm and counts as a transport failure of the call that needed it, so that call's retry rules apply. A `401` from the farm drops the token and repeats the call once with a new one; a second `401` is final. No log line, error or progress post carries the token, the assertion or the key: a token failure names the HTTP status and the OAuth `error` code only.
+
+### Moving from protocol version 1
+
+Release 0.4.0 is the first to speak protocol version 2. The farm and both runners change at the same moment, because the farm answers `409` to version 1. On the Mac, before 0.4.0 starts:
+
+1. Create the key as above and hand `runner.pub.pem` and the key id to whoever registers the runner's client at the authorization server.
+2. Rewrite `config.toml`: remove `token` and `name`, add `issuer`, `token_endpoint`, `client_id`, `key_id`, `key_file` and `resource`, and make `farm_url` `https`.
+3. Upgrade to 0.4.0 and run `rxd install`, which reads the new configuration and rewrites the plist with the longer `ExitTimeOut` the token requests need.
 
 The run uses your personal `~/.config/ralphex` (agents and skills included); `RALPHEX_CONFIG_DIR` is never set.
 
@@ -91,7 +132,7 @@ Both paths are absolute and the plan must sit inside `ctx` - the farm holds no c
 
 ## Run name
 
-A run `rxd` opens has no Linear ticket to take a name from, so the daemon reads the plan's first `# ` heading and sends it as the run's title; the dashboard shows that instead of the plan's file name. A plan without a heading, or one the daemon cannot read, keeps the file name. A ticket job is named after its ticket as before. The farm must accept `title` on `POST /api/runner/runs` (ralphex-farm PR #53 or later); an older farm ignores it and the run keeps the file name.
+A run `rxd` opens has no Linear ticket to take a name from, so the daemon reads the plan's first `# ` heading and sends it as the run's title; the dashboard shows that instead of the plan's file name. A plan without a heading, or one the daemon cannot read, keeps the file name. A ticket job is named after its ticket as before. The farm must accept `title` on `POST /external/runner/runs` (ralphex-farm PR #53 or later); an older farm ignores it and the run keeps the file name.
 
 ## Timeline
 
@@ -123,9 +164,9 @@ Homebrew only replaces the binaries in its prefix; `rxd install` copies the new 
 
 ## Exit codes and restarts
 
-The daemon exits **2** when the farm answers `409` to a claim or a heartbeat, meaning the two no longer speak the same protocol version. A running job is stopped through the normal signal sequence first, the log line names both versions, and launchd's `KeepAlive` restarts the daemon under its own throttle - so a mismatch shows up as a restart loop in the log, not as a silent runner that claims nothing. Exit 1 is a missing or invalid `config.toml` at startup; exit 0 is a clean shutdown after a drain. A farm that cannot be reached is not a startup failure: the claim loop logs `the claim failed: ...` once per poll and keeps trying.
+The daemon exits **2** when the farm answers `409` to a claim or a heartbeat, meaning the two no longer speak the same protocol version. A running job is stopped through the normal signal sequence first, the log line names both versions, and launchd's `KeepAlive` restarts the daemon under its own throttle - so a mismatch shows up as a restart loop in the log, not as a silent runner that claims nothing. Exit 1 is a missing or invalid `config.toml` or a missing, unreadable or shared key file at startup; exit 0 is a clean shutdown after a drain. A farm that cannot be reached is not a startup failure: the claim loop logs `the claim failed: ...` once per poll and keeps trying.
 
-On `SIGTERM` or `SIGINT` the daemon stops claiming and lets a running job finish for up to `drain_timeout`, then stops it and reports it as `runner_shutdown`. A second `SIGTERM` or `SIGINT` cuts the remaining drain to nothing: the run is stopped at once and still reported `runner_shutdown`, so an operator who does not want to wait out the drain never has to reach for `SIGKILL`. A run `rxd` started is drained the same way: the daemon leaves only once its slot is free again. The plist carries an `ExitTimeOut` covering the whole sequence - `drain_timeout` plus the checkout inspection, the plan watcher's start, the stop grace, the terminal drain, the log stream's last flush, the pull-request sequence a finished run still owes, the timeline's last `pr` and `failed` snapshots and the budget the completion is retried for - because launchd's default of 20 seconds would `SIGKILL` the daemon mid-drain and leave the farm to finalise the run `runner_lost`. Raising `drain_timeout` therefore needs another `rxd install` to rewrite the plist.
+On `SIGTERM` or `SIGINT` the daemon stops claiming and lets a running job finish for up to `drain_timeout`, then stops it and reports it as `runner_shutdown`. A second `SIGTERM` or `SIGINT` cuts the remaining drain to nothing: the run is stopped at once and still reported `runner_shutdown`, so an operator who does not want to wait out the drain never has to reach for `SIGKILL`. A run `rxd` started is drained the same way: the daemon leaves only once its slot is free again. The plist carries an `ExitTimeOut` covering the whole sequence - `drain_timeout` plus the checkout inspection, the plan watcher's start, the stop grace, the terminal drain, the log stream's last flush, the pull-request sequence a finished run still owes, the timeline's last `pr` and `failed` snapshots and the budget the completion is retried for, with a token request and the `401` repeat on its last attempt - because launchd's default of 20 seconds would `SIGKILL` the daemon mid-drain and leave the farm to finalise the run `runner_lost`. Raising `drain_timeout` therefore needs another `rxd install` to rewrite the plist.
 
 ## Development
 
@@ -135,7 +176,7 @@ mise exec -- cargo test        # tests only
 mise exec -- cargo run --bin ralphex-macos-runner -- --config /tmp/config.toml
 ```
 
-A debug build uses `ralphex-macos-runner-dev` for its application and log directories and for its launchd label, so neither the daemon nor `rxd install` ever collides with the installed release. The test suite talks to a fake farm, a fake ralphex and `git`/`gh` shims - nothing touches the real farm, Linear, launchd or the network.
+A debug build uses `ralphex-macos-runner-dev` for its application and log directories and for its launchd label, so neither the daemon nor `rxd install` ever collides with the installed release. The test suite talks to a fake farm with a fake token endpoint, a fake ralphex and `git`/`gh` shims - nothing touches the real farm, the authorization server, Linear, launchd or the network. The suite generates its RSA key at run time; no key is checked in.
 
 ## Release
 

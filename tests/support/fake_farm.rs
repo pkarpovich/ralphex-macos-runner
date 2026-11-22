@@ -1,26 +1,39 @@
-//! An in-process stand-in for the farm's runner API.
+//! An in-process stand-in for the farm's runner API and its token endpoint.
 //!
 //! A test scripts each route with a queue of [`Reply`] values, or with a sticky
 //! reply the route falls back to once the queue is empty, and reads back every
-//! request the client made. The log route answers the way the real one does -
+//! request the client made. The token endpoint at [`TOKEN_PATH`] checks the
+//! form and the client assertion the way the authorization server does - the
+//! signature against the key registered for its `kid`, `iss` and `sub` equal to
+//! the client id, `aud` equal to the farm's URL as the issuer, a `jti` it has
+//! not seen and an `exp` sixty seconds after `iat` - and mints a token it then
+//! accepts on every runner route; any other bearer is answered `401`. A run
+//! belongs to the client whose claim or opening handed it out, and a log,
+//! heartbeat, progress or completion from another client is answered `410`.
+//! The log route answers the way the real one does -
 //! `204` for a chunk it took and for a chunk whose sequence number it has
 //! already seen, `400` only for a number below one - and the run route runs the
 //! same version check, so a client that repeats a sequence number or speaks
 //! another protocol version meets the same answer here as at the farm. The
 //! progress route answers `204` unless a test scripts it otherwise.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
-use axum::Router;
+use aws_lc_rs::signature::{RSA_PKCS1_2048_8192_SHA256, UnparsedPublicKey};
 use axum::body::Bytes;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
+use axum::{Json, Router};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ralphex_macos_runner::auth::{ASSERTION_TYPE, GRANT_TYPE, SCOPE};
 use ralphex_macos_runner::protocol::types::{
-    Branch, CreatePr, HeartbeatAction, HeartbeatResponse, Job, OpenRunRequest, RunId, VERSION,
+    Branch, CreatePr, HeartbeatAction, HeartbeatResponse, Job, RunId, VERSION,
 };
+use serde_json::Value;
 use tokio::sync::Notify;
 
 /// What the fake farm answers to one request.
@@ -36,8 +49,40 @@ pub enum Reply {
     Beat(HeartbeatAction),
     /// An arbitrary status and body.
     Status(u16, String),
+    /// `307` with this `Location`, which keeps the method and the body.
+    Redirect(String),
     /// Hold the request open until the test releases it.
     Hold,
+}
+
+/// The path of the fake token endpoint under the farm's URL.
+pub const TOKEN_PATH: &str = "/api/oidc/token";
+
+/// The lifetime of a token the fake endpoint mints unless a test scripts another.
+pub const TOKEN_LIFETIME: u64 = 3600;
+
+/// What the fake token endpoint answers to one valid token request.
+#[derive(Debug, Clone)]
+pub enum Grant {
+    /// `200` with a fresh token that expires after this many seconds.
+    Token(u64),
+    /// An arbitrary status and body, with no token minted.
+    Status(u16, String),
+    /// `307` with this `Location`, with no token minted.
+    Redirect(String),
+}
+
+/// One token request the fake endpoint received.
+#[derive(Debug, Clone)]
+pub struct TokenRequest {
+    /// The form fields of the request.
+    pub form: HashMap<String, String>,
+    /// The decoded header of the client assertion, `null` when it did not decode.
+    pub header: Value,
+    /// The decoded claims of the client assertion, `null` when they did not decode.
+    pub claims: Value,
+    /// Why the request was refused as `invalid_client`, empty when it was not.
+    pub refusal: String,
 }
 
 /// One request the fake farm received.
@@ -105,11 +150,19 @@ struct Routes {
     progress: Route,
     requests: Vec<Recorded>,
     last_seq: HashMap<String, u64>,
+    grants: VecDeque<Grant>,
+    token_requests: Vec<TokenRequest>,
+    keys: HashMap<String, Vec<u8>>,
+    seen_jti: HashSet<String>,
+    issued: HashMap<String, String>,
+    minted: u64,
+    owners: HashMap<String, String>,
 }
 
 struct Shared {
     routes: Mutex<Routes>,
     release: Notify,
+    issuer: Mutex<String>,
 }
 
 /// A farm the client can talk to over loopback.
@@ -119,29 +172,59 @@ pub struct FakeFarm {
 }
 
 impl FakeFarm {
-    /// Starts a farm on an ephemeral loopback port.
+    /// Starts a farm on an ephemeral loopback port that knows the suite's key.
     pub async fn start() -> Self {
         let shared = Arc::new(Shared {
             routes: Mutex::new(Routes::default()),
             release: Notify::new(),
+            issuer: Mutex::new(String::new()),
         });
         let router = Router::new()
-            .route("/api/runner/claim", post(claim))
-            .route("/api/runner/runs", post(runs))
-            .route("/api/runner/jobs/{id}/log", post(log))
-            .route("/api/runner/jobs/{id}/heartbeat", post(heartbeat))
-            .route("/api/runner/jobs/{id}/complete", post(complete))
-            .route("/api/runner/jobs/{id}/progress", post(progress))
+            .route(TOKEN_PATH, post(token))
+            .route("/external/runner/claim", post(claim))
+            .route("/external/runner/runs", post(runs))
+            .route("/external/runner/jobs/{id}/log", post(log))
+            .route("/external/runner/jobs/{id}/heartbeat", post(heartbeat))
+            .route("/external/runner/jobs/{id}/complete", post(complete))
+            .route("/external/runner/jobs/{id}/progress", post(progress))
+            .fallback(elsewhere)
             .with_state(Arc::clone(&shared));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        FakeFarm {
-            url: format!("http://{address}"),
-            shared,
-        }
+        let url = format!("http://{address}");
+        *shared.issuer.lock().unwrap() = url.clone();
+        let farm = FakeFarm { url, shared };
+        let key = super::test_key();
+        farm.register_key(super::KEY_ID, &key.public);
+        farm
+    }
+
+    /// Accepts assertions whose `kid` is `kid` when `public` verifies them.
+    pub fn register_key(&self, kid: &str, public: &[u8]) {
+        let mut routes = self.shared.routes.lock().unwrap();
+        routes.keys.insert(kid.to_string(), public.to_vec());
+    }
+
+    /// Queues `grant` for the next valid token request.
+    pub fn push_grant(&self, grant: Grant) {
+        let mut routes = self.shared.routes.lock().unwrap();
+        routes.grants.push_back(grant);
+    }
+
+    /// Forgets every token minted so far, so each one is answered `401`.
+    pub fn revoke_tokens(&self) {
+        let mut routes = self.shared.routes.lock().unwrap();
+        routes.issued.clear();
+    }
+
+    /// Returns every token request the endpoint received, in order.
+    #[must_use]
+    pub fn token_requests(&self) -> Vec<TokenRequest> {
+        let routes = self.shared.routes.lock().unwrap();
+        routes.token_requests.clone()
     }
 
     /// Returns the base URL of this farm.
@@ -295,6 +378,37 @@ pub fn sample_job(run_id: &str) -> Job {
     }
 }
 
+fn admitted(shared: &Arc<Shared>, uri: &Uri, headers: &HeaderMap, body: &Bytes) -> Option<String> {
+    record(shared, uri, headers, body);
+    let authorization = header_value(headers, "authorization");
+    let routes = shared.routes.lock().unwrap();
+    let token = authorization.strip_prefix("Bearer ")?;
+    routes.issued.get(token).cloned()
+}
+
+fn unauthorized() -> Response {
+    (StatusCode::UNAUTHORIZED, r#"{"error":"invalid_token"}"#).into_response()
+}
+
+fn held_by_another(shared: &Arc<Shared>, id: &str, caller: &str) -> Option<Response> {
+    let routes = shared.routes.lock().unwrap();
+    let owner = routes.owners.get(id)?;
+    if owner == caller {
+        return None;
+    }
+    Some((StatusCode::GONE, r#"{"error":"run is gone"}"#).into_response())
+}
+
+fn handed_out(shared: &Arc<Shared>, reply: &Reply, caller: &str) {
+    let Reply::Job(job) = reply else {
+        return;
+    };
+    let mut routes = shared.routes.lock().unwrap();
+    routes
+        .owners
+        .insert(job.run_id.as_str().to_string(), caller.to_string());
+}
+
 fn record(shared: &Arc<Shared>, uri: &Uri, headers: &HeaderMap, body: &Bytes) {
     let authorization = header_value(headers, "authorization");
     let content_type = header_value(headers, "content-type");
@@ -324,16 +438,15 @@ fn header_value(headers: &HeaderMap, name: &str) -> String {
 
 fn respond(reply: Reply) -> Response {
     match reply {
-        Reply::Job(job) => (StatusCode::OK, axum::Json(job)).into_response(),
+        Reply::Job(job) => (StatusCode::OK, Json(job)).into_response(),
         Reply::NoJob => StatusCode::NO_CONTENT.into_response(),
         Reply::Accepted => StatusCode::OK.into_response(),
-        Reply::Beat(action) => {
-            (StatusCode::OK, axum::Json(HeartbeatResponse { action })).into_response()
-        }
+        Reply::Beat(action) => (StatusCode::OK, Json(HeartbeatResponse { action })).into_response(),
         Reply::Status(code, body) => {
             let status = StatusCode::from_u16(code).unwrap();
             (status, body).into_response()
         }
+        Reply::Redirect(location) => redirect(&location),
         Reply::Hold => StatusCode::NO_CONTENT.into_response(),
     }
 }
@@ -345,6 +458,7 @@ fn accepts(reply: &Reply) -> bool {
         Reply::Accepted => true,
         Reply::Beat(_) => true,
         Reply::Hold => true,
+        Reply::Redirect(_) => false,
         Reply::Status(code, _) => (200..300).contains(code),
     }
 }
@@ -355,13 +469,27 @@ async fn claim(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    record(&shared, &uri, &headers, &body);
-    let reply = take(&shared, RouteName::Claim, Reply::NoJob);
-    let Reply::Hold = reply else {
-        return respond(reply);
+    let Some(caller) = admitted(&shared, &uri, &headers, &body) else {
+        return unauthorized();
     };
-    shared.release.notified().await;
-    respond(take(&shared, RouteName::Claim, Reply::NoJob))
+    if let Some(mismatch) = version_mismatch(&body) {
+        return respond(mismatch);
+    }
+    let reply = take(&shared, RouteName::Claim, Reply::NoJob);
+    let reply = match reply {
+        Reply::Hold => {
+            shared.release.notified().await;
+            take(&shared, RouteName::Claim, Reply::NoJob)
+        }
+        Reply::Job(_)
+        | Reply::NoJob
+        | Reply::Accepted
+        | Reply::Beat(_)
+        | Reply::Status(..)
+        | Reply::Redirect(_) => reply,
+    };
+    handed_out(&shared, &reply, &caller);
+    respond(reply)
 }
 
 async fn runs(
@@ -370,48 +498,46 @@ async fn runs(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    record(&shared, &uri, &headers, &body);
+    let Some(caller) = admitted(&shared, &uri, &headers, &body) else {
+        return unauthorized();
+    };
     if let Some(mismatch) = version_mismatch(&body) {
         return respond(mismatch);
     }
-    let reply = take(
-        &shared,
-        RouteName::Runs,
-        Reply::Status(400, "no run scripted".to_string()),
-    );
-    let Reply::Hold = reply else {
-        return respond(reply);
+    let unscripted = Reply::Status(400, "no run scripted".to_string());
+    let reply = take(&shared, RouteName::Runs, unscripted.clone());
+    let reply = match reply {
+        Reply::Hold => {
+            shared.release.notified().await;
+            take(&shared, RouteName::Runs, unscripted)
+        }
+        Reply::Job(_)
+        | Reply::NoJob
+        | Reply::Accepted
+        | Reply::Beat(_)
+        | Reply::Status(..)
+        | Reply::Redirect(_) => reply,
     };
-    shared.release.notified().await;
-    respond(take(
-        &shared,
-        RouteName::Runs,
-        Reply::Status(400, "no run scripted".to_string()),
-    ))
+    handed_out(&shared, &reply, &caller);
+    respond(reply)
 }
 
 fn version_mismatch(body: &Bytes) -> Option<Reply> {
-    let Ok(request) = serde_json::from_slice::<OpenRunRequest>(body) else {
+    let Ok(request) = serde_json::from_slice::<Value>(body) else {
         return None;
     };
-    let OpenRunRequest {
-        runner,
-        version,
-        runtime: _,
-        repo: _,
-        ctx: _,
-        plan: _,
-        branch: _,
-        create_pr: _,
-        title: _,
-    } = request;
+    let version = match request.get("version") {
+        Some(Value::String(version)) => version.clone(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    };
     if version == VERSION {
         return None;
     }
     Some(Reply::Status(
         409,
         format!(
-            r#"{{"error":"protocol version mismatch: runner \"{runner}\" speaks \"{version}\", farm speaks \"{VERSION}\""}}"#
+            r#"{{"error":"protocol version mismatch: runner speaks \"{version}\", farm speaks \"{VERSION}\""}}"#
         ),
     ))
 }
@@ -424,7 +550,12 @@ async fn log(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    record(&shared, &uri, &headers, &body);
+    let Some(caller) = admitted(&shared, &uri, &headers, &body) else {
+        return unauthorized();
+    };
+    if let Some(gone) = held_by_another(&shared, &id, &caller) {
+        return gone;
+    }
     let LogQuery { seq } = query;
     let mut routes = shared.routes.lock().unwrap();
     let last = match routes.last_seq.get(&id) {
@@ -453,17 +584,44 @@ async fn log(
     accepted()
 }
 
-fn accepted() -> Response {
-    StatusCode::NO_CONTENT.into_response()
+fn redirect(location: &str) -> Response {
+    (
+        StatusCode::TEMPORARY_REDIRECT,
+        [(axum::http::header::LOCATION, location.to_string())],
+    )
+        .into_response()
 }
 
-async fn heartbeat(
+async fn elsewhere(
     State(shared): State<Arc<Shared>>,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     record(&shared, &uri, &headers, &body);
+    StatusCode::NOT_FOUND.into_response()
+}
+
+fn accepted() -> Response {
+    StatusCode::NO_CONTENT.into_response()
+}
+
+async fn heartbeat(
+    State(shared): State<Arc<Shared>>,
+    Path(id): Path<String>,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(caller) = admitted(&shared, &uri, &headers, &body) else {
+        return unauthorized();
+    };
+    if let Some(gone) = held_by_another(&shared, &id, &caller) {
+        return gone;
+    }
+    if let Some(mismatch) = version_mismatch(&body) {
+        return respond(mismatch);
+    }
     let reply = take(
         &shared,
         RouteName::Heartbeat,
@@ -474,11 +632,17 @@ async fn heartbeat(
 
 async fn complete(
     State(shared): State<Arc<Shared>>,
+    Path(id): Path<String>,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    record(&shared, &uri, &headers, &body);
+    let Some(caller) = admitted(&shared, &uri, &headers, &body) else {
+        return unauthorized();
+    };
+    if let Some(gone) = held_by_another(&shared, &id, &caller) {
+        return gone;
+    }
     let reply = take(&shared, RouteName::Complete, Reply::Accepted);
     let Reply::Hold = reply else {
         return respond(reply);
@@ -489,20 +653,29 @@ async fn complete(
 
 async fn progress(
     State(shared): State<Arc<Shared>>,
+    Path(id): Path<String>,
     uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    record(&shared, &uri, &headers, &body);
+    let Some(caller) = admitted(&shared, &uri, &headers, &body) else {
+        return unauthorized();
+    };
+    if let Some(gone) = held_by_another(&shared, &id, &caller) {
+        return gone;
+    }
     let reply = take(&shared, RouteName::Progress, Reply::Accepted);
     let reply = match reply {
         Reply::Hold => {
             shared.release.notified().await;
             take(&shared, RouteName::Progress, Reply::Accepted)
         }
-        Reply::Job(_) | Reply::NoJob | Reply::Accepted | Reply::Beat(_) | Reply::Status(..) => {
-            reply
-        }
+        Reply::Job(_)
+        | Reply::NoJob
+        | Reply::Accepted
+        | Reply::Beat(_)
+        | Reply::Status(..)
+        | Reply::Redirect(_) => reply,
     };
     let Reply::Accepted = reply else {
         return respond(reply);
@@ -533,4 +706,152 @@ fn take(shared: &Arc<Shared>, name: RouteName, fallback: Reply) -> Reply {
 #[derive(serde::Deserialize)]
 struct LogQuery {
     seq: u64,
+}
+
+async fn token(
+    State(shared): State<Arc<Shared>>,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    let issuer = shared.issuer.lock().unwrap().clone();
+    let mut routes = shared.routes.lock().unwrap();
+    let assertion = match form.get("client_assertion") {
+        Some(assertion) => assertion.clone(),
+        None => String::new(),
+    };
+    let (header, claims, signed, signature) = split_assertion(&assertion);
+    let refusal = refusal(
+        &routes, &form, &issuer, &header, &claims, &signed, &signature,
+    );
+    routes.token_requests.push(TokenRequest {
+        form: form.clone(),
+        header,
+        claims: claims.clone(),
+        refusal: refusal.clone(),
+    });
+    if !refusal.is_empty() {
+        return (StatusCode::UNAUTHORIZED, r#"{"error":"invalid_client"}"#).into_response();
+    }
+    if let Some(Value::String(jti)) = claims.get("jti") {
+        routes.seen_jti.insert(jti.clone());
+    }
+    let grant = match routes.grants.pop_front() {
+        Some(grant) => grant,
+        None => Grant::Token(TOKEN_LIFETIME),
+    };
+    match grant {
+        Grant::Token(lifetime) => {
+            routes.minted += 1;
+            let value = format!("token-{}", routes.minted);
+            let client = match form.get("client_id") {
+                Some(client) => client.clone(),
+                None => String::new(),
+            };
+            routes.issued.insert(value.clone(), client);
+            let body = serde_json::json!({
+                "access_token": value,
+                "token_type": "bearer",
+                "expires_in": lifetime,
+                "scope": SCOPE,
+            });
+            (StatusCode::OK, Json(body)).into_response()
+        }
+        Grant::Status(code, body) => (StatusCode::from_u16(code).unwrap(), body).into_response(),
+        Grant::Redirect(location) => redirect(&location),
+    }
+}
+
+fn split_assertion(assertion: &str) -> (Value, Value, String, Vec<u8>) {
+    let parts: Vec<&str> = assertion.split('.').collect();
+    if parts.len() != 3 {
+        return (Value::Null, Value::Null, String::new(), Vec::new());
+    }
+    let header = decode_part(parts[0]);
+    let claims = decode_part(parts[1]);
+    let signature = URL_SAFE_NO_PAD.decode(parts[2]).unwrap_or_default();
+    (
+        header,
+        claims,
+        format!("{}.{}", parts[0], parts[1]),
+        signature,
+    )
+}
+
+fn decode_part(part: &str) -> Value {
+    let Ok(bytes) = URL_SAFE_NO_PAD.decode(part) else {
+        return Value::Null;
+    };
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(value) => value,
+        Err(_) => Value::Null,
+    }
+}
+
+fn refusal(
+    routes: &Routes,
+    form: &HashMap<String, String>,
+    issuer: &str,
+    header: &Value,
+    claims: &Value,
+    signed: &str,
+    signature: &[u8],
+) -> String {
+    let field = |name: &str| match form.get(name) {
+        Some(value) => value.clone(),
+        None => String::new(),
+    };
+    let claim = |name: &str| match claims.get(name) {
+        Some(Value::String(value)) => value.clone(),
+        Some(_) => String::new(),
+        None => String::new(),
+    };
+    if field("grant_type") != GRANT_TYPE {
+        return "grant_type".to_string();
+    }
+    if field("client_assertion_type") != ASSERTION_TYPE {
+        return "client_assertion_type".to_string();
+    }
+    if field("scope") != SCOPE {
+        return "scope".to_string();
+    }
+    if field("resource") != super::RESOURCE {
+        return "resource".to_string();
+    }
+    let client = field("client_id");
+    if client.is_empty() {
+        return "client_id".to_string();
+    }
+    if header.get("alg") != Some(&Value::String("RS256".to_string())) {
+        return "alg".to_string();
+    }
+    let Some(Value::String(kid)) = header.get("kid") else {
+        return "kid".to_string();
+    };
+    let Some(public) = routes.keys.get(kid) else {
+        return "unknown kid".to_string();
+    };
+    let verified = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, public)
+        .verify(signed.as_bytes(), signature);
+    if verified.is_err() {
+        return "signature".to_string();
+    }
+    if claim("iss") != client || claim("sub") != client {
+        return "iss or sub".to_string();
+    }
+    if claim("aud") != issuer {
+        return "aud".to_string();
+    }
+    let jti = claim("jti");
+    if jti.is_empty() || routes.seen_jti.contains(&jti) {
+        return "jti".to_string();
+    }
+    let (Some(iat), Some(exp)) = (
+        claims.get("iat").and_then(Value::as_u64),
+        claims.get("exp").and_then(Value::as_u64),
+    ) else {
+        return "iat or exp".to_string();
+    };
+    if exp != iat + 60 {
+        return "lifetime".to_string();
+    }
+    String::new()
 }

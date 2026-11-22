@@ -46,8 +46,7 @@ use crate::protocol::client::{FarmClient, FarmError, next_delay};
 use crate::protocol::types::{
     Branch, ClaimRequest, CompleteRequest, CompleteStatus, CreatePr, HEARTBEAT_INTERVAL,
     HeartbeatAction, HeartbeatRequest, HeartbeatResponse, Job, OUTPUT_REMOVE_TIMEOUT,
-    OpenRunRequest, Phase, RETRY_BASE_DELAY, RUNTIME, RunId, RunnerName, STOP_GRACE,
-    VALIDATE_TIMEOUT, VERSION,
+    OpenRunRequest, Phase, RETRY_BASE_DELAY, RUNTIME, RunId, STOP_GRACE, VALIDATE_TIMEOUT, VERSION,
 };
 
 const TERMINAL_CAPACITY: usize = 8;
@@ -388,7 +387,7 @@ impl Agent {
     /// so a farm that answers without holding the poll open cannot turn the loop
     /// into a spin against it. A claim that fails is paced the same way, on a
     /// delay that doubles to the retry ceiling and resets the moment a claim
-    /// succeeds, so a farm that is down or refuses the token is not hammered
+    /// succeeds, so a farm that is down or refuses the runner is not hammered
     /// once per retry delay for as long as it stays that way. Either pause ends
     /// on a shutdown rather than being waited out. A job that comes back from a
     /// claim
@@ -399,7 +398,7 @@ impl Agent {
     /// `rxd` client started is drained and completed like a claimed one instead
     /// of dying with the runtime.
     pub async fn run(&self, shutdown: watch::Receiver<Shutdown>) -> AgentExit {
-        let request = ClaimRequest::native(self.config.name.clone());
+        let request = ClaimRequest::native();
         let mut shutdown = shutdown;
         let mut delay = self.options.claim_retry_delay;
         loop {
@@ -524,7 +523,6 @@ impl Agent {
         } = request;
         let title = plan_title(Path::new(&plan)).await;
         let opened = OpenRunRequest {
-            runner: self.config.name.clone(),
             version: VERSION.to_string(),
             runtime: RUNTIME.to_string(),
             repo: repo_name(Path::new(&ctx)),
@@ -650,7 +648,6 @@ impl Agent {
         let beats = tokio::spawn(beat(
             Arc::clone(&self.client),
             run_id.clone(),
-            self.config.name.clone(),
             self.options.heartbeat_interval,
             terminals.clone(),
         ));
@@ -1187,11 +1184,10 @@ fn version_mismatch(error: &FarmError) -> Option<String> {
 async fn beat(
     client: Arc<FarmClient>,
     run_id: RunId,
-    runner: RunnerName,
     interval: Duration,
     terminals: mpsc::Sender<Terminal>,
 ) {
-    let request = HeartbeatRequest::native(runner);
+    let request = HeartbeatRequest::native();
     let mut canceled = false;
     loop {
         match client.heartbeat(&run_id, &request).await {
@@ -1663,17 +1659,18 @@ mod tests {
 
     #[test]
     fn a_fresh_agent_holds_nothing() {
+        let tokens = crate::auth::tests::token_source("http://farm.example");
         let config = Config {
             farm_url: "http://farm.example".to_string(),
-            token: "t".to_string(),
-            name: RunnerName("mbp-native".to_string()),
+            credentials: crate::auth::tests::credentials("http://farm.example"),
+            key_file: std::path::PathBuf::from("/keys/runner.pem"),
             drain_timeout: Duration::from_secs(1),
             ralphex_bin: "ralphex".to_string(),
         };
         let client = Arc::new(
             FarmClient::new(
                 &config.farm_url,
-                &config.token,
+                Arc::new(tokens),
                 Arc::new(crate::protocol::client::TokioSleeper),
             )
             .unwrap(),

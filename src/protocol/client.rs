@@ -1,7 +1,13 @@
 //! The HTTP client that speaks the farm protocol.
 //!
 //! [`FarmClient`] owns the six calls a runner makes, the retry policy each one
-//! carries and the mapping from an HTTP status to a [`FarmError`]. Delays and
+//! carries and the mapping from an HTTP status to a [`FarmError`]. Every
+//! attempt carries a token from the [`TokenSource`]: a `401` drops that token
+//! and repeats the attempt once with a new one, and a token that cannot be had
+//! fails the attempt as [`FarmError::Transport`] before anything reaches the
+//! farm, so each call's own retry policy covers it. A redirect is never
+//! followed, because the bearer would go with it: a `3xx` is the attempt's
+//! answer like any other status the call does not accept. Delays and
 //! the passage of time arrive through the [`Sleeper`] trait, so a test drives
 //! the whole retry table without waiting on a clock.
 
@@ -13,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::header::CONTENT_TYPE;
 
+use crate::auth::{AccessToken, TokenSource};
 use crate::protocol::types::{
     CLAIM_WINDOW, COMPLETE_BUDGET, ClaimRequest, CompleteRequest, HeartbeatRequest,
     HeartbeatResponse, Job, OpenRunRequest, ProgressRequest, REQUEST_TIMEOUT, RETRY_BASE_DELAY,
@@ -85,38 +92,34 @@ enum RetryPolicy {
 pub struct FarmClient {
     http: reqwest::Client,
     farm_url: String,
-    token: String,
+    tokens: Arc<TokenSource>,
     sleeper: Arc<dyn Sleeper>,
     progress_gone: Mutex<HashSet<RunId>>,
 }
 
 impl FarmClient {
-    /// Returns a client that talks to the farm at `farm_url` with `token`.
+    /// Returns a client that talks to the farm at `farm_url` with tokens from `tokens`.
     ///
     /// # Errors
     ///
     /// Returns [`FarmError::Transport`] when the underlying HTTP client cannot
     /// be built.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::sync::Arc;
-    ///
-    /// use ralphex_macos_runner::protocol::client::{FarmClient, TokioSleeper};
-    ///
-    /// let client = FarmClient::new("http://farm.example:7077/", "secret", Arc::new(TokioSleeper));
-    /// assert!(client.is_ok());
-    /// ```
-    pub fn new(farm_url: &str, token: &str, sleeper: Arc<dyn Sleeper>) -> Result<Self, FarmError> {
-        let http = match reqwest::Client::builder().build() {
+    pub fn new(
+        farm_url: &str,
+        tokens: Arc<TokenSource>,
+        sleeper: Arc<dyn Sleeper>,
+    ) -> Result<Self, FarmError> {
+        let built = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build();
+        let http = match built {
             Ok(http) => http,
             Err(error) => return Err(FarmError::Transport(error.to_string())),
         };
         Ok(FarmClient {
             http,
             farm_url: farm_url.trim_end_matches('/').to_string(),
-            token: token.to_string(),
+            tokens,
             sleeper,
             progress_gone: Mutex::new(HashSet::new()),
         })
@@ -132,14 +135,16 @@ impl FarmClient {
     /// [`FarmError::Transport`] when it cannot be reached and
     /// [`FarmError::Decode`] when the job does not parse.
     pub async fn claim(&self, request: &ClaimRequest) -> Result<Option<Job>, FarmError> {
-        let url = self.endpoint("api/runner/claim");
-        let attempt = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.token)
-            .timeout(CLAIM_TIMEOUT)
-            .json(request);
-        let (status, body) = self.send(attempt).await?;
+        let url = self.endpoint("external/runner/claim");
+        let (status, body) = self
+            .authorized(|token| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(token)
+                    .timeout(CLAIM_TIMEOUT)
+                    .json(request)
+            })
+            .await?;
         let body = body.trim();
         if status == 204 || body.is_empty() {
             return Ok(None);
@@ -162,14 +167,16 @@ impl FarmClient {
     /// when the farm cannot be reached and [`FarmError::Decode`] when the job
     /// does not parse.
     pub async fn open_run(&self, request: &OpenRunRequest) -> Result<Job, FarmError> {
-        let url = self.endpoint("api/runner/runs");
-        let attempt = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.token)
-            .timeout(REQUEST_TIMEOUT)
-            .json(request);
-        let (_status, body) = self.send(attempt).await?;
+        let url = self.endpoint("external/runner/runs");
+        let (_status, body) = self
+            .authorized(|token| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(token)
+                    .timeout(REQUEST_TIMEOUT)
+                    .json(request)
+            })
+            .await?;
         match serde_json::from_str::<Job>(&body) {
             Ok(job) => Ok(job),
             Err(error) => Err(FarmError::Decode(error.to_string())),
@@ -194,19 +201,19 @@ impl FarmClient {
         bytes: &[u8],
     ) -> Result<(), FarmError> {
         let url = self.endpoint(&format!(
-            "api/runner/jobs/{}/log?seq={}",
+            "external/runner/jobs/{}/log?seq={}",
             encode_segment(run_id.as_str()),
             seq.get()
         ));
-        self.retrying(RetryPolicy::Attempts(RETRY_MAX_ATTEMPTS), || async {
-            let attempt = self
-                .http
-                .post(&url)
-                .bearer_auth(&self.token)
-                .header(CONTENT_TYPE, "application/octet-stream")
-                .timeout(REQUEST_TIMEOUT)
-                .body(bytes.to_vec());
-            self.send(attempt).await
+        self.retrying(RetryPolicy::Attempts(RETRY_MAX_ATTEMPTS), || {
+            self.authorized(|token| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(token)
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .timeout(REQUEST_TIMEOUT)
+                    .body(bytes.to_vec())
+            })
         })
         .await?;
         Ok(())
@@ -227,18 +234,18 @@ impl FarmClient {
         request: &HeartbeatRequest,
     ) -> Result<HeartbeatResponse, FarmError> {
         let url = self.endpoint(&format!(
-            "api/runner/jobs/{}/heartbeat",
+            "external/runner/jobs/{}/heartbeat",
             encode_segment(run_id.as_str())
         ));
         let (_status, body) = self
-            .retrying(RetryPolicy::Attempts(RETRY_MAX_ATTEMPTS), || async {
-                let attempt = self
-                    .http
-                    .post(&url)
-                    .bearer_auth(&self.token)
-                    .timeout(REQUEST_TIMEOUT)
-                    .json(request);
-                self.send(attempt).await
+            .retrying(RetryPolicy::Attempts(RETRY_MAX_ATTEMPTS), || {
+                self.authorized(|token| {
+                    self.http
+                        .post(&url)
+                        .bearer_auth(token)
+                        .timeout(REQUEST_TIMEOUT)
+                        .json(request)
+                })
             })
             .await?;
         match serde_json::from_str::<HeartbeatResponse>(&body) {
@@ -265,17 +272,17 @@ impl FarmClient {
         request: &CompleteRequest,
     ) -> Result<(), FarmError> {
         let url = self.endpoint(&format!(
-            "api/runner/jobs/{}/complete",
+            "external/runner/jobs/{}/complete",
             encode_segment(run_id.as_str())
         ));
-        self.retrying(RetryPolicy::Budget(COMPLETE_BUDGET), || async {
-            let attempt = self
-                .http
-                .post(&url)
-                .bearer_auth(&self.token)
-                .timeout(REQUEST_TIMEOUT)
-                .json(request);
-            self.send(attempt).await
+        self.retrying(RetryPolicy::Budget(COMPLETE_BUDGET), || {
+            self.authorized(|token| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(token)
+                    .timeout(REQUEST_TIMEOUT)
+                    .json(request)
+            })
         })
         .await?;
         Ok(())
@@ -306,16 +313,19 @@ impl FarmClient {
             return Err(FarmError::Gone);
         }
         let url = self.endpoint(&format!(
-            "api/runner/jobs/{}/progress",
+            "external/runner/jobs/{}/progress",
             encode_segment(run_id.as_str())
         ));
-        let attempt = self
-            .http
-            .post(&url)
-            .bearer_auth(&self.token)
-            .timeout(REQUEST_TIMEOUT)
-            .json(request);
-        match self.send(attempt).await {
+        let sent = self
+            .authorized(|token| {
+                self.http
+                    .post(&url)
+                    .bearer_auth(token)
+                    .timeout(REQUEST_TIMEOUT)
+                    .json(request)
+            })
+            .await;
+        match sent {
             Ok(_) => Ok(()),
             Err(FarmError::Gone) => {
                 let mut gone = self.progress_gone.lock().unwrap();
@@ -333,6 +343,27 @@ impl FarmClient {
 
     fn endpoint(&self, path: &str) -> String {
         format!("{}/{}", self.farm_url, path)
+    }
+
+    async fn authorized<F>(&self, build: F) -> Result<(u16, String), FarmError>
+    where
+        F: Fn(&str) -> reqwest::RequestBuilder,
+    {
+        let token = self.bearer().await?;
+        let answered = self.send(build(token.secret())).await;
+        let Err(FarmError::Rejected(401, _)) = answered else {
+            return answered;
+        };
+        self.tokens.reject(&token).await;
+        let token = self.bearer().await?;
+        self.send(build(token.secret())).await
+    }
+
+    async fn bearer(&self) -> Result<AccessToken, FarmError> {
+        match self.tokens.token().await {
+            Ok(token) => Ok(token),
+            Err(error) => Err(FarmError::Transport(format!("no access token: {error}"))),
+        }
     }
 
     async fn send(&self, request: reqwest::RequestBuilder) -> Result<(u16, String), FarmError> {
@@ -540,11 +571,16 @@ mod tests {
 
     #[test]
     fn a_trailing_slash_in_the_farm_url_is_dropped() {
-        let client =
-            FarmClient::new("http://farm.example:7077/", "t", Arc::new(TokioSleeper)).unwrap();
+        let tokens = crate::auth::tests::token_source("http://farm.example:7077");
+        let client = FarmClient::new(
+            "http://farm.example:7077/",
+            Arc::new(tokens),
+            Arc::new(TokioSleeper),
+        )
+        .unwrap();
         assert_eq!(
-            client.endpoint("api/runner/claim"),
-            "http://farm.example:7077/api/runner/claim"
+            client.endpoint("external/runner/claim"),
+            "http://farm.example:7077/external/runner/claim"
         );
     }
 }

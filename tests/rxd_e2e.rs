@@ -16,14 +16,11 @@ use ralphex_macos_runner::ipc::{
     self, Command, DIRECTORY_MODE, IpcError, MAX_MESSAGE_BYTES, Response, RunRequest,
 };
 use ralphex_macos_runner::job::Worktree;
-use ralphex_macos_runner::protocol::client::FarmClient;
-use ralphex_macos_runner::protocol::types::{
-    Branch, CompleteRequest, CompleteStatus, CreatePr, RunnerName,
-};
+use ralphex_macos_runner::protocol::types::{Branch, CompleteRequest, CompleteStatus, CreatePr};
 use support::fake_farm::{FakeFarm, Reply};
 use support::{
-    Checkout, Record, TestSleeper, alive, completion, dead, invocations, local_job, options, rxd,
-    rxd_argv, rxd_on_terminal, spawned, wait_for,
+    Checkout, Record, TestSleeper, alive, completion, credentials, dead, farm_client, invocations,
+    local_job, options, rxd, rxd_argv, rxd_on_terminal, spawned, wait_for,
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::net::UnixStream;
@@ -40,8 +37,8 @@ enum Claiming {
 fn config(farm: &FakeFarm, ralphex: &Path) -> Config {
     Config {
         farm_url: farm.url().to_string(),
-        token: "secret-token".to_string(),
-        name: RunnerName("mbp-native".to_string()),
+        credentials: credentials(farm),
+        key_file: PathBuf::from("runner.pem"),
         drain_timeout: Duration::from_millis(50),
         ralphex_bin: ralphex.display().to_string(),
     }
@@ -59,9 +56,7 @@ async fn daemon(
     ralphex: &Path,
     claiming: Claiming,
 ) -> Daemon {
-    let client = Arc::new(
-        FarmClient::new(farm.url(), "secret-token", Arc::new(TestSleeper::new())).unwrap(),
-    );
+    let client = Arc::new(farm_client(farm, Arc::new(TestSleeper::new())));
     let agent = Arc::new(Agent::new(
         config(farm, ralphex),
         client,
@@ -933,9 +928,7 @@ async fn a_socket_directory_the_daemon_creates_is_its_own() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[]);
     let farm = FakeFarm::start().await;
-    let client = Arc::new(
-        FarmClient::new(farm.url(), "secret-token", Arc::new(TestSleeper::new())).unwrap(),
-    );
+    let client = Arc::new(farm_client(&farm, Arc::new(TestSleeper::new())));
     let agent = Arc::new(Agent::new(
         config(&farm, &ralphex),
         client,
@@ -972,9 +965,7 @@ async fn a_socket_that_cannot_be_bound_is_an_error_the_daemon_can_report() {
     let checkout = Checkout::new();
     let ralphex = checkout.ralphex(&[]);
     let farm = FakeFarm::start().await;
-    let client = Arc::new(
-        FarmClient::new(farm.url(), "secret-token", Arc::new(TestSleeper::new())).unwrap(),
-    );
+    let client = Arc::new(farm_client(&farm, Arc::new(TestSleeper::new())));
     let agent = Arc::new(Agent::new(
         config(&farm, &ralphex),
         client,

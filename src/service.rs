@@ -16,12 +16,13 @@ use nix::unistd::Uid;
 use tokio::net::UnixStream;
 use tokio::process::Command;
 
-use crate::config::{Config, Loaded};
+use crate::config::Config;
 use crate::ipc;
 use crate::paths::{self, APP_NAME, PathError};
 use crate::protocol::types::{
     COMPLETE_BUDGET, LOG_CLOSE_TIMEOUT, OUTPUT_REMOVE_TIMEOUT, PR_BUDGET, PROGRESS_POST_TIMEOUT,
-    REQUEST_TIMEOUT, RETRY_MAX_DELAY, RunId, STOP_GRACE, VALIDATE_TIMEOUT, WATCH_START_TIMEOUT,
+    REQUEST_TIMEOUT, RETRY_MAX_DELAY, RunId, STOP_GRACE, TOKEN_TIMEOUT, VALIDATE_TIMEOUT,
+    WATCH_START_TIMEOUT,
 };
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -225,8 +226,9 @@ impl std::fmt::Display for Uninstalled {
 /// [`PROGRESS_POST_TIMEOUT`]s for the timeline - the opening `setup` snapshot
 /// the watcher's stop waits for, `pr` before the push and `failed` when the
 /// pull request then fails - [`COMPLETE_BUDGET`] for the completion - which
-/// overruns its budget by a backoff and a request, because the budget is
-/// checked before the sleep rather than after the attempt - and
+/// overruns its budget by a backoff and one attempt, because the budget is
+/// checked before the sleep rather than after the attempt, and an attempt is a
+/// token request and a request, twice when the farm answers `401` - and
 /// [`OUTPUT_REMOVE_TIMEOUT`] for the output directory removed before the run
 /// slot is given back.
 ///
@@ -239,7 +241,9 @@ impl std::fmt::Display for Uninstalled {
 ///
 /// assert_eq!(
 ///     service::exit_timeout(Duration::from_secs(120)),
-///     Duration::from_secs(30 + 10 + 120 + 10 + 10 + 30 + 720 + 10 + 10 + 10 + 180 + 30 + 30 + 10)
+///     Duration::from_secs(
+///         30 + 10 + 120 + 10 + 10 + 30 + 720 + 10 + 10 + 10 + 180 + 30 + 2 * (10 + 30) + 10
+///     )
 /// );
 /// ```
 #[must_use]
@@ -256,6 +260,9 @@ pub fn exit_timeout(drain_timeout: Duration) -> Duration {
         + PROGRESS_POST_TIMEOUT
         + COMPLETE_BUDGET
         + RETRY_MAX_DELAY
+        + TOKEN_TIMEOUT
+        + REQUEST_TIMEOUT
+        + TOKEN_TIMEOUT
         + REQUEST_TIMEOUT
         + OUTPUT_REMOVE_TIMEOUT
 }
@@ -370,10 +377,7 @@ pub async fn install(force: Force) -> Result<Installed, ServiceError> {
 
     place_daemon(&source, &daemon_path)?;
 
-    let (drain_timeout, warnings) = configured_drain_timeout()?;
-    for warning in warnings {
-        eprintln!("rxd: {warning}");
-    }
+    let drain_timeout = configured_drain_timeout()?;
     let path_env = std::env::var("PATH").unwrap_or_default();
     let label = paths::launchd_label();
     let exit_timeout = exit_timeout(drain_timeout);
@@ -519,10 +523,10 @@ async fn listed(uid: u32, label: &str) -> bool {
     status.success()
 }
 
-fn configured_drain_timeout() -> Result<(Duration, Vec<String>), ServiceError> {
+fn configured_drain_timeout() -> Result<Duration, ServiceError> {
     let path = paths::config_path()?;
-    let loaded = match Config::load(&path) {
-        Ok(loaded) => loaded,
+    let config = match Config::load(&path) {
+        Ok(config) => config,
         Err(error) => {
             return Err(ServiceError::Config {
                 path: path.display().to_string(),
@@ -530,8 +534,7 @@ fn configured_drain_timeout() -> Result<(Duration, Vec<String>), ServiceError> {
             });
         }
     };
-    let Loaded { config, warnings } = loaded;
-    Ok((config.drain_timeout, warnings))
+    Ok(config.drain_timeout)
 }
 
 /// Returns the `ExitTimeOut` the property list in `plist` carries.
@@ -799,7 +802,9 @@ mod tests {
         let logs = LOG_CLOSE_TIMEOUT;
         let pull_request = PR_BUDGET;
         let timeline = PROGRESS_POST_TIMEOUT + PROGRESS_POST_TIMEOUT + PROGRESS_POST_TIMEOUT;
-        let completion = COMPLETE_BUDGET + RETRY_MAX_DELAY + REQUEST_TIMEOUT;
+        let attempt = TOKEN_TIMEOUT + REQUEST_TIMEOUT;
+        let repeat = TOKEN_TIMEOUT + REQUEST_TIMEOUT;
+        let completion = COMPLETE_BUDGET + RETRY_MAX_DELAY + attempt + repeat;
         let output = OUTPUT_REMOVE_TIMEOUT;
         assert_eq!(
             exit_timeout(drain_timeout),
@@ -826,7 +831,7 @@ mod tests {
             Path::new("/logs"),
             exit_timeout(drain_timeout),
         );
-        assert!(plist.contains("<integer>1690</integer>"), "{plist}");
+        assert!(plist.contains("<integer>1740</integer>"), "{plist}");
     }
 
     #[test]

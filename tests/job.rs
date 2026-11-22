@@ -10,18 +10,16 @@ use ralphex_macos_runner::job::{
     JobError, JobSpec, LocalOptions, Review, Worktree, spawn, validate,
 };
 use ralphex_macos_runner::logstream::LogStream;
-use ralphex_macos_runner::protocol::client::FarmClient;
 use ralphex_macos_runner::protocol::types::{Branch, MAX_LOG_CHUNK, RunId};
 use support::fake_farm::FakeFarm;
 use support::{
-    Record, TestSleeper, TickHandle, dead, fake_ralphex, gone_within, manual_ticker, wait_for,
+    Record, TestSleeper, TickHandle, dead, fake_ralphex, farm_client, gone_within, manual_ticker,
+    wait_for,
 };
 use tempfile::TempDir;
 
 fn stream(farm: &FakeFarm) -> (Arc<LogStream>, TickHandle) {
-    let client = Arc::new(
-        FarmClient::new(farm.url(), "secret-token", Arc::new(TestSleeper::new())).unwrap(),
-    );
+    let client = Arc::new(farm_client(farm, Arc::new(TestSleeper::new())));
     let (ticker, handle) = manual_ticker();
     let stream = LogStream::new(client, RunId("local-1".to_string()), ticker);
     (Arc::new(stream), handle)
