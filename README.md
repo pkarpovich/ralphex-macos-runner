@@ -73,11 +73,11 @@ A failed token request sends nothing to the farm and counts as a transport failu
 
 ### Moving from protocol version 1
 
-The farm and both runners change at the same moment, because the farm answers `409` to version 1. On the Mac, before the new version starts:
+Release 0.4.0 is the first to speak protocol version 2. The farm and both runners change at the same moment, because the farm answers `409` to version 1. On the Mac, before 0.4.0 starts:
 
 1. Create the key as above and hand `runner.pub.pem` and the key id to whoever registers the runner's client at the authorization server.
 2. Rewrite `config.toml`: remove `token` and `name`, add `issuer`, `token_endpoint`, `client_id`, `key_id`, `key_file` and `resource`, and make `farm_url` `https`.
-3. Upgrade and run `rxd install`, which reads the new configuration and rewrites the plist with the longer `ExitTimeOut` the token requests need.
+3. Upgrade to 0.4.0 and run `rxd install`, which reads the new configuration and rewrites the plist with the longer `ExitTimeOut` the token requests need.
 
 The run uses your personal `~/.config/ralphex` (agents and skills included); `RALPHEX_CONFIG_DIR` is never set.
 
